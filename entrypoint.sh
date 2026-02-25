@@ -26,7 +26,7 @@ case "$ATTENTION_BACKEND" in
   sa2)
     if ! uv pip show sageattention > /dev/null 2>&1; then
       echo "Installing SageAttention 2++ from source..."
-      uv pip install --no-build-isolation "sageattention @ git+https://github.com/thu-ml/SageAttention@v2"
+      uv pip install --no-build-isolation "sageattention @ git+https://github.com/thu-ml/SageAttention@v2.2.0"
       echo "SageAttention 2++ installed successfully."
     fi
     ;;
