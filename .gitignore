@@ -24,3 +24,8 @@ notes/
 .cursor/
 .specstory/
 *.local*
+
+# Total Recall (local memory — see README for team mode)
+CLAUDE.local.md
+.claude/settings.local.json
+memory/

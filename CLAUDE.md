@@ -21,23 +21,7 @@ We are evolving Daydream Scope from a prompt-driven video generation tool into a
 4. **Real-time streaming** — Video must remain real-time and low-latency via WebRTC, same as today. Actions should begin rendering within a frame budget, not after a long planning delay.
 5. **Emotion and expression control** — Beyond gross motor actions, the persona should support facial expressions and emotional states (smile, look confused, laugh) driven by conversation context.
 
-**Architectural implications:**
-
-- A new **Persona pipeline** (alongside or replacing LongLive) that accepts structured action/expression directives rather than raw text prompts.
-- An **action interpreter** layer (likely LLM-based) that sits between the chat interface and the video pipeline, translating conversation into `{ action, expression, dialogue }` tuples.
-- A **character consistency module** — either via persistent latent conditioning, reference image anchoring, or identity-preserving fine-tuning — to prevent character drift.
-- The **frontend** needs a chat interface (text input + message history) in addition to or replacing the current timeline/prompt editor.
-- **Audio/TTS integration** (future) — the persona should eventually speak responses aloud, synchronized with lip movement in the generated video.
-
 When making architectural decisions, always consider how they serve the interactive persona use case. Prefer designs that maintain character consistency, support low-latency action transitions, and cleanly separate the conversational AI layer from the video generation layer.
-
-## Task Tracking
-
-- **Always check TODO.md** at the root of this project before starting work — it contains the current state of all tasks, what's in progress, what's pending, and what's done.
-- **Update TODO.md** as tasks are completed (`[x]`), started (`[~]`), blocked, or skipped (`[-]`).
-- When new work is discovered during a session, add it as `[ ]` in the appropriate phase section.
-- Keep TODO.md as the **single source of truth** for project status. Do not rely on memory or conversation history for what needs to be done next.
-- Keep completed items visible for a few sessions for context, then move them to the Completed section.
 
 ## Development Commands
 
