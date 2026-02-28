@@ -13,7 +13,7 @@ from diffusers.modular_pipelines.modular_pipeline_utils import (
     OutputParam,
 )
 
-from ..utils import initialize_crossattn_cache, initialize_kv_cache
+from ..utils import initialize_kv_cache
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,11 @@ class SetupCachesBlock(ModularPipelineBlocks):
                 components.generator,
                 components.config.local_attn_size * frame_seq_length,
             )
+            set_all_modules_cache_sink_tokens(
+                components.generator,
+                frame_seq_length * (components.config.local_attn_size - components.config.num_frame_per_block),
+                frame_seq_length * components.generator.model.sink_size,
+            )
 
             block_state.kv_cache = initialize_kv_cache(
                 generator=components.generator,
@@ -196,23 +201,12 @@ class SetupCachesBlock(ModularPipelineBlocks):
                 device=generator_device,
                 local_attn_size=components.config.local_attn_size,
                 frame_seq_length=frame_seq_length,
+                num_frame_per_block=components.config.num_frame_per_block,
                 kv_cache_existing=block_state.kv_cache,
             )
+            # Reset fill_level when cache is (re)initialized
+            components.generator.model.fill_level = 0
 
-        # If the conditioning embeds change we need to reinitialize the crossattn cache
-        # During transitions, this updates cross-attn cache without full KV cache reset
-        if (
-            init_cache
-            or block_state.crossattn_cache is None
-            or block_state.conditioning_embeds_updated
-        ):
-            block_state.crossattn_cache = initialize_crossattn_cache(
-                generator=components.generator,
-                batch_size=1,
-                dtype=generator_param.dtype,
-                device=generator_param.device,
-                crossattn_cache_existing=block_state.crossattn_cache,
-            )
 
         if init_cache:
             logger.info(
@@ -263,3 +257,15 @@ def set_all_modules_frame_seq_length(generator, frame_seq_length: int):
     for _, module in generator.model.named_modules():
         if hasattr(module, "frame_seq_length"):
             module.frame_seq_length = frame_seq_length
+
+def set_all_modules_cache_sink_tokens(generator, cache_tokens: int, sink_tokens: int):
+    if hasattr(generator.model, "cache_tokens"):
+        generator.model.cache_tokens = cache_tokens
+    if hasattr(generator.model, "sink_tokens"):
+        generator.model.sink_tokens = sink_tokens
+
+    for _, module in generator.model.named_modules():
+        if hasattr(module, "cache_tokens"):
+            module.cache_tokens = cache_tokens
+        if hasattr(module, "sink_tokens"):
+            module.sink_tokens = sink_tokens
