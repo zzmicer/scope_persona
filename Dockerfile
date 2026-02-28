@@ -41,6 +41,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
   curl \
+  wget \
   git \
   software-properties-common \
   build-essential \

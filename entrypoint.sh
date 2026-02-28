@@ -39,4 +39,20 @@ case "$ATTENTION_BACKEND" in
     ;;
 esac
 
+# Download LoRA models
+LORA_DIR="/workspace/models/lora"
+mkdir -p "$LORA_DIR"
+
+if [ -n "$CIVIT_TOKEN" ]; then
+  if [ ! -f "$LORA_DIR/nsfw.safetensors" ]; then
+    echo "Downloading LoRA: nsfw.safetensors..."
+    wget -O "$LORA_DIR/nsfw.safetensors" \
+      "https://civitai.com/api/download/models/1514371?type=Model&format=SafeTensor&token=$CIVIT_TOKEN"
+  else
+    echo "LoRA nsfw.safetensors already exists, skipping download."
+  fi
+else
+  echo "CIVIT_TOKEN not set, skipping LoRA downloads."
+fi
+
 exec "$@"
