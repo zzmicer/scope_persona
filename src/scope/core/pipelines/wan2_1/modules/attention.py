@@ -7,6 +7,7 @@ import time
 
 import torch
 from flash_attn import flash_attn_func
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,11 @@ def is_hopper_gpu():
     return "h100" in device_name or "hopper" in device_name
 
 
-def is_b200_gpu():
+def is_blackwell_gpu():
     if not torch.cuda.is_available():
         return False
-    device_name = torch.cuda.get_device_name(0).lower()
-    return "b200" in device_name
+    major, _ = torch.cuda.get_device_capability(0)
+    return major >= 12
 
 
 FLASH_ATTN_3_AVAILABLE = False
@@ -64,7 +65,9 @@ from .sage import (  # noqa: F811, F401
     sageattn_func,
 )
 
-ATTENTION_BACKEND = os.getenv("ATTENTION_BACKEND")  # sa3, sa2, flash, sdpa, or None
+ATTENTION_BACKEND = os.getenv(
+    "ATTENTION_BACKEND"
+)  # sa3, sa2, flash, sdpa, cudnn, or None
 
 __all__ = [
     "flash_attention",
@@ -77,6 +80,7 @@ logger.info("flash attn 2 available: %s", FLASH_ATTN_2_AVAILABLE)
 logger.info("flash attn 3 available: %s", FLASH_ATTN_3_AVAILABLE)
 logger.info("sage attn 3 available: %s", SAGEATTN_AVAILABLE)
 logger.info("sage attn 2++ available: %s", SAGEATTN2_AVAILABLE)
+logger.info("blackwell gpu detected: %s", is_blackwell_gpu())
 if ATTENTION_BACKEND:
     logger.info("attention backend override: %s", ATTENTION_BACKEND)
 
@@ -273,6 +277,11 @@ def _run_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype):
     return out.transpose(1, 2).contiguous()
 
 
+def _run_cudnn_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype):
+    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+        return _run_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype)
+
+
 def attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -318,6 +327,9 @@ def attention(
     elif ATTENTION_BACKEND == "sdpa":
         _backend = "SDPA"
         out = _run_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype)
+    elif ATTENTION_BACKEND == "cudnn":
+        _backend = "CuDNN-SDPA"
+        out = _run_cudnn_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype)
     # Auto-detection (original behavior)
     elif SAGEATTN_AVAILABLE:
         _backend = "SA3"
@@ -339,6 +351,9 @@ def attention(
             dtype,
             fa_version,
         )
+    elif is_blackwell_gpu():
+        _backend = "CuDNN-SDPA"
+        out = _run_cudnn_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype)
     else:
         _backend = "SDPA"
         out = _run_sdpa(q, k, v, q_lens, k_lens, causal, dropout_p, dtype)
