@@ -112,10 +112,16 @@ def create_vace_attention_block_class(base_attention_block_class):
 
 def create_base_attention_block_class(base_attention_block_class):
     """
-    Factory that creates a BaseWanAttentionBlock class with hint injection support.
+    Factory that creates a BaseWanAttentionBlock class with conditioning injection support.
+
+    Supports both VACE hint injection (residual) and IP-Adapter identity injection
+    (cross-attention). Both are optional and controlled via kwargs.
 
     Uses duck typing - assumes base_attention_block_class has:
     - forward() method with standard transformer block signature
+    - self.cross_attn with .q and .norm_q projections (for IP-Adapter)
+    - self.norm3 layer normalization (for IP-Adapter query computation)
+    - self.num_heads attribute (for IP-Adapter attention reshaping)
 
     Args:
         base_attention_block_class: Any CausalWanAttentionBlock class (not instance)
@@ -125,7 +131,7 @@ def create_base_attention_block_class(base_attention_block_class):
     """
 
     class BaseWanAttentionBlock(base_attention_block_class):
-        """Base attention block with VACE hint injection support."""
+        """Base attention block with VACE hint and IP-Adapter injection support."""
 
         def __init__(self, *args, block_id=None, **kwargs):
             super().__init__(*args, **kwargs)
@@ -143,14 +149,20 @@ def create_base_attention_block_class(base_attention_block_class):
             block_mask,
             hints=None,
             context_scale=1.0,
+            ip_tokens=None,
+            ip_scale=1.0,
+            ip_cross_attn_layer=None,
             **kwargs,
         ):
             """
-            Forward pass with optional VACE hint injection.
+            Forward pass with optional VACE hint and IP-Adapter injection.
 
             Args:
                 hints: List of VACE hints, one per injection layer
-                context_scale: Scaling factor for hint injection
+                context_scale: Scaling factor for VACE hint injection
+                ip_tokens: Identity tokens from Resampler [B, num_tokens, dim]
+                ip_scale: Scaling factor for IP-Adapter injection
+                ip_cross_attn_layer: IPCrossAttentionLayer for this block (or None)
                 **kwargs: Pipeline-specific parameters (kv_cache, crossattn_cache, etc.)
             """
             # Standard forward pass
@@ -183,6 +195,14 @@ def create_base_attention_block_class(base_attention_block_class):
                 # Apply context scale (default to 1.0 if None for safety)
                 scale = context_scale if context_scale is not None else 1.0
                 x = x + hint * scale
+
+            # IP-Adapter: inject identity via parallel cross-attention
+            if ip_tokens is not None and ip_cross_attn_layer is not None:
+                # Compute query using the block's own cross-attn q projection
+                # (same projection Lynx uses — reuses text cross-attn's q)
+                q = self.cross_attn.norm_q(self.cross_attn.q(self.norm3(x)))
+                ip_out = ip_cross_attn_layer(q, ip_tokens, self.num_heads)
+                x = x + ip_scale * ip_out
 
             # Return with cache info if applicable
             if cache_update_info is not None:

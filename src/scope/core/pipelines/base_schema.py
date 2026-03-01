@@ -286,6 +286,14 @@ class BasePipelineConfig(BaseModel):
     ref_images: list[str] | None = ref_images_field()
     vace_context_scale: float = vace_context_scale_field()
 
+    # IP-Adapter / Lynx (optional face identity conditioning)
+    ip_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="Scaling factor for IP-Adapter face identity injection",
+    )
+
     @classmethod
     def get_pipeline_metadata(cls) -> dict[str, str]:
         """Return pipeline identification metadata.

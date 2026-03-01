@@ -228,6 +228,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         kv_cache_attention_bias: float = 1.0,
         vace_context: torch.Tensor | None = None,
         vace_context_scale: float = 1.0,
+        ip_image_embed: torch.Tensor | None = None,
+        ip_scale: float = 1.0,
         sink_recache_after_switch: bool = False,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -259,6 +261,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache_attention_bias=kv_cache_attention_bias,
                 vace_context=vace_context,
                 vace_context_scale=vace_context_scale,
+                ip_image_embed=ip_image_embed,
+                ip_scale=ip_scale,
                 sink_recache_after_switch=sink_recache_after_switch,
             ).permute(0, 2, 1, 3, 4)
         else:

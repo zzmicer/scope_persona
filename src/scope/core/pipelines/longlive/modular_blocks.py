@@ -15,6 +15,7 @@ from ..wan2_1.blocks import (
     SetupCachesBlock,
     TextConditioningBlock,
 )
+from ..wan2_1.ip_adapter.blocks import IPAdapterEncodingBlock  # noqa: F401
 from ..wan2_1.vace.blocks import VaceEncodingBlock
 from .blocks import (
     PrepareRecacheFramesBlock,
@@ -41,6 +42,7 @@ ALL_BLOCKS = InsertableDict(
         ("auto_prepare_latents", AutoPrepareLatentsBlock),
         ("recache_frames", RecacheFramesBlock),
         ("vace_encoding", VaceEncodingBlock),
+        ("ip_adapter_encoding", IPAdapterEncodingBlock),
         ("denoise", DenoiseBlock),
         ("clean_kv_cache", CleanKVCacheBlock),
         ("decode", DecodeBlock),

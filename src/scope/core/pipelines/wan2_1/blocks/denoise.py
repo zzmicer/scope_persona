@@ -123,6 +123,18 @@ class DenoiseBlock(ModularPipelineBlocks):
                 type_hint=float,
                 description="Scaling factor for VACE hint injection",
             ),
+            InputParam(
+                "ip_image_embed",
+                default=None,
+                type_hint=torch.Tensor | None,
+                description="ArcFace face embedding for IP-Adapter identity conditioning",
+            ),
+            InputParam(
+                "ip_scale",
+                default=1.0,
+                type_hint=float,
+                description="Scaling factor for IP-Adapter identity injection",
+            ),
         ]
 
     @property
@@ -196,6 +208,8 @@ class DenoiseBlock(ModularPipelineBlocks):
                     kv_cache_attention_bias=block_state.kv_cache_attention_bias,
                     vace_context=block_state.vace_context,
                     vace_context_scale=block_state.vace_context_scale,
+                    ip_image_embed=block_state.ip_image_embed,
+                    ip_scale=block_state.ip_scale,
                 )
 
                 next_timestep = denoising_step_list[index + 1]
@@ -232,6 +246,8 @@ class DenoiseBlock(ModularPipelineBlocks):
                     kv_cache_attention_bias=block_state.kv_cache_attention_bias,
                     vace_context=block_state.vace_context,
                     vace_context_scale=block_state.vace_context_scale,
+                    ip_image_embed=block_state.ip_image_embed,
+                    ip_scale=block_state.ip_scale,
                 )
 
         block_state.latents = denoised_pred

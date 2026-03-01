@@ -17,6 +17,7 @@ from ..interface import Pipeline, Requirements
 from ..process import postprocess_chunk
 from ..utils import Quantization, load_model_config, validate_resolution
 from ..wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
+from ..wan2_1.ip_adapter import IPAdapterEnabledPipeline
 from ..wan2_1.lora.mixin import LoRAEnabledPipeline
 from ..wan2_1.lora.strategies.module_targeted_lora import ModuleTargetedLoRAStrategy
 from ..wan2_1.vace import VACEEnabledPipeline
@@ -32,7 +33,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_DENOISING_STEP_LIST = [1000, 750, 500, 250]
 
 
-class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
+class LongLivePipeline(
+    Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline, IPAdapterEnabledPipeline
+):
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
         return LongLiveConfig
@@ -84,8 +87,14 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         )
 
         # Apply VACE wrapper if vace_path is configured (upfront loading)
-        # This must happen before LoRA to get correct ordering: LoRA -> VACE -> Base
+        # This must happen before LoRA to get correct ordering: LoRA -> IP-Adapter -> VACE -> Base
         generator.model = self._init_vace(
+            config, generator.model, device=device, dtype=dtype
+        )
+
+        # Apply IP-Adapter wrapper if paths are configured (upfront loading)
+        # Must happen after VACE but before LoRA for correct wrapper ordering
+        generator.model = self._init_ip_adapter(
             config, generator.model, device=device, dtype=dtype
         )
 
@@ -224,6 +233,9 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
         # Clear vace_ref_images from state if not provided to prevent encoding on chunks where they weren't sent
         if "vace_ref_images" not in kwargs:
             self.state.set("vace_ref_images", None)
+
+        # Note: ip_face_image is NOT cleared per-chunk — it persists across chunks
+        # for continuous identity conditioning. Pass ip_face_image=None to explicitly disable.
 
         # Clear extension mode frame images from state if not provided to prevent reuse on non-extension chunks
         if "first_frame_image" not in kwargs:

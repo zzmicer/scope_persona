@@ -45,3 +45,10 @@ LIGHTTAE_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="lightx2v/Autoencoders",
     files=["lighttaew2_1.pth"],
 )
+
+# Lynx IP-Adapter artifacts (face identity preservation)
+# Lynx Lite: ID-Adapter only (Perceiver Resampler + IP cross-attention layers)
+LYNX_LITE_ARTIFACT = HuggingfaceRepoArtifact(
+    repo_id="ByteDance/lynx",
+    files=["lynx_lite/resampler.safetensors", "lynx_lite/ip_layers.safetensors"],
+)

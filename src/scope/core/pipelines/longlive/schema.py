@@ -125,6 +125,15 @@ class LongLiveConfig(BasePipelineConfig):
             order=8, component="quantization", is_load_param=True
         ),
     )
+    ip_scale: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="Scaling factor for IP-Adapter face identity injection (0.0 to 2.0)",
+        json_schema_extra=ui_field_config(
+            order=9, component="ip_adapter", is_load_param=True
+        ),
+    )
 
     modes = {
         "text": ModeDefaults(default=True),
