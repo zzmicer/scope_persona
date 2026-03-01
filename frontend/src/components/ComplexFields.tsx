@@ -465,6 +465,65 @@ export function SchemaComplexField({
     );
   }
 
+  if (component === "ip_adapter" && !rendered.has("ip_adapter")) {
+    rendered.add("ip_adapter");
+    const faceImage = ctx.schemaFieldOverrides?.["ip_face_image"];
+    const facePath = faceImage == null ? null : String(faceImage);
+    const ipScale =
+      (ctx.schemaFieldOverrides?.["ip_scale"] as number | undefined) ?? 1.0;
+    return (
+      <div key="ip_adapter" className="space-y-2">
+        <LabelWithTooltip
+          label="IP-Adapter"
+          tooltip="Face identity preservation using IP-Adapter (Lynx Lite). Upload a face reference image and adjust the injection scale."
+          className="text-sm font-medium"
+        />
+        <div className="rounded-lg border bg-card p-3 space-y-3">
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground">Face Image</span>
+            <ImageManager
+              images={facePath ? [facePath] : []}
+              onImagesChange={images =>
+                ctx.onSchemaFieldOverrideChange?.(
+                  "ip_face_image",
+                  images[0] ?? null,
+                  true
+                )
+              }
+              disabled={ctx.isLoading ?? false}
+              maxImages={1}
+              hideLabel
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <LabelWithTooltip
+              label="Scale"
+              tooltip="Scaling factor for IP-Adapter face identity injection. Higher values make the face reference more influential."
+              className="text-xs text-muted-foreground w-16"
+            />
+            <div className="flex-1 min-w-0">
+              <SliderWithInput
+                value={ipScale}
+                onValueChange={v =>
+                  ctx.onSchemaFieldOverrideChange?.("ip_scale", v, true)
+                }
+                onValueCommit={v =>
+                  ctx.onSchemaFieldOverrideChange?.("ip_scale", v, true)
+                }
+                min={0}
+                max={2}
+                step={0.1}
+                incrementAmount={0.1}
+                valueFormatter={v => Math.round(v * 10) / 10}
+                inputParser={v => parseFloat(v) || 1.0}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   if (component === "quantization" && !rendered.has("quantization")) {
     rendered.add("quantization");
     if (!ctx.supportsQuantization) return null;

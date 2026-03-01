@@ -33,6 +33,7 @@ class LongLiveConfig(BasePipelineConfig):
         LIGHTVAE_ARTIFACT,
         TAE_ARTIFACT,
         LIGHTTAE_ARTIFACT,
+        LYNX_LITE_ARTIFACT,
         HuggingfaceRepoArtifact(
             repo_id="Efficient-Large-Model/LongLive-1.3B",
             files=["models/longlive_base.pt", "models/lora.pt"],
@@ -125,13 +126,20 @@ class LongLiveConfig(BasePipelineConfig):
             order=8, component="quantization", is_load_param=True
         ),
     )
+    ip_face_image: str | None = Field(
+        default=None,
+        description="Path to face reference image for IP-Adapter identity conditioning",
+        json_schema_extra=ui_field_config(
+            order=9, component="ip_adapter", is_load_param=False, label="Face Image"
+        ),
+    )
     ip_scale: float = Field(
         default=1.0,
         ge=0.0,
         le=2.0,
         description="Scaling factor for IP-Adapter face identity injection (0.0 to 2.0)",
         json_schema_extra=ui_field_config(
-            order=9, component="ip_adapter", is_load_param=True
+            order=9, component="ip_adapter", is_load_param=False
         ),
     )
 

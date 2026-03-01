@@ -211,6 +211,7 @@ export const COMPLEX_COMPONENTS = [
   "noise",
   "quantization",
   "image",
+  "ip_adapter",
 ] as const;
 
 export type ComplexComponentName = (typeof COMPLEX_COMPONENTS)[number];

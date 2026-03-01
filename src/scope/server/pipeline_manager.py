@@ -515,6 +515,30 @@ class PipelineManager:
                     f"vace_context_scale={config.get('vace_context_scale', 1.0)}"
                 )
 
+    def _configure_ip_adapter(self, config: dict) -> None:
+        """Configure IP-Adapter (Lynx Lite) support for a pipeline.
+
+        Adds ip_adapter_resampler_path and ip_adapter_ip_layers_path to config
+        by resolving the Lynx Lite artifact paths.
+
+        Args:
+            config: Pipeline configuration dict to modify
+        """
+        from .models_config import get_model_file_path
+
+        resampler_path = str(
+            get_model_file_path("lynx/lynx_lite/resampler.safetensors")
+        )
+        ip_layers_path = str(
+            get_model_file_path("lynx/lynx_lite/ip_layers.safetensors")
+        )
+        config["ip_adapter_resampler_path"] = resampler_path
+        config["ip_adapter_ip_layers_path"] = ip_layers_path
+        logger.debug(
+            f"_configure_ip_adapter: Using Lynx Lite resampler={resampler_path}, "
+            f"ip_layers={ip_layers_path}"
+        )
+
     def _apply_load_params(
         self,
         config: dict,
@@ -803,6 +827,9 @@ class PipelineManager:
                 self._configure_vace(config, load_params)
             else:
                 logger.info("VACE disabled by load_params, skipping VACE configuration")
+
+            # Configure IP-Adapter (Lynx Lite) for face identity preservation
+            self._configure_ip_adapter(config)
 
             self._apply_load_params(
                 config,
