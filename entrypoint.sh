@@ -33,8 +33,11 @@ case "$ATTENTION_BACKEND" in
   flash)
     echo "Using Flash Attention 2 (should be pre-installed in image)."
     ;;
+  cudnn)
+    echo "Using cuDNN SDPA backend."
+    ;;
   *)
-    echo "Unknown ATTENTION_BACKEND=$ATTENTION_BACKEND — expected sa3, sa2, or flash"
+    echo "Unknown ATTENTION_BACKEND=$ATTENTION_BACKEND — expected sa3, sa2, flash, or cudnn"
     exit 1
     ;;
 esac
