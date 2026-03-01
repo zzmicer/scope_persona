@@ -5,6 +5,7 @@ from ..base_schema import BasePipelineConfig, ModeDefaults, ui_field_config
 from ..common_artifacts import (
     LIGHTTAE_ARTIFACT,
     LIGHTVAE_ARTIFACT,
+    LYNX_LITE_ARTIFACT,
     TAE_ARTIFACT,
     UMT5_ENCODER_ARTIFACT,
     VACE_ARTIFACT,
