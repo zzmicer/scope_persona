@@ -62,6 +62,7 @@ class CausalVaceWanModel(nn.Module):
         self.qk_norm = causal_wan_model.qk_norm
         self.cross_attn_norm = causal_wan_model.cross_attn_norm
         self.eps = causal_wan_model.eps
+        self.model_type = causal_wan_model.model_type
         self.patch_size = causal_wan_model.patch_size
         self.in_dim = causal_wan_model.in_dim
 
@@ -116,16 +117,14 @@ class CausalVaceWanModel(nn.Module):
         # This allows the VACE model to work with any CausalWanModel implementation
         self._block_forward_params = self._get_block_forward_params()
 
-        # Detect whether wrapped model uses new-style (freqs_cos/sin) or old-style (grid_sizes/freqs) interface
-        parent_sig = inspect.signature(self._original_block_class.forward)
-        self._uses_new_style = "freqs_cos" in parent_sig.parameters
-
     def _get_block_init_kwargs(self):
         """Get initialization kwargs for creating new blocks.
 
         Uses duck typing to determine which parameters the block class expects.
         """
-        cross_attn_type = "t2v_cross_attn"
+        cross_attn_type = (
+            "t2v_cross_attn" if self.model_type == "t2v" else "i2v_cross_attn"
+        )
 
         # Base kwargs that all blocks should have
         kwargs = {
@@ -308,60 +307,19 @@ class CausalVaceWanModel(nn.Module):
 
         self.vace_blocks = vace_blocks
 
-    def _build_vace_block_kwargs(
-        self, e0, context, context_lens, crossattn_cache, x, seq_len
-    ):
-        """Build kwargs for VACE block forward_vace calls based on wrapped model type."""
-        if self._uses_new_style:
-            # New-style: LongLive with precomputed RoPE (freqs_cos/sin)
-            # VACE blocks don't use caching — pass empty cache tensors
-            empty_k = torch.empty(
-                1,
-                0,
-                self.num_heads,
-                self.dim // self.num_heads,
-                dtype=x.dtype,
-                device=x.device,
-            )
-            return {
-                "e": e0,
-                "freqs_cos": None,  # Will be set per-call
-                "freqs_sin": None,  # Will be set per-call
-                "context": context,
-                "cache_k": empty_k,
-                "cache_v": empty_k,
-                "crossattn_cache": None,
-            }
-        else:
-            # Old-style: grid_sizes/freqs/block_mask
-            return {
-                "e": e0,
-                "seq_lens": torch.tensor([x.size(1)], dtype=torch.long),
-                "grid_sizes": None,  # Set by caller
-                "freqs": self.causal_wan_model.freqs,
-                "context": context,
-                "context_lens": context_lens,
-                "block_mask": getattr(self.causal_wan_model, "block_mask", None),
-                "crossattn_cache": None,
-            }
-
     def forward_vace(
         self,
         x,
         vace_context,
         seq_len,
-        e0,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
         context,
         context_lens,
+        block_mask,
         crossattn_cache,
-        # Old-style params (may be None for new-style models)
-        seq_lens=None,
-        grid_sizes=None,
-        freqs=None,
-        block_mask=None,
-        # New-style params (may be None for old-style models)
-        freqs_cos=None,
-        freqs_sin=None,
     ):
         """Process VACE context to generate hints."""
         # Get target dtype from vace_patch_embedding parameters
@@ -384,38 +342,20 @@ class CausalVaceWanModel(nn.Module):
             ]
         )
 
-        # Build block kwargs based on model type
-        if self._uses_new_style:
-            empty_k = torch.empty(
-                1,
-                0,
-                self.num_heads,
-                self.dim // self.num_heads,
-                dtype=x.dtype,
-                device=x.device,
-            )
-            block_kwargs = {
-                "e": e0,
-                "freqs_cos": freqs_cos,
-                "freqs_sin": freqs_sin,
-                "context": context,
-                "cache_k": empty_k,
-                "cache_v": empty_k,
-            }
-        else:
-            block_kwargs = {
-                "e": e0,
-                "seq_lens": seq_lens,
-                "grid_sizes": grid_sizes,
-                "freqs": freqs,
-                "context": context,
-                "context_lens": context_lens,
-                "block_mask": block_mask,
-            }
-
         # Process through VACE blocks
         for _block_idx, block in enumerate(self.vace_blocks):
-            c = block.forward_vace(c, x, **block_kwargs)
+            c = block.forward_vace(
+                c,
+                x,
+                e,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                context,
+                context_lens,
+                block_mask,
+                crossattn_cache,
+            )
 
         # Extract hints
         hints = torch.unbind(c)[:-1]
@@ -426,7 +366,7 @@ class CausalVaceWanModel(nn.Module):
         x,
         t,
         context,
-        seq_len=None,
+        seq_len,
         clip_fea=None,
         y=None,
         vace_context=None,
@@ -437,6 +377,9 @@ class CausalVaceWanModel(nn.Module):
         **block_kwargs,
     ):
         """Forward pass with optional VACE conditioning."""
+        if self.model_type == "i2v":
+            assert clip_fea is not None and y is not None
+
         device = self.causal_wan_model.patch_embedding.weight.device
         if self.causal_wan_model.freqs.device != device:
             self.causal_wan_model.freqs = self.causal_wan_model.freqs.to(device)
@@ -450,24 +393,9 @@ class CausalVaceWanModel(nn.Module):
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
         )
         x = [u.flatten(2).transpose(1, 2) for u in x]
-
-        if self._uses_new_style:
-            # New-style: single tensor, compute RoPE cos/sin
-            x = torch.cat(x)
-            f, h, w = grid_sizes[0].tolist()
-            from scope.core.pipelines.longlive.modules.causal_model import (
-                precompute_freqs_i,
-            )
-
-            start_frame = current_start // (h * w)
-            freqs_cos, freqs_sin = precompute_freqs_i(
-                self.causal_wan_model.freqs, f, h, w, start_frame
-            )
-        else:
-            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-            if seq_len is not None:
-                assert seq_lens.max() <= seq_len
-            x = torch.cat(x)
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        assert seq_lens.max() <= seq_len
+        x = torch.cat(x)
 
         # Time embeddings
         e = self.causal_wan_model.time_embedding(
@@ -506,55 +434,32 @@ class CausalVaceWanModel(nn.Module):
         # Generate VACE hints
         hints = None
         if vace_context is not None:
-            if self._uses_new_style:
-                hints = self.forward_vace(
-                    x,
-                    vace_context,
-                    seq_len if seq_len else f * h * w,
-                    e0,
-                    context,
-                    context_lens,
-                    crossattn_cache,
-                    freqs_cos=freqs_cos,
-                    freqs_sin=freqs_sin,
-                )
-            else:
-                hints = self.forward_vace(
-                    x,
-                    vace_context,
-                    seq_len,
-                    e0,
-                    context,
-                    context_lens,
-                    crossattn_cache,
-                    seq_lens=seq_lens,
-                    grid_sizes=grid_sizes,
-                    freqs=self.causal_wan_model.freqs,
-                    block_mask=self.causal_wan_model.block_mask,
-                )
+            hints = self.forward_vace(
+                x,
+                vace_context,
+                seq_len,
+                e0,
+                seq_lens,
+                grid_sizes,
+                self.causal_wan_model.freqs,
+                context,
+                context_lens,
+                self.causal_wan_model.block_mask,
+                crossattn_cache,
+            )
 
-        # Build base kwargs for transformer blocks
-        if self._uses_new_style:
-            base_kwargs = {
-                "e": e0,
-                "freqs_cos": freqs_cos,
-                "freqs_sin": freqs_sin,
-                "context": context,
-                "hints": hints,
-                "context_scale": vace_context_scale,
-            }
-        else:
-            base_kwargs = {
-                "e": e0,
-                "seq_lens": seq_lens,
-                "grid_sizes": grid_sizes,
-                "freqs": self.causal_wan_model.freqs,
-                "context": context,
-                "context_lens": context_lens,
-                "block_mask": self.causal_wan_model.block_mask,
-                "hints": hints,
-                "context_scale": vace_context_scale,
-            }
+        # Base arguments for transformer blocks (shared across all blocks)
+        base_kwargs = {
+            "e": e0,
+            "seq_lens": seq_lens,
+            "grid_sizes": grid_sizes,
+            "freqs": self.causal_wan_model.freqs,
+            "context": context,
+            "context_lens": context_lens,
+            "block_mask": self.causal_wan_model.block_mask,
+            "hints": hints,
+            "context_scale": vace_context_scale,
+        }
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -563,46 +468,18 @@ class CausalVaceWanModel(nn.Module):
             return custom_forward
 
         # Process through blocks
-        new_kvs = []
+        cache_update_infos = []
         for block_index, block in enumerate(self.blocks):
-            # Build per-block kwargs
+            # Build per-block kwargs:
+            # - kv_cache/crossattn_cache are always per-block indexed
+            # - Additional block_kwargs are dynamically filtered based on block's signature
+            #   and automatically indexed if they're per-block lists
             filtered_block_kwargs = self._filter_block_kwargs(block_kwargs, block_index)
-
-            if self._uses_new_style:
-                # New-style: pass cache_k, cache_v tensors directly
-                fill_level = self.causal_wan_model.fill_level
-                if fill_level > 0:
-                    cache_k = kv_cache[block_index]["k"][:, :fill_level]
-                    cache_v = kv_cache[block_index]["v"][:, :fill_level]
-                else:
-                    empty = torch.empty(
-                        1,
-                        0,
-                        self.num_heads,
-                        self.dim // self.num_heads,
-                        dtype=x.dtype,
-                        device=x.device,
-                    )
-                    cache_k = empty
-                    cache_v = empty
-
-                per_block_kwargs = {
-                    "cache_k": cache_k,
-                    "cache_v": cache_v,
-                    "crossattn_cache": crossattn_cache[block_index]
-                    if crossattn_cache
-                    else None,
-                    **filtered_block_kwargs,
-                }
-            else:
-                per_block_kwargs = {
-                    "kv_cache": kv_cache[block_index],
-                    "crossattn_cache": crossattn_cache[block_index]
-                    if crossattn_cache
-                    else None,
-                    "current_start": current_start,
-                    **filtered_block_kwargs,
-                }
+            per_block_kwargs = {
+                "kv_cache": kv_cache[block_index],
+                "current_start": current_start,
+                **filtered_block_kwargs,
+            }
 
             if torch.is_grad_enabled() and self.causal_wan_model.gradient_checkpointing:
                 kwargs = {**base_kwargs, **per_block_kwargs}
@@ -613,42 +490,30 @@ class CausalVaceWanModel(nn.Module):
                     use_reentrant=False,
                 )
                 if kv_cache is not None and isinstance(result, tuple):
-                    x, block_cache_info = result
-                    new_kvs.append(block_cache_info)
+                    x, block_cache_update_info = result
+                    cache_update_infos.append((block_index, block_cache_update_info))
                 else:
                     x = result
             else:
+                per_block_kwargs["crossattn_cache"] = crossattn_cache[block_index]
                 kwargs = {**base_kwargs, **per_block_kwargs}
                 result = block(x, **kwargs)
                 if kv_cache is not None and isinstance(result, tuple):
-                    x, block_cache_info = result
-                    new_kvs.append(block_cache_info)
+                    x, block_cache_update_info = result
+                    cache_update_infos.append((block_index, block_cache_update_info))
                 else:
                     x = result
 
-        # Apply cache updates
-        if kv_cache is not None and new_kvs:
-            if self._uses_new_style:
-                # New-style: use fill_level-based roll update
-                self.causal_wan_model._roll_update_cache(kv_cache, new_kvs)
-            else:
-                # Old-style: use _apply_cache_updates
-                cache_update_infos = [(i, info) for i, info in enumerate(new_kvs)]
-                self.causal_wan_model._apply_cache_updates(
-                    kv_cache, cache_update_infos, **block_kwargs
-                )
+        if kv_cache is not None and cache_update_infos:
+            self.causal_wan_model._apply_cache_updates(
+                kv_cache, cache_update_infos, **block_kwargs
+            )
 
         x = self.causal_wan_model.head(
             x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2)
         )
-
-        if self._uses_new_style:
-            x = self.causal_wan_model.unpatchify(x, f, h, w)
-        else:
-            x = self.causal_wan_model.unpatchify(x, grid_sizes)
-            x = torch.stack(x)
-
-        return x
+        x = self.causal_wan_model.unpatchify(x, grid_sizes)
+        return torch.stack(x)
 
     def forward(self, *args, **kwargs):
         if kwargs.get("kv_cache", None) is not None:

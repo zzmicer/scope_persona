@@ -11,17 +11,18 @@ def initialize_kv_cache(
     device: torch.device,
     local_attn_size: int,
     frame_seq_length: int,
-    num_frame_per_block: int = 3,
     kv_cache_existing: list[dict] | None = None,
+    reset_indices: bool = True,
+    zero_cache: bool = True,
 ):
     kv_cache = []
 
-    # Cache stores context only: (local_attn_size - num_frame_per_block) frames.
-    # During attention, the new num_frame_per_block frames are concatenated to reach
-    # the full local_attn_size window.
+    # Calculate KV cache size
     if local_attn_size != -1:
-        kv_cache_size = (local_attn_size - num_frame_per_block) * frame_seq_length
+        # Use the local attention size to compute the KV cache size
+        kv_cache_size = local_attn_size * frame_seq_length
     else:
+        # Use the default KV cache size
         kv_cache_size = 32760
 
     # Get transformer config
@@ -31,7 +32,7 @@ def initialize_kv_cache(
     k_shape = [batch_size, kv_cache_size, num_heads, dim // num_heads]
     v_shape = [batch_size, kv_cache_size, num_heads, dim // num_heads]
 
-    # Check if we can reuse existing cache tensors (same shape)
+    # Check if we can reuse existing cache
     if (
         kv_cache_existing
         and len(kv_cache_existing) > 0
@@ -39,16 +40,32 @@ def initialize_kv_cache(
         and list(kv_cache_existing[0]["v"].shape) == v_shape
     ):
         for i in range(num_transformer_blocks):
-            kv_cache_existing[i]["k"].zero_()
-            kv_cache_existing[i]["v"].zero_()
+            if zero_cache:
+                kv_cache_existing[i]["k"].zero_()
+                kv_cache_existing[i]["v"].zero_()
+
+            if reset_indices:
+                kv_cache_existing[i]["global_end_index"] = torch.tensor(
+                    [0], dtype=torch.long, device=device
+                )
+                kv_cache_existing[i]["local_end_index"] = torch.tensor(
+                    [0], dtype=torch.long, device=device
+                )
+
         return kv_cache_existing
     else:
-        # Create new cache -- just k and v tensors, no index tracking
+        # Create new cache
         for _ in range(num_transformer_blocks):
             kv_cache.append(
                 {
                     "k": torch.zeros(k_shape, dtype=dtype, device=device).contiguous(),
                     "v": torch.zeros(v_shape, dtype=dtype, device=device).contiguous(),
+                    "global_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device
+                    ),
+                    "local_end_index": torch.tensor(
+                        [0], dtype=torch.long, device=device
+                    ),
                 }
             )
         return kv_cache

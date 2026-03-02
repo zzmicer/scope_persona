@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from typing import TYPE_CHECKING
 
@@ -139,9 +138,6 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
             print(f"Quantized FFN layers to fp8 in {time.time() - start:.3f}s")
         else:
             generator = generator.to(device=device, dtype=dtype)
-
-        if os.getenv("TORCH_COMPILE", "0") != "0":
-            generator.model.enable_compile()
 
         start = time.time()
         text_encoder = WanTextEncoderWrapper(

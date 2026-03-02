@@ -39,14 +39,26 @@ def create_vace_attention_block_class(base_attention_block_class):
             nn.init.zeros_(self.after_proj.weight)
             nn.init.zeros_(self.after_proj.bias)
 
-        def forward_vace(self, c, x, **block_kwargs):
+        def forward_vace(
+            self,
+            c,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+            block_mask,
+            crossattn_cache=None,
+        ):
             """
             Forward pass for VACE blocks.
 
             Args:
                 c: Accumulated VACE context from previous blocks (stacked hints + current)
                 x: Input latent features
-                **block_kwargs: Standard transformer block keyword arguments (pipeline-specific)
+                Other args: Standard transformer block arguments
 
             Returns:
                 Updated VACE context stack with new hint appended
@@ -67,7 +79,21 @@ def create_vace_attention_block_class(base_attention_block_class):
 
             # Run standard transformer block on current context
             # VACE blocks don't use caching since they process reference images once
-            c = super().forward(c, **block_kwargs)
+            # Pass block_mask to ensure the non-caching attention path is used
+            # crossattn_cache=None because VACE processes reference images without caching
+            c = super().forward(
+                c,
+                e,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                context,
+                context_lens,
+                block_mask,  # Must pass block_mask to trigger non-caching path in KREA
+                kv_cache=None,
+                crossattn_cache=None,  # VACE doesn't use cross-attention caching
+                current_start=0,
+            )
 
             # Handle case where block returns tuple (shouldn't happen with kv_cache=None)
             if isinstance(c, tuple):
@@ -105,18 +131,40 @@ def create_base_attention_block_class(base_attention_block_class):
             super().__init__(*args, **kwargs)
             self.block_id = block_id
 
-        def forward(self, *args, hints=None, context_scale=1.0, **kwargs):
+        def forward(
+            self,
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+            block_mask,
+            hints=None,
+            context_scale=1.0,
+            **kwargs,
+        ):
             """
             Forward pass with optional VACE hint injection.
 
             Args:
-                *args: Positional arguments forwarded to parent block
                 hints: List of VACE hints, one per injection layer
                 context_scale: Scaling factor for hint injection
                 **kwargs: Pipeline-specific parameters (kv_cache, crossattn_cache, etc.)
             """
-            # Standard forward pass — delegate all positional and keyword args to parent
-            result = super().forward(*args, **kwargs)
+            # Standard forward pass
+            result = super().forward(
+                x,
+                e,
+                seq_lens,
+                grid_sizes,
+                freqs,
+                context,
+                context_lens,
+                block_mask,
+                **kwargs,
+            )
 
             # Handle cache updates if present
             if isinstance(result, tuple):
