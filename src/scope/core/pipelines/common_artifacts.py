@@ -45,3 +45,8 @@ LIGHTTAE_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="lightx2v/Autoencoders",
     files=["lighttaew2_1.pth"],
 )
+
+CAUSAL_FORCING_ARTIFACT = HuggingfaceRepoArtifact(
+    repo_id="zhuhz22/Causal-Forcing",
+    files=["framewise/causal_forcing.pt"],
+)
