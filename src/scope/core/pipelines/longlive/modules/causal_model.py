@@ -47,8 +47,8 @@ def precompute_freqs_i(freqs, f, h, w, start_frame=0):
 
     # Convert complex frequencies to real cos/sin for compile-friendly RoPE.
     # Shape: [1, seq_len, 1, head_dim // 2] for broadcasting with [B, seq_len, heads, head_dim // 2]
-    freqs_cos = freqs_i.real.float().unsqueeze(0)
-    freqs_sin = freqs_i.imag.float().unsqueeze(0)
+    freqs_cos = freqs_i.real.to(torch.float64).unsqueeze(0)
+    freqs_sin = freqs_i.imag.to(torch.float64).unsqueeze(0)
 
     return freqs_cos, freqs_sin
 
@@ -64,9 +64,9 @@ def causal_rope_apply_precomputed(x, freqs_cos, freqs_sin):
     Returns:
         Tensor with rotary embeddings applied, same shape as x.
     """
-    # Split into even/odd pairs and apply rotation in float32
-    x_even = x[..., 0::2].float()
-    x_odd = x[..., 1::2].float()
+    # Split into even/odd pairs and apply rotation in float64 (matches training precision)
+    x_even = x[..., 0::2].to(torch.float64)
+    x_odd = x[..., 1::2].to(torch.float64)
 
     # Complex rotation: (a + bi)(cos + i*sin) = (a*cos - b*sin) + (a*sin + b*cos)i
     rotated_even = x_even * freqs_cos - x_odd * freqs_sin
@@ -509,6 +509,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
         x = self.unpatchify(x, f, h, w)
         return x
+
+    def enable_compile(self):
+        """Compile the inner forward loop for kernel fusion and speedup.
+
+        Call after model is loaded and moved to device. Requires torch.compile
+        compatible attention backend (SA2++ custom_op or SDPA).
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        self._inner_forward = torch.compile(
+            self._inner_forward,
+            mode="max-autotune-no-cudagraphs",
+            dynamic=False,
+        )
+        logger.info("torch.compile enabled on CausalWanModel._inner_forward")
 
     def forward(self, *args, **kwargs):
         return self._forward_inference(*args, **kwargs)

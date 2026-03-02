@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -122,17 +123,25 @@ class LongLivePipeline(Pipeline, LoRAEnabledPipeline, VACEEnabledPipeline):
                 quantize_,
             )
 
+            def _ffn_only_filter(module, fqn):
+                """Only quantize FFN layers — attention projections are precision-sensitive."""
+                return ".ffn." in fqn
+
             # Move to target device during quantization
-            # Defaults to using fp8_e4m3fn for both weights and activations
+            # Selective FP8: only FFN layers (less precision-sensitive) to preserve quality
             quantize_(
                 generator,
                 Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor()),
                 device=device,
+                filter_fn=_ffn_only_filter,
             )
 
-            print(f"Quantized diffusion model to fp8 in {time.time() - start:.3f}s")
+            print(f"Quantized FFN layers to fp8 in {time.time() - start:.3f}s")
         else:
             generator = generator.to(device=device, dtype=dtype)
+
+        if os.getenv("TORCH_COMPILE", "0") != "0":
+            generator.model.enable_compile()
 
         start = time.time()
         text_encoder = WanTextEncoderWrapper(

@@ -88,6 +88,11 @@ class RecacheFramesBlock(ModularPipelineBlocks):
                 description="Initialized KV cache",
             ),
             OutputParam(
+                "crossattn_cache",
+                type_hint=list[dict],
+                description="Initialized cross-attention cache",
+            ),
+            OutputParam(
                 "recache_buffer",
                 type_hint=torch.Tensor,
                 description="Sliding window of recache frames",
@@ -192,6 +197,18 @@ class RecacheFramesBlock(ModularPipelineBlocks):
                 update_cache=True,
                 current_start=chunk_start_frame * frame_seq_length,
             )
+
+        # Reset cross-attention cache after recaching to prevent stale prompt
+        # embeddings from bleeding through on prompt switches.
+        from scope.core.pipelines.wan2_1.utils import initialize_crossattn_cache
+
+        block_state.crossattn_cache = initialize_crossattn_cache(
+            generator=components.generator,
+            batch_size=1,
+            dtype=generator_param.dtype,
+            device=generator_param.device,
+            crossattn_cache_existing=block_state.crossattn_cache,
+        )
 
         self.set_block_state(state, block_state)
         return components, state

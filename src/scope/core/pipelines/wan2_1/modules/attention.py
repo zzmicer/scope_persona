@@ -223,7 +223,7 @@ def _run_sa2(q, k, v, causal, dtype):
     q = q.transpose(1, 2).to(dtype)
     k = k.transpose(1, 2).to(dtype)
     v = v.transpose(1, 2).to(dtype)
-    out = sageattn2_func(q, k, v, tensor_layout="HND", is_causal=causal)
+    out = sageattn2_func(q, k, v, is_causal=causal)
     return out.transpose(1, 2).contiguous().to(og_dtype)
 
 

@@ -82,7 +82,39 @@ except Exception as e:
 SAGEATTN2_AVAILABLE = False
 sageattn2_func = None
 try:
-    from sageattention import sageattn as sageattn2_func
+    if os.getenv("DISABLE_SAGEATTENTION", "0") != "0":
+        raise Exception("DISABLE_SAGEATTENTION is set")
+
+    from sageattention import sageattn as _sageattn2_raw
+
+    @torch.library.custom_op("mylib::sageattn2pp", mutates_args=(), device_types="cuda")
+    def sageattn2_func(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        return _sageattn2_raw(q, k, v, tensor_layout="HND", is_causal=is_causal)
+
+    @sageattn2_func.register_fake
+    def _sageattn2_fake(q, k, v, is_causal=False):
+        return torch.empty(*q.shape, device=q.device, dtype=q.dtype)
+
+    # Runtime kernel probe for SA2++
+    if torch.cuda.is_available():
+        _q2 = torch.randn(1, 16, 64, 128, dtype=torch.bfloat16, device="cuda")
+        _k2 = torch.randn(1, 16, 64, 128, dtype=torch.bfloat16, device="cuda")
+        _v2 = torch.randn(1, 16, 64, 128, dtype=torch.bfloat16, device="cuda")
+        try:
+            sageattn2_func(_q2, _k2, _v2)
+            torch.cuda.synchronize()
+        except Exception as probe_err:
+            raise RuntimeError(
+                "SageAttention 2++ kernel probe failed — kernels are not "
+                f"compatible with this GPU: {probe_err}"
+            ) from probe_err
+        finally:
+            del _q2, _k2, _v2
 
     SAGEATTN2_AVAILABLE = True
     print("SageAttention 2++ loaded successfully")
