@@ -128,20 +128,20 @@ class CausalForcingPipeline(Pipeline):
             from .modules.clip_encoder import WanCLIPVisualEncoder
 
             clip_path = self._resolve_clip_path(model_dir)
-            if clip_path is not None:
-                start = time.time()
-                clip_encoder = WanCLIPVisualEncoder(
-                    checkpoint_path=clip_path,
-                    dtype=dtype,
-                    device=device,
+            if clip_path is None:
+                raise RuntimeError(
+                    "CLIP checkpoint not found for I2V mode. "
+                    "The Wan2.1-I2V model should have been downloaded. "
+                    "Please check that the artifacts downloaded correctly."
                 )
-                clip_encoder = clip_encoder.to(device=device)
-                print(f"Loaded CLIP visual encoder in {time.time() - start:.3f}s")
-            else:
-                logger.warning(
-                    "CLIP checkpoint not found. I2V mode will not have CLIP conditioning. "
-                    "Download Wan2.1-I2V model for full I2V support."
-                )
+            start = time.time()
+            clip_encoder = WanCLIPVisualEncoder(
+                checkpoint_path=clip_path,
+                dtype=dtype,
+                device=device,
+            )
+            clip_encoder = clip_encoder.to(device=device)
+            print(f"Loaded CLIP visual encoder in {time.time() - start:.3f}s")
 
         # Create components
         components_config = {}

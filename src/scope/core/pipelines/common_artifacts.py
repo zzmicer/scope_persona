@@ -50,3 +50,9 @@ CAUSAL_FORCING_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="zhuhz22/Causal-Forcing",
     files=["framewise/causal_forcing.pt"],
 )
+
+# CLIP visual encoder for I2V conditioning
+WAN_I2V_1_3B_CLIP_ARTIFACT = HuggingfaceRepoArtifact(
+    repo_id="Wan-AI/Wan2.1-I2V-1.3B-480P",
+    files=["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"],
+)

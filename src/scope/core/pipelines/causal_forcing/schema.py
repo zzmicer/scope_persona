@@ -8,6 +8,7 @@ from ..common_artifacts import (
     TAE_ARTIFACT,
     UMT5_ENCODER_ARTIFACT,
     WAN_1_3B_ARTIFACT,
+    WAN_I2V_1_3B_CLIP_ARTIFACT,
 )
 from ..enums import Quantization
 from ..utils import VaeType
@@ -36,6 +37,7 @@ class CausalForcingConfig(BasePipelineConfig):
         TAE_ARTIFACT,
         LIGHTTAE_ARTIFACT,
         CAUSAL_FORCING_ARTIFACT,
+        WAN_I2V_1_3B_CLIP_ARTIFACT,
     ]
 
     # Configuration fields

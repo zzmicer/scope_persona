@@ -56,7 +56,14 @@ class CLIPImageConditioningBlock(ModularPipelineBlocks):
     def __call__(self, components, state: PipelineState) -> tuple[Any, PipelineState]:
         block_state = self.get_block_state(state)
 
+        # Only use CLIP conditioning if reference image is provided
+        # clip_encoder component will only exist when pipeline is initialized with reference_image
         if block_state.reference_image_tensor is not None:
+            if not hasattr(components, "clip_encoder"):
+                raise RuntimeError(
+                    "CLIP encoder required for I2V mode but not loaded. "
+                    "This indicates a pipeline initialization error."
+                )
             clip_fea = components.clip_encoder(block_state.reference_image_tensor)
             block_state.clip_fea = clip_fea
         else:
