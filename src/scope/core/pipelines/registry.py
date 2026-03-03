@@ -148,6 +148,11 @@ def _register_pipelines():
         ),
         ("longlive", ".longlive.pipeline", "LongLivePipeline"),
         (
+            "causal_forcing",
+            ".causal_forcing.pipeline",
+            "CausalForcingPipeline",
+        ),
+        (
             "krea_realtime_video",
             ".krea_realtime_video.pipeline",
             "KreaRealtimeVideoPipeline",

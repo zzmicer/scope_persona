@@ -45,3 +45,15 @@ LIGHTTAE_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="lightx2v/Autoencoders",
     files=["lighttaew2_1.pth"],
 )
+
+CAUSAL_FORCING_ARTIFACT = HuggingfaceRepoArtifact(
+    repo_id="zhuhz22/Causal-Forcing",
+    files=["framewise/causal_forcing.pt"],
+)
+
+# CLIP visual encoder for I2V conditioning
+# Reusing Kijai repo (already downloaded for UMT5/VACE)
+WAN_I2V_1_3B_CLIP_ARTIFACT = HuggingfaceRepoArtifact(
+    repo_id="Kijai/WanVideo_comfy",
+    files=["open-clip-xlm-roberta-large-vit-huge-14_visual_fp16.safetensors"],
+)
