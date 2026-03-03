@@ -52,7 +52,8 @@ CAUSAL_FORCING_ARTIFACT = HuggingfaceRepoArtifact(
 )
 
 # CLIP visual encoder for I2V conditioning
+# Reusing Kijai repo (already downloaded for UMT5/VACE)
 WAN_I2V_1_3B_CLIP_ARTIFACT = HuggingfaceRepoArtifact(
-    repo_id="Wan-AI/Wan2.1-I2V-1.3B-480P",
-    files=["models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"],
+    repo_id="Kijai/WanVideo_comfy",
+    files=["open-clip-xlm-roberta-large-vit-huge-14_visual_fp16.safetensors"],
 )

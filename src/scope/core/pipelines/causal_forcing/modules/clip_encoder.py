@@ -214,20 +214,36 @@ class WanCLIPVisualEncoder(nn.Module):
         self.normalize = T.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
 
     def _load_checkpoint(self, checkpoint_path: str, device: torch.device | str):
-        """Load visual encoder weights from the full CLIP checkpoint."""
+        """Load visual encoder weights from the CLIP checkpoint."""
         logger.info(f"Loading CLIP visual encoder from {checkpoint_path}")
-        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        # Handle both .pth and .safetensors formats
+        if checkpoint_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(checkpoint_path, device="cpu")
+        else:
+            state_dict = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=True
+            )
 
         # Extract only visual encoder weights (prefix: "visual.")
+        # If already visual-only (no prefix), use as-is
         visual_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("visual."):
-                visual_state_dict[k.removeprefix("visual.")] = v
+        has_visual_prefix = any(k.startswith("visual.") for k in state_dict.keys())
+
+        if has_visual_prefix:
+            for k, v in state_dict.items():
+                if k.startswith("visual."):
+                    visual_state_dict[k.removeprefix("visual.")] = v
+        else:
+            # Already visual-only checkpoint
+            visual_state_dict = state_dict
 
         if not visual_state_dict:
             raise ValueError(
                 f"No visual encoder weights found in {checkpoint_path}. "
-                "Expected keys starting with 'visual.'"
+                "Expected keys starting with 'visual.' or visual-only checkpoint"
             )
 
         self.visual = self.visual.to_empty(device="cpu")
