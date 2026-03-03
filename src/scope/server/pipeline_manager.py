@@ -650,6 +650,7 @@ class PipelineManager:
             "streamdiffusionv2",
             "passthrough",
             "longlive",
+            "causal_forcing",
             "krea-realtime-video",
             "reward-forcing",
             "memflow",
@@ -823,6 +824,56 @@ class PipelineManager:
                 dtype=torch.bfloat16,
             )
             logger.info("LongLive pipeline initialized")
+            return pipeline
+
+        elif pipeline_id == "causal_forcing":
+            from scope.core.pipelines.causal_forcing import CausalForcingPipeline
+
+            from .models_config import get_model_file_path, get_models_dir
+
+            models_dir = get_models_dir()
+            config = OmegaConf.create(
+                {
+                    "model_dir": str(models_dir),
+                    "generator_path": str(
+                        get_model_file_path(
+                            "Causal-Forcing/framewise/causal_forcing.pt"
+                        )
+                    ),
+                    "text_encoder_path": str(
+                        get_model_file_path(
+                            "WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+                        )
+                    ),
+                    "tokenizer_path": str(
+                        get_model_file_path("Wan2.1-T2V-1.3B/google/umt5-xxl")
+                    ),
+                }
+            )
+
+            self._apply_load_params(
+                config,
+                load_params,
+                default_height=480,
+                default_width=832,
+                default_seed=42,
+            )
+
+            # Pass reference_image from load_params if provided
+            if load_params and load_params.get("reference_image"):
+                config["reference_image"] = load_params["reference_image"]
+
+            quantization = None
+            if load_params:
+                quantization = load_params.get("quantization", None)
+
+            pipeline = CausalForcingPipeline(
+                config,
+                quantization=quantization,
+                device=torch.device("cuda"),
+                dtype=torch.bfloat16,
+            )
+            logger.info("Causal Forcing pipeline initialized")
             return pipeline
 
         elif pipeline_id == "krea-realtime-video":
