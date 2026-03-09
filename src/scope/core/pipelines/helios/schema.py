@@ -81,20 +81,6 @@ class HeliosConfig(BasePipelineConfig):
         ),
     )
 
-    # Autoregressive chunk count — each chunk produces 33 pixel frames (9 latent frames)
-    num_frames: int = Field(
-        default=240,
-        ge=33,
-        description=(
-            "Total number of frames to generate per call. "
-            "Must be a multiple of 33 (frames per chunk). "
-            "Non-multiples are rounded up automatically."
-        ),
-        json_schema_extra=ui_field_config(
-            order=5, label="Frame Count", is_load_param=False
-        ),
-    )
-
     # Pyramid denoising steps per stage (3 stages)
     pyramid_steps: int = Field(
         default=2,
