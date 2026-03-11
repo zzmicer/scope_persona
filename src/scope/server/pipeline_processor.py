@@ -502,24 +502,51 @@ class PipelineProcessor:
             # to prevent FPS spikes followed by starvation.
             # Only pace when producing large batches without video input
             # (text-mode pipelines like Helios that emit 33 frames at once).
+            cycle_time = getattr(self, '_cycle_time_last', None)
             should_pace = (
                 num_frames > 1 and video_input is None and self.next_processor is None
             )
-            frame_interval = processing_time / num_frames if should_pace else 0.0
+            if should_pace:
+                if cycle_time is not None and cycle_time > processing_time:
+                    frame_interval = cycle_time / num_frames
+                    logger.info(
+                        f"[processor] {self.pipeline_id} "
+                        f"cycle_fps={num_frames / cycle_time:.2f} "
+                        f"burst_fps={num_frames / processing_time:.2f} "
+                        f"overhead={cycle_time - processing_time:.3f}s"
+                    )
+                else:
+                    frame_interval = processing_time / num_frames
+            else:
+                frame_interval = 0.0
 
+            if should_pace:
+                # Burst: all frames queued instantly. Override FPS window with
+                # sustainable generation rate so WebRTC doesn't drain queue too fast.
+                sustainable_interval = frame_interval  # processing_time / num_frames
+                with self.output_fps_lock:
+                    n_samples = min(num_frames - 1, OUTPUT_FPS_SAMPLE_SIZE)
+                    for _ in range(n_samples):
+                        self.output_frame_deltas.append(sustainable_interval)
+                    self._last_frame_time = time.time()
+                self._calculate_output_fps()
+                logger.info(
+                    f"[processor] {self.pipeline_id} burst_fps={1.0/sustainable_interval:.2f} "
+                    f"queue_depth={self.output_queue.qsize()}/{self.output_queue.maxsize}"
+                )
             for i, frame in enumerate(output):
-                if should_pace and i > 0:
-                    time.sleep(frame_interval)
                 frame = frame.unsqueeze(0)
-                # Track when a frame is ready (production rate)
-                self._track_output_frame()
+                if not should_pace:
+                    self._track_output_frame()
                 try:
                     self.output_queue.put_nowait(frame)
                 except queue.Full:
-                    logger.info(
-                        f"Output queue full for {self.pipeline_id}, dropping processed frame"
-                    )
-                    continue
+                    # Evict oldest frame — freshness > completeness for real-time.
+                    try:
+                        self.output_queue.get_nowait()
+                        self.output_queue.put_nowait(frame)
+                    except (queue.Empty, queue.Full):
+                        pass
 
             # Apply throttling if this pipeline is producing faster than next can consume
             # Only throttle if: (1) has video input, (2) has next processor
@@ -569,10 +596,15 @@ class PipelineProcessor:
         """Get the current dynamically calculated pipeline FPS.
 
         Returns the FPS based on how fast frames are produced into the output queue,
-        adjusted for queue fill level to prevent buildup.
+        with adaptive boost when queue fills to prevent latency buildup.
         """
         with self.output_fps_lock:
             output_fps = self.current_output_fps
+        # Adaptive drain: boost consumption rate proportional to queue fill.
+        # This drains backlog from slow warm-up chunks without dropping frames.
+        q_fill = self.output_queue.qsize() / max(1, self.output_queue.maxsize)
+        if q_fill > 0.2:
+            output_fps = output_fps * (1.0 + q_fill)  # up to 2x at 100% fill
         return min(MAX_FPS, output_fps)
 
     @staticmethod

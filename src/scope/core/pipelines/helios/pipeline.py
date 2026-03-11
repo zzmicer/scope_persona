@@ -479,7 +479,7 @@ class HeliosPipeline(Pipeline):
         k = state.chunk_index
         is_first_chunk = k == 0
 
-        chunk_start = time.time()
+        chunk_start = time.perf_counter()
 
         # --- Extract history conditioning ---
         if state.keep_first_frame:
@@ -512,6 +512,8 @@ class HeliosPipeline(Pipeline):
                 )
             )
 
+        t_history = time.perf_counter()
+
         # --- Prepare noise latents for this chunk ---
         latents = pipe.prepare_latents(
             batch_size=1,
@@ -523,9 +525,11 @@ class HeliosPipeline(Pipeline):
             device=device,
             generator=state.generator,
         )
+        t_noise = time.perf_counter()
 
         # --- Pyramid multi-scale denoising ---
         pyramid_num_stages = len(state.pyramid_num_inference_steps_list)
+        pyramid_stage_times = []
         num_latent_frames_per_chunk = state.num_latent_frames_per_chunk
 
         _, _, _, pyramid_height, pyramid_width = latents.shape
@@ -561,6 +565,7 @@ class HeliosPipeline(Pipeline):
             start_point_list = [latents]
 
         for stage_idx in range(pyramid_num_stages):
+            stage_start = time.perf_counter()
             patch_size = pipe.transformer.config.patch_size
             image_seq_len = (
                 latents.shape[-1] * latents.shape[-2] * latents.shape[-3]
@@ -674,6 +679,9 @@ class HeliosPipeline(Pipeline):
                     **extra_kwargs,
                 )[0]
 
+            pyramid_stage_times.append(time.perf_counter() - stage_start)
+
+        t_pyramid = time.perf_counter()
         # --- Capture first-frame anchor ---
         if state.keep_first_frame and is_first_chunk and state.image_latents is None:
             state.image_latents = latents[:, :, 0:1, :, :]
@@ -699,17 +707,25 @@ class HeliosPipeline(Pipeline):
             generated_frames - 1
         ) // pipe.vae_scale_factor_temporal * pipe.vae_scale_factor_temporal + 1
         current_video = current_video[:, :, :generated_frames]
+        t_vae = time.perf_counter()
 
         # Convert from BCTHW [-1,1] to THWC [0,1]
         video = pipe.video_processor.postprocess_video(current_video, output_type="np")[
             0
         ]
         video = self._convert_output_to_thwc(video)
+        t_post = time.perf_counter()
 
-        chunk_time = time.time() - chunk_start
+        chunk_time = t_post - chunk_start
+        stage_str = " | ".join(f"s{i}={pyramid_stage_times[i]:.3f}s" for i in range(len(pyramid_stage_times)))
         logger.info(
-            f"Chunk {k} generated in {chunk_time:.2f}s "
-            f"({video.shape[0]} frames, shape={video.shape})"
+            f"[helios] chunk={k} total={chunk_time:.3f}s "
+            f"hist={t_history - chunk_start:.3f}s "
+            f"noise={t_noise - t_history:.3f}s "
+            f"pyramid=[{stage_str}] "
+            f"vae={t_vae - t_pyramid:.3f}s "
+            f"post={t_post - t_vae:.3f}s "
+            f"frames={video.shape[0]}"
         )
 
         state.chunk_index += 1

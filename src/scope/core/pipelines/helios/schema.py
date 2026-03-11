@@ -119,10 +119,11 @@ class HeliosConfig(BasePipelineConfig):
     )
 
     compile: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Enable torch.compile on transformer blocks. "
-            "Provides 1.3-1.8x speedup after initial warmup (~30-60s)."
+            "Provides 1.3-1.8x speedup after initial warmup (~30-60s). "
+            "Disabled by default as dynamic shapes in Helios can cause overhead."
         ),
         json_schema_extra=ui_field_config(
             order=9, label="Compile Transformer", is_load_param=True
