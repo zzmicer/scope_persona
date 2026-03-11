@@ -109,6 +109,9 @@ class HeliosPipeline(Pipeline):
         pyramid_steps: int = 2,
         amplify_first_chunk: bool = True,
         offload_text_encoder: bool = True,
+        compile: bool = True,
+        attention_backend: str | None = None,
+        compile_vae: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
         **kwargs,
@@ -123,6 +126,9 @@ class HeliosPipeline(Pipeline):
         self.pyramid_steps = pyramid_steps
         self.amplify_first_chunk = amplify_first_chunk
         self.offload_text_encoder = offload_text_encoder
+        self.compile = compile
+        self.attention_backend = attention_backend
+        self.compile_vae = compile_vae
 
         if kwargs:
             logger.debug(
@@ -179,6 +185,60 @@ class HeliosPipeline(Pipeline):
         )
 
         pipe.to(self.device)
+
+        # --- Model optimizations ---
+
+        # 1. Fuse QKV projections (~15-25% speedup)
+        try:
+            pipe.transformer.fuse_qkv_projections()
+            logger.info("  Fused QKV projections")
+        except Exception as e:
+            logger.warning(f"  Failed to fuse QKV projections: {e}")
+
+        # 2. Set attention backend (FA3 for H100+, FA2 for Ampere, default SDPA)
+        attention_backend = self.attention_backend
+        if attention_backend is None and torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability(0)
+            if cc[0] >= 9:  # H100+ (sm_90)
+                attention_backend = "_FLASH_3_HUB"
+            else:
+                attention_backend = "FLASH_HUB"  # FA2 for Ampere
+
+        if attention_backend is not None:
+            try:
+                pipe.transformer.set_attention_backend(attention_backend)
+                logger.info(f"  Attention backend set to: {attention_backend}")
+            except Exception as e:
+                logger.warning(
+                    f"  Failed to set attention backend '{attention_backend}': {e}"
+                )
+                # Try fallback chain: FA3 -> FA2 -> leave default
+                if attention_backend == "_FLASH_3_HUB":
+                    try:
+                        pipe.transformer.set_attention_backend("FLASH_HUB")
+                        logger.info("  Fell back to FLASH_HUB (FA2)")
+                    except Exception as e2:
+                        logger.warning(f"  FA2 fallback also failed: {e2}")
+
+        # 3. Compile transformer blocks (regional compilation, ~1.3-1.8x speedup)
+        if self.compile:
+            try:
+                pipe.transformer.compile_repeated_blocks(
+                    mode="max-autotune-no-cudagraphs", fullgraph=False
+                )
+                logger.info("  Compiled transformer repeated blocks")
+            except Exception as e:
+                logger.warning(f"  Failed to compile transformer blocks: {e}")
+
+        # 4. Compile VAE decoder (optional, lower priority)
+        if self.compile_vae:
+            try:
+                pipe.vae.decode = torch.compile(
+                    pipe.vae.decode, mode="reduce-overhead", fullgraph=False
+                )
+                logger.info("  Compiled VAE decoder")
+            except Exception as e:
+                logger.warning(f"  Failed to compile VAE decoder: {e}")
 
         if self.offload_text_encoder:
             self._offload_text_encoder_from_pipe(pipe)

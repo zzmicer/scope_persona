@@ -497,7 +497,19 @@ class PipelineProcessor:
             # For intermediate pipelines, output goes to next pipeline's input
             # For last pipeline, output goes to frame_processor's output_queue
             # Output frames are [H, W, C], convert to [1, H, W, C] for consistency
-            for frame in output:
+
+            # Frame pacing: spread burst output over the generation window
+            # to prevent FPS spikes followed by starvation.
+            # Only pace when producing large batches without video input
+            # (text-mode pipelines like Helios that emit 33 frames at once).
+            should_pace = (
+                num_frames > 1 and video_input is None and self.next_processor is None
+            )
+            frame_interval = processing_time / num_frames if should_pace else 0.0
+
+            for i, frame in enumerate(output):
+                if should_pace and i > 0:
+                    time.sleep(frame_interval)
                 frame = frame.unsqueeze(0)
                 # Track when a frame is ready (production rate)
                 self._track_output_frame()

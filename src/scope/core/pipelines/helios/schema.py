@@ -117,3 +117,36 @@ class HeliosConfig(BasePipelineConfig):
             order=8, label="Offload Text Encoder", is_load_param=True
         ),
     )
+
+    compile: bool = Field(
+        default=True,
+        description=(
+            "Enable torch.compile on transformer blocks. "
+            "Provides 1.3-1.8x speedup after initial warmup (~30-60s)."
+        ),
+        json_schema_extra=ui_field_config(
+            order=9, label="Compile Transformer", is_load_param=True
+        ),
+    )
+
+    attention_backend: str | None = Field(
+        default=None,
+        description=(
+            "Attention backend override. Auto-detects best backend if None "
+            "(FA3 for H100+, FA2 for Ampere). Options: '_FLASH_3_HUB', 'FLASH_HUB', or None."
+        ),
+        json_schema_extra=ui_field_config(
+            order=10, label="Attention Backend", is_load_param=True
+        ),
+    )
+
+    compile_vae: bool = Field(
+        default=False,
+        description=(
+            "Enable torch.compile on VAE decoder. "
+            "Moderate speedup for decoding, adds to initial warmup time."
+        ),
+        json_schema_extra=ui_field_config(
+            order=11, label="Compile VAE", is_load_param=True
+        ),
+    )
