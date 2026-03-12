@@ -83,12 +83,12 @@ class HeliosConfig(BasePipelineConfig):
 
     # Pyramid denoising steps per stage (3 stages)
     pyramid_steps: int = Field(
-        default=2,
+        default=1,
         ge=1,
         le=20,
         description=(
             "Number of denoising steps per pyramid stage. "
-            "Distilled model works well with 2 steps. "
+            "Distilled model is designed for 1 step per stage (3 total). "
             "Higher values improve quality at the cost of speed."
         ),
         json_schema_extra=ui_field_config(
@@ -97,10 +97,11 @@ class HeliosConfig(BasePipelineConfig):
     )
 
     amplify_first_chunk: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "Amplify the first chunk for better initial quality. "
-            "Recommended for the distilled model."
+            "Amplify the first chunk by doubling denoising steps on chunk=0. "
+            "Improves initial quality but doubles first-chunk latency (~3.7s vs ~2.3s), "
+            "causing a visible freeze on every prompt change."
         ),
         json_schema_extra=ui_field_config(
             order=7, label="Amplify First Chunk", is_load_param=False
@@ -108,10 +109,11 @@ class HeliosConfig(BasePipelineConfig):
     )
 
     offload_text_encoder: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Offload text encoder to CPU after encoding prompts. "
-            "Saves significant VRAM but adds latency when prompts change."
+            "Saves ~8GB VRAM but adds ~6s latency on every prompt change (causes freezes). "
+            "Keep False on H100 where VRAM is not a constraint."
         ),
         json_schema_extra=ui_field_config(
             order=8, label="Offload Text Encoder", is_load_param=True
@@ -119,11 +121,11 @@ class HeliosConfig(BasePipelineConfig):
     )
 
     compile: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Enable torch.compile on transformer blocks. "
             "Provides 1.3-1.8x speedup after initial warmup (~30-60s). "
-            "Disabled by default as dynamic shapes in Helios can cause overhead."
+            "Required to reach target FPS on H100."
         ),
         json_schema_extra=ui_field_config(
             order=9, label="Compile Transformer", is_load_param=True

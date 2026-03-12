@@ -91,7 +91,7 @@ class HeliosPipeline(Pipeline):
     Wraps the diffusers HeliosPyramidPipeline for use within Daydream Scope.
     The model generates video autoregressively — each __call__ produces one
     chunk of 33 pixel frames (9 latent frames) using pyramid multi-scale
-    denoising with only 2 steps per stage.
+    denoising with 1 step per stage (3 total for the distilled model).
 
     The pipeline processor calls __call__ repeatedly in a loop. State
     (history latents, image anchor) is maintained between calls for temporal
@@ -106,9 +106,9 @@ class HeliosPipeline(Pipeline):
         self,
         height: int = 384,
         width: int = 640,
-        pyramid_steps: int = 2,
-        amplify_first_chunk: bool = True,
-        offload_text_encoder: bool = True,
+        pyramid_steps: int = 1,
+        amplify_first_chunk: bool = False,
+        offload_text_encoder: bool = False,
         compile: bool = True,
         attention_backend: str | None = None,
         compile_vae: bool = False,
@@ -717,7 +717,10 @@ class HeliosPipeline(Pipeline):
         t_post = time.perf_counter()
 
         chunk_time = t_post - chunk_start
-        stage_str = " | ".join(f"s{i}={pyramid_stage_times[i]:.3f}s" for i in range(len(pyramid_stage_times)))
+        stage_str = " | ".join(
+            f"s{i}={pyramid_stage_times[i]:.3f}s"
+            for i in range(len(pyramid_stage_times))
+        )
         logger.info(
             f"[helios] chunk={k} total={chunk_time:.3f}s "
             f"hist={t_history - chunk_start:.3f}s "
