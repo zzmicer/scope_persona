@@ -47,6 +47,11 @@ class VideoProcessingTrack(MediaStreamTrack):
         self._paused_lock = threading.Lock()
         self._last_frame = None
 
+        # Drain rate tracking for diagnostics
+        self._drain_frames = 0
+        self._drain_log_time: float | None = None
+        self._drain_empty_waits = 0  # how many loops had no frame (queue empty)
+
         # Server-side input mode - when enabled, frames come from the backend
         # instead of WebRTC (no browser video track needed)
         self._input_source_enabled = False
@@ -81,10 +86,10 @@ class VideoProcessingTrack(MediaStreamTrack):
         if self.readyState != "live":
             raise MediaStreamError
 
-        if hasattr(self, "timestamp"):
+        if hasattr(self, "_stream_start"):
             # Calculate wait time based on current frame rate
-            current_time = time.time()
-            time_since_last_frame = current_time - self.last_frame_time
+            now = time.monotonic()
+            time_since_last_frame = now - self._last_pts_time
 
             # Wait for the appropriate interval based on current FPS
             target_interval = self.frame_ptime  # Current frame period
@@ -93,13 +98,18 @@ class VideoProcessingTrack(MediaStreamTrack):
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
 
-            # Update timestamp and last frame time
-            self.timestamp += int(self.frame_ptime * VIDEO_CLOCK_RATE)
-            self.last_frame_time = time.time()
+            # Derive PTS from wall clock relative to stream start — eliminates
+            # accumulated sleep drift from timestamp computation.
+            self.timestamp = int(
+                (time.monotonic() - self._stream_start) * VIDEO_CLOCK_RATE
+            )
+            self._last_pts_time = time.monotonic()
         else:
-            self.start = time.time()
-            self.last_frame_time = time.time()
+            self._stream_start = time.monotonic()
+            self._last_pts_time = time.monotonic()
             self.timestamp = 0
+            # Keep self.start for any legacy compatibility
+            self.start = time.time()
 
         return self.timestamp, VIDEO_TIME_BASE
 
@@ -156,10 +166,39 @@ class VideoProcessingTrack(MediaStreamTrack):
                     frame.time_base = time_base
 
                     self._last_frame = frame
+
+                    # Drain rate diagnostics — log every 5s
+                    self._drain_frames += 1
+                    now = time.monotonic()
+                    if self._drain_log_time is None:
+                        self._drain_log_time = now
+                    elif now - self._drain_log_time >= 5.0:
+                        actual_fps = self._drain_frames / (now - self._drain_log_time)
+                        q = (
+                            self.frame_processor.pipeline_processors[-1].output_queue
+                            if (
+                                self.frame_processor
+                                and self.frame_processor.pipeline_processors
+                            )
+                            else None
+                        )
+                        q_info = f"{q.qsize()}/{q.maxsize}" if q else "n/a"
+                        logger.info(
+                            f"[track] drain: actual={actual_fps:.1f}fps "
+                            f"target={self.fps:.1f}fps "
+                            f"ptime={self.frame_ptime * 1000:.1f}ms "
+                            f"queue={q_info} "
+                            f"empty_polls={self._drain_empty_waits}"
+                        )
+                        self._drain_frames = 0
+                        self._drain_empty_waits = 0
+                        self._drain_log_time = now
+
                     return frame
 
                 # No frame available, wait a bit before trying again
-                await asyncio.sleep(0.01)
+                self._drain_empty_waits += 1
+                await asyncio.sleep(0.002)
 
             except Exception as e:
                 logger.error(f"Error getting processed frame: {e}")

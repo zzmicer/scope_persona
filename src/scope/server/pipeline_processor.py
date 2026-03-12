@@ -29,6 +29,13 @@ MAX_FPS = 60.0  # Maximum FPS cap
 OUTPUT_FPS_SAMPLE_SIZE = 30
 OUTPUT_FPS_MIN_SAMPLES = 2
 
+# Burst pacing caps — prevent warmup/cold-start chunks from inflating the
+# sustainable_interval to absurd values (e.g. 58s warmup → 0.56fps).
+# cycle_time is capped so a single slow chunk can't dominate the estimate;
+# frame_interval is capped so WebRTC always drains at least MIN_BURST_FPS.
+MAX_BURST_CYCLE_TIME = 5.0  # seconds — cap cycle_time used for interval calc
+MIN_BURST_FPS = 10.0  # fps floor — WebRTC drains at least this fast
+
 
 class PipelineProcessor:
     """Processes frames through a single pipeline in a dedicated thread."""
@@ -311,6 +318,7 @@ class PipelineProcessor:
 
     def process_chunk(self):
         """Process a single chunk of frames."""
+        _cycle_start = time.monotonic()
         # Check if there are new parameters
         try:
             new_parameters = self.parameters_queue.get_nowait()
@@ -502,36 +510,52 @@ class PipelineProcessor:
             # to prevent FPS spikes followed by starvation.
             # Only pace when producing large batches without video input
             # (text-mode pipelines like Helios that emit 33 frames at once).
-            cycle_time = getattr(self, '_cycle_time_last', None)
+            cycle_time = getattr(self, "_cycle_time_last", None)
             should_pace = (
                 num_frames > 1 and video_input is None and self.next_processor is None
             )
             if should_pace:
-                if cycle_time is not None and cycle_time > processing_time:
-                    frame_interval = cycle_time / num_frames
+                # Cap cycle_time to exclude warmup/cold-start inflation.
+                # A 58s first chunk must not make every subsequent chunk pace at 0.56fps.
+                effective_cycle = (
+                    min(cycle_time, MAX_BURST_CYCLE_TIME)
+                    if cycle_time is not None
+                    else None
+                )
+                if effective_cycle is not None and effective_cycle > processing_time:
+                    frame_interval = effective_cycle / num_frames
                     logger.info(
                         f"[processor] {self.pipeline_id} "
-                        f"cycle_fps={num_frames / cycle_time:.2f} "
+                        f"cycle_fps={num_frames / effective_cycle:.2f} "
                         f"burst_fps={num_frames / processing_time:.2f} "
-                        f"overhead={cycle_time - processing_time:.3f}s"
+                        f"overhead={effective_cycle - processing_time:.3f}s"
                     )
                 else:
                     frame_interval = processing_time / num_frames
+                # Floor: WebRTC must drain at least MIN_BURST_FPS regardless of chunk time
+                frame_interval = min(frame_interval, 1.0 / MIN_BURST_FPS)
             else:
                 frame_interval = 0.0
 
             if should_pace:
                 # Burst: all frames queued instantly. Override FPS window with
                 # sustainable generation rate so WebRTC doesn't drain queue too fast.
-                sustainable_interval = frame_interval  # processing_time / num_frames
+                sustainable_interval = frame_interval
                 with self.output_fps_lock:
                     n_samples = min(num_frames - 1, OUTPUT_FPS_SAMPLE_SIZE)
                     for _ in range(n_samples):
                         self.output_frame_deltas.append(sustainable_interval)
                     self._last_frame_time = time.time()
                 self._calculate_output_fps()
+                with self.output_fps_lock:
+                    cur_fps = self.current_output_fps
+                q_fill = self.output_queue.qsize() / max(1, self.output_queue.maxsize)
+                boosted = cur_fps * (1.0 + q_fill) if q_fill > 0.2 else cur_fps
                 logger.info(
-                    f"[processor] {self.pipeline_id} burst_fps={1.0/sustainable_interval:.2f} "
+                    f"[processor] {self.pipeline_id} burst_fps={1.0 / sustainable_interval:.2f} "
+                    f"current_output_fps={cur_fps:.2f} "
+                    f"get_fps_would_return={min(MAX_FPS, boosted):.2f} "
+                    f"q_fill={q_fill:.0%} "
                     f"queue_depth={self.output_queue.qsize()}/{self.output_queue.maxsize}"
                 )
             for i, frame in enumerate(output):
@@ -539,14 +563,15 @@ class PipelineProcessor:
                 if not should_pace:
                     self._track_output_frame()
                 try:
-                    self.output_queue.put_nowait(frame)
+                    # Block briefly rather than evicting — prevents jump cuts from
+                    # silent frame drops while still bounding max stall time.
+                    self.output_queue.put(frame, timeout=0.005)
                 except queue.Full:
-                    # Evict oldest frame — freshness > completeness for real-time.
-                    try:
-                        self.output_queue.get_nowait()
-                        self.output_queue.put_nowait(frame)
-                    except (queue.Empty, queue.Full):
-                        pass
+                    logger.warning(
+                        f"[processor] {self.pipeline_id} output queue still full after "
+                        f"5ms, dropping frame to avoid stall "
+                        f"(queue={self.output_queue.qsize()}/{self.output_queue.maxsize})"
+                    )
 
             # Apply throttling if this pipeline is producing faster than next can consume
             # Only throttle if: (1) has video input, (2) has next processor
@@ -562,6 +587,7 @@ class PipelineProcessor:
                 raise e
 
         self.is_prepared = True
+        self._cycle_time_last = time.monotonic() - _cycle_start
 
     def _track_output_frame(self):
         """Track when a frame is added to the output queue (production rate).
