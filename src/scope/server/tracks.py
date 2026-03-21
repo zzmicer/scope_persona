@@ -190,14 +190,40 @@ class VideoProcessingTrack(MediaStreamTrack):
                             f"queue={q_info} "
                             f"empty_polls={self._drain_empty_waits}"
                         )
+                        if self._drain_empty_waits > 0:
+                            freeze_pct = self._drain_empty_waits / max(
+                                1, self._drain_frames + self._drain_empty_waits
+                            )
+                            if freeze_pct > 0.05:
+                                logger.warning(
+                                    f"[track] FREEZE RISK: queue empty {self._drain_empty_waits}x "
+                                    f"({freeze_pct:.0%} of polls) — pipeline may be too slow to "
+                                    f"sustain target={self.fps:.1f}fps"
+                                )
                         self._drain_frames = 0
                         self._drain_empty_waits = 0
                         self._drain_log_time = now
 
                     return frame
 
-                # No frame available, wait a bit before trying again
+                # No frame available — advance the PTS clock and return the last
+                # frame as a freeze-frame.  This prevents the PTS from falling
+                # behind wall-clock time: without this, when the next burst
+                # arrives all frames get timestamped in rapid succession (PTS
+                # snap-forward), which the browser decoder renders as a freeze
+                # followed by a jump cut.
                 self._drain_empty_waits += 1
+                if self._last_frame is not None:
+                    pts, time_base = await self.next_timestamp()
+                    # Reformat creates a new VideoFrame so we don't mutate _last_frame's pts
+                    freeze_frame = self._last_frame.reformat(
+                        width=self._last_frame.width,
+                        height=self._last_frame.height,
+                        format=self._last_frame.format.name,
+                    )
+                    freeze_frame.pts = pts
+                    freeze_frame.time_base = time_base
+                    return freeze_frame
                 await asyncio.sleep(0.002)
 
             except Exception as e:

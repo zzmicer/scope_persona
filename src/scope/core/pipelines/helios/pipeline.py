@@ -60,6 +60,7 @@ class _HeliosARState:
     image_latents: torch.Tensor | None
     total_generated_latent_frames: int
     chunk_index: int
+    first_frame_image: str | None
 
     # Generation config (fixed for the session)
     height: int
@@ -291,6 +292,8 @@ class HeliosPipeline(Pipeline):
                 - pyramid_steps: Override denoising steps per stage
                 - amplify_first_chunk: Override first chunk amplification
                 - init_cache: If True, reinitialize autoregressive state
+                - first_frame_image: Optional path to image for i2v generation
+                - image_noise_sigma: Noise added to image latents (0.0 = exact anchor)
 
         Returns:
             Dictionary with "video" key containing [T, H, W, C] tensor in [0, 1] range.
@@ -311,6 +314,8 @@ class HeliosPipeline(Pipeline):
             "amplify_first_chunk", self.amplify_first_chunk
         )
         init_cache = kwargs.get("init_cache", False)
+        first_frame_image = kwargs.get("first_frame_image", None)
+        image_noise_sigma = kwargs.get("image_noise_sigma", 0.0)
 
         # Determine if we need to (re)initialize autoregressive state
         needs_init = (
@@ -319,6 +324,7 @@ class HeliosPipeline(Pipeline):
             or prompt_text != self._ar_state.prompt_text
             or height != self._ar_state.height
             or width != self._ar_state.width
+            or first_frame_image != self._ar_state.first_frame_image
         )
 
         if needs_init:
@@ -329,9 +335,68 @@ class HeliosPipeline(Pipeline):
                 width=width,
                 pyramid_steps=pyramid_steps,
                 amplify_first_chunk=amplify_first_chunk,
+                first_frame_image=first_frame_image,
+                image_noise_sigma=image_noise_sigma,
             )
 
         return self._generate_chunk()
+
+    def _encode_first_frame_image(
+        self,
+        image_path: str,
+        height: int,
+        width: int,
+        latents_mean: torch.Tensor,
+        latents_std: torch.Tensor,
+        image_noise_sigma: float,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """VAE-encode a first-frame image for i2v conditioning.
+
+        Returns latents of shape [1, C, 1, H//vae_scale, W//vae_scale] in float32.
+        """
+        import torchvision.transforms.functional as TF
+        from PIL import Image
+
+        pipe = self._pipe
+        device = self.device
+
+        img = Image.open(image_path).convert("RGB")
+
+        # Crop-to-fill resize to match target resolution
+        orig_w, orig_h = img.size
+        scale = max(height / orig_h, width / orig_w)
+        new_h, new_w = int(orig_h * scale), int(orig_w * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        img = img.crop((left, top, left + width, top + height))
+
+        # Normalize to [-1, 1], shape [3, H, W] -> [1, 3, 1, H, W]
+        pixel_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(device, torch.float32)
+        pixel_tensor = pixel_tensor.unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
+
+        with torch.no_grad():
+            image_latents = pipe.vae.encode(pixel_tensor).latent_dist.mode()
+
+        # Normalize to match the latent space used during denoising
+        image_latents = (image_latents - latents_mean) * latents_std
+        image_latents = image_latents.to(torch.float32)
+
+        if image_noise_sigma > 0.0:
+            noise = torch.randn(
+                image_latents.shape,
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            image_latents = image_latents + image_noise_sigma * noise
+
+        logger.info(
+            f"Encoded first-frame image '{image_path}' to latents "
+            f"shape={tuple(image_latents.shape)}, noise_sigma={image_noise_sigma}"
+        )
+        return image_latents
 
     def _setup_autoregressive(
         self,
@@ -341,6 +406,8 @@ class HeliosPipeline(Pipeline):
         width: int,
         pyramid_steps: int,
         amplify_first_chunk: bool,
+        first_frame_image: str | None = None,
+        image_noise_sigma: float = 0.0,
     ) -> None:
         """Initialize autoregressive state for a new generation session."""
         logger.info(
@@ -428,13 +495,27 @@ class HeliosPipeline(Pipeline):
 
         generator = torch.Generator(device).manual_seed(seed)
 
+        # I2V: encode first-frame image if provided
+        encoded_image_latents: torch.Tensor | None = None
+        if first_frame_image is not None:
+            encoded_image_latents = self._encode_first_frame_image(
+                image_path=first_frame_image,
+                height=height,
+                width=width,
+                latents_mean=latents_mean,
+                latents_std=latents_std,
+                image_noise_sigma=image_noise_sigma,
+                generator=generator,
+            )
+
         self._ar_state = _HeliosARState(
             prompt_text=prompt_text,
             prompt_embeds=prompt_embeds,
             history_latents=history_latents,
-            image_latents=None,
+            image_latents=encoded_image_latents,
             total_generated_latent_frames=0,
             chunk_index=0,
+            first_frame_image=first_frame_image,
             height=height,
             width=width,
             num_latent_frames_per_chunk=num_latent_frames_per_chunk,
@@ -690,7 +771,23 @@ class HeliosPipeline(Pipeline):
         state.total_generated_latent_frames += latents.shape[2]
         state.history_latents = torch.cat([state.history_latents, latents], dim=2)
 
+        # Trim history to only what's needed for conditioning (num_history_latent_frames)
+        # and VAE decode (num_latent_frames_per_chunk). Without trimming, history_latents
+        # grows by 9 latent frames per chunk (~22MB each on H100), causing torch.cat to
+        # allocate progressively larger tensors → per-chunk slowdown → freeze escalation.
+        max_history_keep = state.num_history_latent_frames + num_latent_frames_per_chunk
+        if state.history_latents.shape[2] > max_history_keep:
+            state.history_latents = state.history_latents[
+                :, :, -max_history_keep:
+            ].contiguous()
+            logger.debug(
+                f"[helios] trimmed history_latents to {max_history_keep} frames "
+                f"(total_generated={state.total_generated_latent_frames})"
+            )
+
         # --- VAE decode this chunk ---
+        # Use total_generated to skip leading zeros from init, but Python slicing handles
+        # the case where total_generated > buffer size (returns the full buffer).
         real_history_latents = state.history_latents[
             :, :, -state.total_generated_latent_frames :
         ]
@@ -721,6 +818,17 @@ class HeliosPipeline(Pipeline):
             f"s{i}={pyramid_stage_times[i]:.3f}s"
             for i in range(len(pyramid_stage_times))
         )
+        hist_frames = state.history_latents.shape[2]
+        hist_mb = (
+            state.history_latents.numel()
+            * state.history_latents.element_size()
+            / 1024**2
+        )
+        gpu_alloc_gb = (
+            torch.cuda.memory_allocated() / 1024**3
+            if torch.cuda.is_available()
+            else 0.0
+        )
         logger.info(
             f"[helios] chunk={k} total={chunk_time:.3f}s "
             f"hist={t_history - chunk_start:.3f}s "
@@ -728,7 +836,9 @@ class HeliosPipeline(Pipeline):
             f"pyramid=[{stage_str}] "
             f"vae={t_vae - t_pyramid:.3f}s "
             f"post={t_post - t_vae:.3f}s "
-            f"frames={video.shape[0]}"
+            f"frames={video.shape[0]} "
+            f"hist_buf={hist_frames}f/{hist_mb:.0f}MB "
+            f"gpu={gpu_alloc_gb:.2f}GB"
         )
 
         state.chunk_index += 1

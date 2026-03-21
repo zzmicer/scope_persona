@@ -63,6 +63,33 @@ class HeliosConfig(BasePipelineConfig):
 
     supports_prompts: ClassVar[bool] = True
 
+    # I2V: optional first frame image path
+    first_frame_image: str | None = Field(
+        default=None,
+        description=(
+            "Path to an image used as the first frame for image-to-video generation. "
+            "When set, the image is VAE-encoded and used to anchor generation. "
+            "Leave empty for standard text-to-video generation."
+        ),
+        json_schema_extra=ui_field_config(
+            order=1, label="First Frame Image", component="image", category="input"
+        ),
+    )
+
+    image_noise_sigma: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Noise level added to the encoded first-frame latents. "
+            "Higher values increase motion amplitude at the cost of first-frame fidelity. "
+            "0.0 = exact first-frame anchor, ~0.12 = reference repo default."
+        ),
+        json_schema_extra=ui_field_config(
+            order=2, label="Image Noise Sigma", category="input"
+        ),
+    )
+
     # Resolution — Helios works best at 384x640
     height: int = Field(
         default=384,
