@@ -5,6 +5,18 @@
 - [~] Define product direction and update CLAUDE.md with persona vision
 - [~] Research character consistency techniques (persistent latent conditioning, reference image anchoring, IP-Adapter)
 
+## LongLive 2.0 (NVFP4) Integration
+
+See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeline on Wan2.2-TI2V-5B
+(text + image), NVFP4 W4A4 on RTX 5090. Native kernel phases run on the 5090, not macOS.
+
+- [ ] Phase 0: env/dep spike on 5090 — build fouroversix (CUDA_ARCHS=120), transformer-engine, flash-attn 2.8.3, kv_dequant ext; run upstream `inference.py --nproc_per_node=1` for reference clip
+- [~] Phase 1: scaffold `pipelines/wan2_2/` component layer (mirror of wan2_1) — causal 5B model, VAE 2.2 (48ch), loader
+- [~] Phase 2: scaffold `pipelines/longlive2/` — schema/config/artifacts/model.yaml/pipeline/registry (BF16 correctness gate)
+- [ ] Phase 3: NVFP4 path — port `setup_nvfp4_pipeline` (TE quant, model_te.pt), KV-cache quant kernel, precision/steps config
+- [ ] Phase 4: Scope integration — WebRTC, prompt-switch→multi-shot, I2V first-frame conditioning, VRAM tuning
+- [ ] Phase 5 (optional): VACE/LoRA parity
+
 ## Phase 1: Foundation — Action Schema & Interpreter
 
 - [ ] Design structured action/expression schema (Pydantic models for `{ action, expression, dialogue, intensity }`)

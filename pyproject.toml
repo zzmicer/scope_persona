@@ -63,6 +63,13 @@ dependencies = [
 kafka = [
     "aiokafka>=0.10.0",
 ]
+# LongLive 2.0 NVFP4 (Blackwell-only) backend. TransformerEngine installs from
+# PyPI; FourOverSix and the KV-dequant CUDA extension are source-built on the pod
+# (see src/scope/core/pipelines/wan2_2/nvfp4/README.md). flash-attn / triton are
+# already core deps. Install with: uv sync --extra longlive2-nvfp4
+longlive2-nvfp4 = [
+    "transformer-engine[pytorch]>=1.13; sys_platform == 'linux'",
+]
 
 [project.scripts]
 daydream-scope = "scope.server.app:main"

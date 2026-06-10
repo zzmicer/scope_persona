@@ -147,6 +147,7 @@ def _register_pipelines():
             "StreamDiffusionV2Pipeline",
         ),
         ("longlive", ".longlive.pipeline", "LongLivePipeline"),
+        ("longlive2", ".longlive2.pipeline", "LongLive2Pipeline"),
         (
             "krea_realtime_video",
             ".krea_realtime_video.pipeline",

@@ -1,0 +1,35 @@
+base_model_name: Wan2.2-TI2V-5B
+base_model_kwargs:
+  timestep_shift: 5.0           # upstream sample_shift for the 5B model (wan_ti2v_5B.py)
+  sink_size: 8                  # attention sink size (5B: 8 vs 1.3B: 3)
+generator_model_name: "generator"
+num_frame_per_block: 8          # 5B block size (vs 3 for the 1.3B LongLive)
+local_attn_size: 32             # local/streaming attention window (vs 12 for 1.3B)
+global_sink: true
+# Wan2.2 VAE: 16x spatial / 4x temporal compression (48 latent channels).
+vae_spatial_downsample_factor: 16
+vae_temporal_downsample_factor: 4
+patch_embedding_spatial_downsample_factor: 2
+max_rope_freq_table_seq_len: 1024
+# 4-step DMD distilled denoising schedule (nvfp4-s4 / bf16). The nvfp4-s2
+# checkpoint is a 2-step distillation; the active schedule is chosen at runtime
+# from the `precision` config field (see schema.PRECISION_STEPS).
+# TODO(longlive2-phase3): confirm the exact 5B denoising_step_list values from
+# upstream wan_5b/configs/wan_ti2v_5B.py (DMD timesteps), do not assume reuse of
+# the 1.3B [1000, 750, 500, 250] schedule.
+denoising_steps: [1000, 750, 500, 250]
+# Multi-shot (prompt-switching) parameters for the 5B model.
+multi_shot_sink: 8              # sink frames retained across shot transitions
+multi_shot_rope_offset: 8       # RoPE position offset applied per new shot
+adapter:
+  type: "lora"
+  # NOTE: the LongLive 2.0 performance LoRA is PRE-MERGED into the released
+  # inference checkpoints (model_*.pt). These rank/alpha values are recorded for
+  # provenance and for any re-training; no separate lora.pt is loaded at
+  # inference time (unlike LongLive 1, which loads models/lora.pt).
+  rank: 128                     # LoRA rank
+  alpha: 128                    # LoRA alpha (same as rank)
+  dropout: 0.0                  # LoRA dropout rate
+  dtype: "bfloat16"             # Data type for LoRA parameters
+  verbose: false                # Whether to print all target module names
+  pre_merged: true              # LoRA already merged into inference weights
