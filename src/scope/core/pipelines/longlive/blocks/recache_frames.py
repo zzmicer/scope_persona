@@ -117,11 +117,12 @@ class RecacheFramesBlock(ModularPipelineBlocks):
             latent_width = (
                 block_state.width // components.config.vae_spatial_downsample_factor
             )
+            latent_channels = getattr(components.config, "latent_channels", 16)
             block_state.recache_buffer = torch.zeros(
                 [
                     1,
                     components.config.local_attn_size,
-                    16,
+                    latent_channels,
                     latent_height,
                     latent_width,
                 ],

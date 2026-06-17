@@ -10,12 +10,13 @@
 See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeline on Wan2.2-TI2V-5B
 (text + image), NVFP4 W4A4 on RTX 5090. Native kernel phases run on the 5090, not macOS.
 
-- [ ] Phase 0: env/dep spike on 5090 — build fouroversix (CUDA_ARCHS=120), transformer-engine, flash-attn 2.8.3, kv_dequant ext; run upstream `inference.py --nproc_per_node=1` for reference clip
-- [~] Phase 1: scaffold `pipelines/wan2_2/` component layer (mirror of wan2_1) — causal 5B model, VAE 2.2 (48ch), loader
-- [~] Phase 2: scaffold `pipelines/longlive2/` — schema/config/artifacts/model.yaml/pipeline/registry (BF16 correctness gate)
-- [ ] Phase 3: NVFP4 path — port `setup_nvfp4_pipeline` (TE quant, model_te.pt), KV-cache quant kernel, precision/steps config
-- [ ] Phase 4: Scope integration — WebRTC, prompt-switch→multi-shot, I2V first-frame conditioning, VRAM tuning
+- [~] Phase 0: env/dep spike on Blackwell (RTX PRO 6000, sm_120) — kv_dequant ext BUILDS; fouroversix installs but import fails (transformers `WeightConverter` conflict); transformer-engine needs CUDA math+cudnn dev headers (build in progress). See `docs/longlive2-runpod-bringup.md`.
+- [x] Phase 1: scaffold `pipelines/wan2_2/` component layer — causal 5B model loads (825/825 keys match), VAE 2.2 (48ch) decodes
+- [x] Phase 2: `pipelines/longlive2/` BF16 correctness gate PASSED — renders coherent video on GPU after fixing model.yaml load, latent channels (16→48), and denoising schedule (frontend's 2-step [700,500] → 4-step [1000,750,500,250])
+- [ ] Phase 3: NVFP4 path — UNBLOCK: pin transformers for fouroversix, finish TE build; then validate nvfp4-s2 render + fps. Confirm real 5B DMD timesteps (2-step) from upstream.
+- [~] Phase 4: Scope integration — WebRTC/TURN FIXED (Cloudflare direct keys, validated); prompt-switch/I2V/VRAM tuning remain
 - [ ] Phase 5 (optional): VACE/LoRA parity
+- [ ] CI/Dockerfile: runtime image ships without nvcc/CUDA headers — fix so NVFP4 extensions can build on boot (see findings doc)
 
 ## Phase 1: Foundation — Action Schema & Interpreter
 

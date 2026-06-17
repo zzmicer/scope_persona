@@ -9,6 +9,9 @@ global_sink: true
 # Wan2.2 VAE: 16x spatial / 4x temporal compression (48 latent channels).
 vae_spatial_downsample_factor: 16
 vae_temporal_downsample_factor: 4
+# Latent channel count for noise/latent allocation (Wan2.2 VAE = 48, vs 16 for
+# Wan2.1). Consumed by the shared wan2_1 PrepareLatentsBlock.
+latent_channels: 48
 patch_embedding_spatial_downsample_factor: 2
 max_rope_freq_table_seq_len: 1024
 # 4-step DMD distilled denoising schedule (nvfp4-s4 / bf16). The nvfp4-s2

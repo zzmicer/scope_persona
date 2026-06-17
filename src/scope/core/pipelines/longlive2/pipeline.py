@@ -1,9 +1,11 @@
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 from diffusers.modular_pipelines import PipelineState
+from omegaconf import OmegaConf
 
 from ..blending import EmbeddingBlender
 from ..components import ComponentsManager
@@ -15,7 +17,7 @@ from ..defaults import (
 )
 from ..interface import Pipeline, Requirements
 from ..process import postprocess_chunk
-from ..utils import Quantization, load_model_config, validate_resolution
+from ..utils import Quantization, validate_resolution
 
 # wan2_2 component layer (parallel scaffold). These are the Wan2.2-TI2V-5B
 # equivalents of the wan2_1 wrappers used by LongLive 1. The text encoder is
@@ -64,7 +66,15 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
 
         precision = getattr(config, "precision", "nvfp4-s2")
 
-        model_config = load_model_config(config, __file__)
+        # Load model.yaml directly. NOTE: we cannot use the shared
+        # load_model_config() helper here because it probes
+        # getattr(config, "model_config"), which collides with Pydantic v2's
+        # reserved `model_config = ConfigDict(...)` on BasePipelineConfig. That
+        # reserved attribute is truthy, so the helper would return Pydantic's
+        # ConfigDict instead of the model.yaml contents, dropping required keys
+        # like `max_rope_freq_table_seq_len`. LongLive 1 avoids this only because
+        # it passes an OmegaConf config (no `model_config` attribute).
+        model_config = OmegaConf.load(Path(__file__).parent / "model.yaml")
         base_model_name = getattr(model_config, "base_model_name", "Wan2.2-TI2V-5B")
         base_model_kwargs = getattr(model_config, "base_model_kwargs", {})
         generator_model_name = getattr(
@@ -115,9 +125,7 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
             if nvfp4_available():
                 try:
                     start = time.time()
-                    generator = setup_nvfp4_pipeline(
-                        generator, model_config, device
-                    )
+                    generator = setup_nvfp4_pipeline(generator, model_config, device)
                     print(
                         f"Set up NVFP4 ({precision}) generator in "
                         f"{time.time() - start:.3f}s"
@@ -190,7 +198,33 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         self.state.set("base_seed", getattr(config, "base_seed", 42))
 
         # Resolve effective denoising steps from precision (or explicit override).
-        self.state.set("steps", config.resolve_steps())
+        num_steps = config.resolve_steps()
+        self.state.set("steps", num_steps)
+
+        # Precompute the DMD denoising-timestep SCHEDULE (the actual timestep
+        # values, not just the count). LongLive 2.0's 5B checkpoints are distilled
+        # for a fixed schedule; the base 4-step schedule comes from model.yaml
+        # (`denoising_steps`). For fewer steps (e.g. nvfp4-s2 = 2) we evenly
+        # subsample it. The generic frontend default (e.g. [700, 500], tuned for
+        # the 1.3B LongLive 1) does NOT match and yields pure noise, so _generate
+        # enforces this schedule whenever the incoming list length is wrong.
+        base_schedule = list(
+            getattr(model_config, "denoising_steps", DEFAULT_DENOISING_STEP_LIST)
+        )
+        if num_steps >= len(base_schedule):
+            self._denoising_step_list = base_schedule
+        else:
+            # Evenly sample `num_steps` timesteps from the base schedule, always
+            # keeping the highest-noise step first.
+            idx = (
+                [
+                    round(i * (len(base_schedule) - 1) / (num_steps - 1))
+                    for i in range(num_steps)
+                ]
+                if num_steps > 1
+                else [0]
+            )
+            self._denoising_step_list = [base_schedule[i] for i in idx]
 
         self.first_call = True
         self.last_mode = None  # Track mode for transition detection
@@ -232,8 +266,13 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         if "first_frame_image" not in kwargs:
             self.state.set("first_frame_image", None)
 
-        if self.state.get("denoising_step_list") is None:
-            self.state.set("denoising_step_list", DEFAULT_DENOISING_STEP_LIST)
+        # Enforce the precision-correct DMD schedule. The frontend default
+        # (e.g. [700, 500]) is a 2-step list tuned for the 1.3B LongLive 1 and
+        # produces pure noise on the 5B model. Override it whenever the incoming
+        # list is missing or has the wrong length for this precision.
+        incoming_steps = self.state.get("denoising_step_list")
+        if not incoming_steps or len(incoming_steps) != len(self._denoising_step_list):
+            self.state.set("denoising_step_list", list(self._denoising_step_list))
 
         # Apply mode-specific defaults
         mode = resolve_input_mode(kwargs)
