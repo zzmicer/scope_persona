@@ -650,6 +650,7 @@ class PipelineManager:
             "streamdiffusionv2",
             "passthrough",
             "longlive",
+            "longlive2",
             "krea-realtime-video",
             "reward-forcing",
             "memflow",
@@ -823,6 +824,62 @@ class PipelineManager:
                 dtype=torch.bfloat16,
             )
             logger.info("LongLive pipeline initialized")
+            return pipeline
+
+        elif pipeline_id == "longlive2":
+            from scope.core.pipelines.longlive2.pipeline import LongLive2Pipeline
+            from scope.core.pipelines.longlive2.schema import LongLive2Config
+
+            from .models_config import get_model_file_path, get_models_dir
+
+            # Build a real LongLive2Config (the pipeline calls config methods such
+            # as resolve_steps()). Only forward known schema fields from
+            # load_params (the config forbids extra fields).
+            field_names = set(LongLive2Config.model_fields.keys())
+            init_kwargs = {
+                k: v for k, v in (load_params or {}).items() if k in field_names
+            }
+            config = LongLive2Config(**init_kwargs)
+
+            # Resolve the generator checkpoint for the requested precision.
+            # Disk layout: models/<repo-last-segment>/<file> (see download_models).
+            precision_generator = {
+                "nvfp4-s2": "LongLive-2.0-5B-NVFP4-S2/model_te.pt",
+                "nvfp4-s4": "LongLive-2.0-5B-NVFP4-S4/model_te.pt",
+                "bf16": "LongLive-2.0-5B/model_bf16.pt",
+            }
+            generator_rel = precision_generator.get(
+                config.precision, precision_generator["nvfp4-s2"]
+            )
+
+            models_dir = get_models_dir()
+            # Inject runtime paths (not schema fields) onto the config object.
+            runtime_paths = {
+                "model_dir": str(models_dir),
+                "generator_path": str(get_model_file_path(generator_rel)),
+                "text_encoder_path": str(
+                    get_model_file_path(
+                        "WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+                    )
+                ),
+                "tokenizer_path": str(
+                    get_model_file_path("Wan2.2-TI2V-5B/google/umt5-xxl")
+                ),
+            }
+            for k, v in runtime_paths.items():
+                object.__setattr__(config, k, v)
+
+            quantization = None
+            if load_params:
+                quantization = load_params.get("quantization", None)
+
+            pipeline = LongLive2Pipeline(
+                config,
+                quantization=quantization,
+                device=torch.device("cuda"),
+                dtype=torch.bfloat16,
+            )
+            logger.info("LongLive2 pipeline initialized")
             return pipeline
 
         elif pipeline_id == "krea-realtime-video":
