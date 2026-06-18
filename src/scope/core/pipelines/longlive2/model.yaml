@@ -14,13 +14,28 @@ vae_temporal_downsample_factor: 4
 latent_channels: 48
 patch_embedding_spatial_downsample_factor: 2
 max_rope_freq_table_seq_len: 1024
-# 4-step DMD distilled denoising schedule (nvfp4-s4 / bf16). The nvfp4-s2
-# checkpoint is a 2-step distillation; the active schedule is chosen at runtime
-# from the `precision` config field (see schema.PRECISION_STEPS).
-# TODO(longlive2-phase3): confirm the exact 5B denoising_step_list values from
-# upstream wan_5b/configs/wan_ti2v_5B.py (DMD timesteps), do not assume reuse of
-# the 1.3B [1000, 750, 500, 250] schedule.
-denoising_steps: [1000, 750, 500, 250]
+# 4-step DMD distilled denoising schedule (nvfp4-s4 / bf16). The active schedule
+# is chosen at runtime from the `precision` config field (see schema.PRECISION_STEPS).
+#
+# VERIFIED from upstream NVlabs/LongLive (configs/nvfp4/train_dmd_nvfp4_step4.yaml):
+#   denoising_step_list: [1000, 946, 854, 681, 0]   with warp_denoising_step: false
+# Upstream uses the "boundaries" convention: 5 entries for sampling_steps=4, where
+# the generator is conditioned at [1000, 946, 854, 681] and the trailing 0 is the
+# final renoise-to-clean boundary. Our denoise loop (wan2_1/blocks/denoise.py)
+# uses the equivalent convention where the LAST entry is the final conditioning
+# timestep and there is NO trailing 0 (the last call outputs x0 directly). So the
+# upstream schedule maps to our list as [1000, 946, 854, 681] (trailing 0 dropped).
+# warp_denoising_step=false means these are used directly as timesteps — our loop
+# also feeds them directly, so this is consistent. Note these are front-loaded by
+# the shift=5.0 schedule (timestep_shift above), NOT the evenly-spaced 1.3B
+# [1000, 750, 500, 250] that was previously assumed here.
+#
+# TODO(longlive2-phase3): the 2-step (nvfp4-s2) schedule is still UNVERIFIED.
+# Upstream ships only sampling_steps=4 configs publicly; the S2 checkpoint was
+# distilled separately and likely has its own optimal 2 timesteps. The runtime
+# subsample of this 4-step list (-> [1000, 681]) is a real-valued heuristic, not
+# the confirmed s2 schedule. Confirm from the NVFP4-S2 release if/when published.
+denoising_steps: [1000, 946, 854, 681]
 # Multi-shot (prompt-switching) parameters for the 5B model.
 multi_shot_sink: 8              # sink frames retained across shot transitions
 multi_shot_rope_offset: 8       # RoPE position offset applied per new shot
