@@ -159,9 +159,7 @@ class Wan2_2_VAEWrapper(torch.nn.Module):
             latent = self._apply_encoding_normalization(latent, scale)
         else:
             # Batch encode with a one-time cache (does not affect stream state).
-            latent = self._encode_with_cache(
-                pixel, scale, self._create_encoder_cache()
-            )
+            latent = self._encode_with_cache(pixel, scale, self._create_encoder_cache())
 
         # [batch, channels, frames, h, w] -> [batch, frames, channels, h, w]
         return latent.permute(0, 2, 1, 3, 4)
@@ -215,10 +213,16 @@ class Wan2_2_VAEWrapper(torch.nn.Module):
         """
         # [batch, frames, channels, h, w] -> [batch, channels, frames, h, w]
         zs = latent.permute(0, 2, 1, 3, 4)
-        zs = zs.to(torch.bfloat16).to("cuda")
 
-        device, dtype = latent.device, latent.dtype
-        scale = self._get_scale(device, dtype)
+        # Decode on the VAE's own device (CUDA on Blackwell; the latent's device on
+        # CPU/macOS) rather than hardcoding "cuda", so the bf16 CPU fallback path
+        # the longlive2 pipeline advertises actually works.
+        try:
+            model_device = next(self.model.parameters()).device
+        except StopIteration:
+            model_device = latent.device
+        zs = zs.to(device=model_device, dtype=torch.bfloat16)
+        scale = self._get_scale(model_device, torch.bfloat16)
 
         if use_cache:
             output = self.model.stream_decode(zs, scale)

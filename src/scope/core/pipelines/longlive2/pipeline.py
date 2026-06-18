@@ -225,23 +225,34 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         base_schedule = list(
             getattr(model_config, "denoising_steps", DEFAULT_DENOISING_STEP_LIST)
         )
-        if num_steps >= len(base_schedule):
-            self._denoising_step_list = base_schedule
-        else:
-            # Evenly sample `num_steps` timesteps from the base schedule, always
-            # keeping the highest-noise step first.
-            idx = (
-                [
-                    round(i * (len(base_schedule) - 1) / (num_steps - 1))
-                    for i in range(num_steps)
-                ]
-                if num_steps > 1
-                else [0]
-            )
-            self._denoising_step_list = [base_schedule[i] for i in idx]
+        self._denoising_step_list = self._subsample_schedule(base_schedule, num_steps)
 
         self.first_call = True
         self.last_mode = None  # Track mode for transition detection
+
+    @staticmethod
+    def _subsample_schedule(base_schedule: list[int], num_steps: int) -> list[int]:
+        """Pick ``num_steps`` distilled timesteps from ``base_schedule``.
+
+        The 5B checkpoints are DMD-distilled for the fixed ``base_schedule`` (from
+        model.yaml, e.g. ``[1000, 946, 854, 681]``). When fewer steps are
+        requested we evenly sample, always keeping the highest-noise step first
+        (e.g. 2 steps -> ``[1000, 681]``). When ``num_steps`` >= the schedule
+        length we return the full schedule unchanged.
+
+        NOTE: the 2-step (nvfp4-s2) result is a heuristic subsample, not a
+        separately distilled schedule — see the TODO in model.yaml.
+        """
+        base_schedule = list(base_schedule)
+        if num_steps >= len(base_schedule):
+            return base_schedule
+        if num_steps <= 1:
+            return [base_schedule[0]]
+        idx = [
+            round(i * (len(base_schedule) - 1) / (num_steps - 1))
+            for i in range(num_steps)
+        ]
+        return [base_schedule[i] for i in idx]
 
     @staticmethod
     def _inject_nvfp4_config(model_config, config, precision, model_dir):

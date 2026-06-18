@@ -2,6 +2,18 @@ from diffusers.modular_pipelines import SequentialPipelineBlocks
 from diffusers.modular_pipelines.modular_pipeline_utils import InsertableDict
 from diffusers.utils import logging as diffusers_logging
 
+# NOTE: LongLive 2.0 reuses the LongLive 1 recache blocks for now. The 5B model's
+# multi-shot prompt switching (multi_shot_sink / multi_shot_rope_offset) may need
+# a dedicated recache/rope-offset block.
+# TODO(longlive2-phase3): if 5B multi-shot diverges from 1.3B recaching, port
+# upstream NVlabs/LongLive wan_5b multi-shot KV-cache handling into local blocks
+# (mirror longlive/blocks/{prepare_recache_frames,recache_frames}.py) instead of
+# importing the 1.3B versions below.
+from ..longlive.blocks import (
+    PrepareRecacheFramesBlock,
+    RecacheFramesBlock,
+)
+
 # The wan2_1 modular blocks operate on the shared pipeline State and are largely
 # model-agnostic (they call into components.generator / vae / scheduler), so the
 # LongLive 2.0 (Wan2.2-TI2V-5B) pipeline reuses them. Blocks that genuinely
@@ -18,18 +30,6 @@ from ..wan2_1.blocks import (
     SetTransformerBlocksLocalAttnSizeBlock,
     SetupCachesBlock,
     TextConditioningBlock,
-)
-
-# NOTE: LongLive 2.0 reuses the LongLive 1 recache blocks for now. The 5B model's
-# multi-shot prompt switching (multi_shot_sink / multi_shot_rope_offset) may need
-# a dedicated recache/rope-offset block.
-# TODO(longlive2-phase3): if 5B multi-shot diverges from 1.3B recaching, port
-# upstream NVlabs/LongLive wan_5b multi-shot KV-cache handling into local blocks
-# (mirror longlive/blocks/{prepare_recache_frames,recache_frames}.py) instead of
-# importing the 1.3B versions below.
-from ..longlive.blocks import (
-    PrepareRecacheFramesBlock,
-    RecacheFramesBlock,
 )
 
 logger = diffusers_logging.get_logger(__name__)

@@ -99,7 +99,9 @@ class LongLive2Config(BasePipelineConfig):
             "Blackwell only), 'nvfp4-s4' (4-step) is higher quality (Blackwell only), "
             "'bf16' is the portable fallback."
         ),
-        json_schema_extra=ui_field_config(order=1, is_load_param=True, label="Precision"),
+        json_schema_extra=ui_field_config(
+            order=1, is_load_param=True, label="Precision"
+        ),
     )
     height: int = Field(
         default=704,
@@ -140,6 +142,22 @@ class LongLive2Config(BasePipelineConfig):
             "(nvfp4-s2 -> 2, nvfp4-s4 / bf16 -> 4)."
         ),
         json_schema_extra=ui_field_config(order=5, is_load_param=True, label="Steps"),
+    )
+    # NVFP4 backend selection. Default FourOverSix (model_4o6.pt) is the validated
+    # path. TransformerEngine (model_te.pt) is EXPERIMENTAL/unverified in Scope —
+    # it requires the `transformer-engine` wheel on a Blackwell host and has not
+    # been render-verified here. Selecting it switches both the construction
+    # checkpoint (model_te.pt) and the setup_nvfp4_pipeline quantization path.
+    model_quant_use_transformer_engine: bool = Field(
+        default=False,
+        description=(
+            "Use the TransformerEngine NVFP4 backend (model_te.pt) instead of the "
+            "default FourOverSix backend (model_4o6.pt). Experimental: requires "
+            "transformer-engine on Blackwell and is not render-verified."
+        ),
+        json_schema_extra=ui_field_config(
+            order=6, is_load_param=True, label="Use TransformerEngine (experimental)"
+        ),
     )
 
     modes = {

@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import logging
+import os
 import threading
 import time
 from enum import Enum
@@ -841,8 +842,32 @@ class PipelineManager:
             }
             config = LongLive2Config(**init_kwargs)
 
-            # Resolve the generator checkpoint for the requested precision.
-            # Disk layout: models/<repo-last-segment>/<file> (see download_models).
+            # The entrypoint exposes the TE backend via LONGLIVE2_NVFP4_TE=1. Honor
+            # it as the default when the load params did not set the field, so the
+            # env opt-in actually reaches the config (without it, use_te is always
+            # False and the TE path is unreachable).
+            if "model_quant_use_transformer_engine" not in (load_params or {}):
+                if os.getenv("LONGLIVE2_NVFP4_TE") == "1":
+                    object.__setattr__(
+                        config, "model_quant_use_transformer_engine", True
+                    )
+            # use_te now flows into the config (read by _inject_nvfp4_config +
+            # setup_nvfp4_pipeline); it selects the SETUP-time weights, not the
+            # construction file resolved below.
+
+            # generator_path is the checkpoint loaded at WRAPPER CONSTRUCTION. For
+            # NVFP4 this is intentionally the merged BF16 base (model_te.pt), NOT
+            # the quantized model_4o6.pt:
+            #   * model_te.pt loads cleanly into the non-quantized CausalWanModel,
+            #     giving a valid BF16 model. The NVFP4 weights are then loaded by
+            #     setup_nvfp4_pipeline (it resolves model_4o6.pt / model_te.pt from
+            #     the backend via _inject_nvfp4_config and strict-loads them).
+            #   * model_4o6.pt stores `quantized_weight_values` + metadata and DROPS
+            #     the plain `weight` keys, so loading it into the plain model would
+            #     leave every linear uninitialized — fine once NVFP4 setup runs, but
+            #     it breaks the BF16 fallback used when NVFP4 is unavailable.
+            # So the BF16 base is the correct construction seed for BOTH backends.
+            # Disk layout: models/<repo-last-segment>/<file>.
             precision_generator = {
                 "nvfp4-s2": "LongLive-2.0-5B-NVFP4-S2/model_te.pt",
                 "nvfp4-s4": "LongLive-2.0-5B-NVFP4-S4/model_te.pt",

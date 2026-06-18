@@ -9,6 +9,7 @@
 # longlive2 pipeline calls ``setup_nvfp4_pipeline`` to quantize the 5B
 # generator and load the NVFP4 checkpoints.
 """NVFP4 pipeline setup: detect checkpoint type, quantize, load weights, wire KV-quant."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -33,7 +34,13 @@ def _torch_load(path: str):
         return torch.load(path, map_location="cpu")
 
 
-def load_generator_checkpoint(generator, checkpoint_path: str, *, use_ema: bool = False, strict: bool | None = None):
+def load_generator_checkpoint(
+    generator,
+    checkpoint_path: str,
+    *,
+    use_ema: bool = False,
+    strict: bool | None = None,
+):
     """Load a LongLive generator checkpoint into ``generator``."""
     checkpoint = _torch_load(checkpoint_path)
     state_dict = unwrap_generator_state_dict(checkpoint, use_ema=use_ema)
@@ -103,7 +110,9 @@ def apply_and_merge_lora(
 
     if verbose:
         print("[LoRA] Merging LoRA delta into base weights (merge_and_unload)...")
-    pipeline.generator.model = pipeline.generator.model.merge_and_unload(safe_merge=True)
+    pipeline.generator.model = pipeline.generator.model.merge_and_unload(
+        safe_merge=True
+    )
     pipeline.generator.model.eval().requires_grad_(False)
     pipeline.is_lora_enabled = False
     pipeline.is_lora_merged = True
@@ -166,7 +175,9 @@ def setup_nvfp4_pipeline(
     Returns the (mutated) ``pipeline`` with its quantized generator on ``device``.
     """
     if not bool(getattr(config, "model_quant", False)):
-        raise ValueError("setup_nvfp4_pipeline requires model_quant=true in the config.")
+        raise ValueError(
+            "setup_nvfp4_pipeline requires model_quant=true in the config."
+        )
 
     generator_ckpt = getattr(config, "generator_ckpt", None)
     if not generator_ckpt:
@@ -188,7 +199,9 @@ def setup_nvfp4_pipeline(
         )
 
     is_prequantized = is_nvfp4_state_dict(state_dict)
-    has_lora_request = bool(getattr(config, "adapter", None)) and bool(getattr(config, "lora_ckpt", None))
+    has_lora_request = bool(getattr(config, "adapter", None)) and bool(
+        getattr(config, "lora_ckpt", None)
+    )
 
     pipeline.is_lora_enabled = False
     pipeline.is_lora_merged = False
@@ -239,7 +252,9 @@ def setup_nvfp4_pipeline(
                 keep_master_weights=False,
                 verbose=verbose,
             )
-            te_fallback = bool(getattr(config, "model_quant_te_fallback_to_fouroversix", False))
+            te_fallback = bool(
+                getattr(config, "model_quant_te_fallback_to_fouroversix", False)
+            )
             if te_fallback:
                 from .quant import (
                     _materialize_mixed_quantized_weights_for_inference as materialize_fn,
@@ -259,7 +274,12 @@ def setup_nvfp4_pipeline(
                 _materialize_quantized_weights_for_inference as materialize_fn,
             )
 
-        pipeline.to(dtype=torch.bfloat16)
+        # NOTE: ``pipeline`` is a lightweight namespace exposing .generator /
+        # .text_encoder / .vae (see LongLive2Pipeline.__init__), NOT an nn.Module,
+        # so cast each component individually instead of pipeline.to(...).
+        pipeline.generator.to(dtype=torch.bfloat16)
+        pipeline.text_encoder.to(dtype=torch.bfloat16)
+        pipeline.vae.to(dtype=torch.bfloat16)
         materialize_fn(pipeline.generator.model, target_device=device)
 
     pipeline.generator.to(device=device)
