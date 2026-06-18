@@ -170,5 +170,98 @@ These need validation on the next CI image build + pod boot.
       (CUDA_HOME + PATH + build-time `nvcc` assertion), and have `entrypoint.sh`
       install the dev headers it needs for the NVFP4 build. **Still:** verify on the
       next CI build + pod boot.
-- [ ] Decide whether the frontend should stop sending a hardcoded
-      `denoising_step_list` for longlive2 (backend override now guards it anyway).
+- [x] Decide whether the frontend should stop sending a hardcoded
+      `denoising_step_list` for longlive2 — backend now ENFORCES the distilled
+      schedule unconditionally (see Session 2 below); the frontend's list is ignored.
+
+---
+
+# Session 2 — NVFP4 end-to-end bring-up (2026-06-18)
+
+**Branch:** `longlive2`. **GPU:** RTX PRO 6000 Blackwell **Max-Q** Workstation
+(sm_120, 96GB) — the Server Edition was out of stock. Goal: make the NVFP4
+(`nvfp4-s2`) path actually load + render, and chase the 45fps target.
+
+## Result: NVFP4 renders correctly (quality fixed); 45fps NOT reached (~6.7fps)
+
+A coherent, photorealistic render is produced from the real `model_4o6.pt`
+(FourOverSix) NVFP4 weights — verified by pulling an actual frame. Three real
+bugs + a dep-version maze were fixed to get there. Speed is bottlenecked by the
+**VAE decode**, not the transformer.
+
+## Bugs fixed (committed)
+
+1. **NVFP4 setup was never wired up** (`longlive2/pipeline.py`). It called
+   `setup_nvfp4_pipeline(generator, …)` passing the bare `WanDiffusionWrapper`, but
+   that function needs a pipeline-like object exposing `.generator/.text_encoder/
+   .vae` → it always threw `'WanDiffusionWrapper' object has no attribute
+   'generator'` and silently fell back to a **bf16 cast of `model_te.pt`** (the
+   "trash" render). **Fix:** build text-encoder + VAE *before* NVFP4 setup, pass a
+   `SimpleNamespace(generator, text_encoder, vae)` shim, and add
+   `_inject_nvfp4_config()` to reconcile the on-disk checkpoint path + quant recipe
+   (`model_quant`, `generator_ckpt` = `model_4o6.pt`, `scale_rule=mse`) that
+   `setup_nvfp4_pipeline` reads. The base generator still loads `model_te.pt` (BF16,
+   builds the architecture); the 4o6 weights replace it.
+
+2. **2-step schedule produced noise in the UI** (`longlive2/pipeline.py`). The
+   override only replaced the frontend's `denoising_step_list` on a *length*
+   mismatch. The UI's 2-step list (`[700,500]`-style, 1.3B-tuned) has the SAME
+   length as our 2-step `[1000,681]` but wrong VALUES → slipped through → noise.
+   (4 steps mismatched length → got overridden → looked OK, which is why "4 steps =
+   panda, 2 steps = noise".) **Fix:** ENFORCE the distilled schedule
+   unconditionally; ignore the UI's list entirely.
+
+3. **`from_blocked` import path drift** (`wan2_2/nvfp4/quant.py`). Newer fouroversix
+   re-exports it from `fouroversix.quantize`; older/bundled from
+   `quantize.quantized_tensor`. **Fix:** try/except both.
+
+## The fouroversix version maze (critical)
+
+- PyPI `fouroversix` (1.0.5) installs fast but is **incompatible** with the released
+  checkpoints: it serializes a **6-field** `quantized_weight_metadata`; the released
+  `model_4o6.pt` was made with the LongLive-bundled **1.1.0**, which uses a **4-field**
+  `torch.zeros(2+2)` layout (`[orig_r, orig_c, padded_r, padded_c]` = `[3072,3072,
+  3072,3072]`). Strict load fails with size mismatches `[4]` vs `[6]` otherwise.
+- **Install 1.1.0 from the repo** (`git+…NVlabs/LongLive#subdirectory=fouroversix`).
+  Pitfalls: needs the **cutlass submodule** (lives in `fouroversix/.gitmodules`,
+  ignored by the parent clone → clone `NVIDIA/cutlass` directly into
+  `third_party/cutlass`); needs `VIRTUAL_ENV=/app/.venv` for `uv pip install`;
+  `SKIP_CUDA_BUILD=1` installs without cutlass (correctness only, no fast matmul).
+- **The 1.1.0 build downgrades `nvidia-cudnn-cu12` to 9.10.x**, which makes the
+  Wan2.2 VAE 3D-conv select a ~72GB workspace algorithm → OOM on decode. **Restore
+  cudnn** (`uv pip install -U nvidia-cudnn-cu12`) after the build.
+- `entrypoint.sh` is updated to this exact recipe (FourOverSix default; TE opt-in
+  via `LONGLIVE2_NVFP4_TE=1`).
+
+## Why ~6.7fps (profile @ 704x1280, nvfp4-s2, 2-step)
+
+| stage | time/chunk | fps |
+|---|---|---|
+| **VAE decode (full Wan2.2 VAE)** | ~3.2s | **~10** ← bottleneck |
+| generator (transformer, 2-step NVFP4) | ~1.5s | ~20 |
+| total | ~4.8s | ~6.7 |
+
+- Cutlass FP4 matmul is built (`fouroversix._C.so`, 43MB) but **not dispatched** in
+  the generator — total fps is identical with/without it. The default
+  `model_quant_backend=None` uses the dequant path; need to set the cutlass backend.
+- **The 45fps path requires the LightVAE** (`mg_lightvae` / `mg_lightvae_v2`,
+  `utils/lightvae_5b_wrapper.py` upstream — a pruned `PrunableWanVAE` decoder). Our
+  pipeline uses the full Wan2.2 VAE. Not yet integrated.
+
+## TODO (45fps follow-up)
+
+- [ ] Integrate LightVAE (`LightVAE5BWrapper`/`PrunableWanVAE`) as an alternate
+      `vae_type` for longlive2 + download its checkpoint. **Dominant blocker.**
+- [ ] Dispatch the cutlass FP4 matmul backend in the generator (set
+      `model_quant_backend`) to speed the ~20fps transformer further.
+- [ ] Confirm/measure on a full-power Blackwell (5090/Server Edition) — Max-Q is
+      power-limited, so 45fps may be optimistic on this card even after the above.
+- [ ] Run-on-boot cutlass build is ~10-20 min; consider pre-baking fouroversix 1.1.0
+      into the image.
+
+## Pod / dep quick-reference (this session)
+
+- fouroversix 1.1.0 (repo + cutlass), transformers 5.12.1, torch 2.9.1+cu128,
+  cudnn 9.23.x (restored), flash_attn 2.8.3, kv_dequant built sm_120a.
+- Run the server with `PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce VAE
+  decode fragmentation.
