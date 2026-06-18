@@ -70,6 +70,18 @@ kafka = [
 longlive2-nvfp4 = [
     "transformer-engine[pytorch]>=1.13; sys_platform == 'linux'",
 ]
+# OmniForcing (LTX-2 causal audio-video). The LTX model code is NOT vendored
+# (LTX-2 Community License); it is installed from the OmniForcing repo as three
+# source packages (see [tool.uv.sources] below) plus audio deps. GPU host only
+# (H100/H200 class). Install with: uv sync --extra omniforcing
+# See src/scope/core/pipelines/omniforcing/docs/usage.md.
+omniforcing = [
+    "ltx-core; sys_platform == 'linux'",
+    "ltx-causal; sys_platform == 'linux'",
+    "ltx-distillation; sys_platform == 'linux'",
+    "soundfile; sys_platform == 'linux'",
+    "sentencepiece; sys_platform == 'linux'",
+]
 
 [project.scripts]
 daydream-scope = "scope.server.app:main"
@@ -119,6 +131,21 @@ sageattn3 = [
     # SA3 (SageAttention 3.0) — no prebuilt wheels yet; source install from
     # the sageattention3_blackwell subdirectory of the main repo.
     { git = "https://github.com/thu-ml/SageAttention", subdirectory = "sageattention3_blackwell", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+# OmniForcing LTX-2 packages — source-installed from the OmniForcing monorepo
+# (uv workspace). ltx-distillation pulls in ltx-core + ltx-pipelines by name, so
+# all four are mapped here. Linux/pod only. See the `omniforcing` extra above.
+ltx-core = [
+    { git = "https://github.com/OmniForcing/OmniForcing", subdirectory = "LTX-2/packages/ltx-core", marker = "sys_platform == 'linux'" },
+]
+ltx-causal = [
+    { git = "https://github.com/OmniForcing/OmniForcing", subdirectory = "LTX-2/packages/ltx-causal", marker = "sys_platform == 'linux'" },
+]
+ltx-pipelines = [
+    { git = "https://github.com/OmniForcing/OmniForcing", subdirectory = "LTX-2/packages/ltx-pipelines", marker = "sys_platform == 'linux'" },
+]
+ltx-distillation = [
+    { git = "https://github.com/OmniForcing/OmniForcing", subdirectory = "LTX-2/packages/ltx-distillation", marker = "sys_platform == 'linux'" },
 ]
 
 [[tool.uv.index]]

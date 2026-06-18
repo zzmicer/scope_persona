@@ -148,6 +148,7 @@ def _register_pipelines():
         ),
         ("longlive", ".longlive.pipeline", "LongLivePipeline"),
         ("longlive2", ".longlive2.pipeline", "LongLive2Pipeline"),
+        ("omniforcing", ".omniforcing.pipeline", "OmniForcingPipeline"),
         (
             "krea_realtime_video",
             ".krea_realtime_video.pipeline",

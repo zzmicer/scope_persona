@@ -5,6 +5,29 @@
 - [~] Define product direction and update CLAUDE.md with persona vision
 - [~] Research character consistency techniques (persistent latent conditioning, reference image anchoring, IP-Adapter)
 
+## OmniForcing (LTX-2 causal AV) Integration
+
+See plan: `.claude/plans/dreamy-frolicking-snail.md` and pipeline docs:
+`src/scope/core/pipelines/omniforcing/docs/usage.md`. New `omniforcing` pipeline:
+streaming autoregressive **audio+video** distilled from bidirectional LTX-2 (19B),
+Gemma-3-12B text encoder. ~60GB bf16 → H100/H200 only. Weights:
+`Exploration/omniforcing-ltx2-5s-causal` + gated `Lightricks/LTX-2` base.
+
+- [x] Phase 0: branch `omniforcing` + deps (`omniforcing` extra → ltx-core/causal/
+  distillation git-installed; soundfile/sentencepiece) + HF artifact ids/files verified.
+- [x] Phase 3: scope-side scaffold — `omniforcing/{schema,pipeline,runtime,model.yaml,
+  __init__}.py`, registry entry, import-safe offline; `runtime.is_available()` gates the
+  LTX stack. 7/7 CPU contract tests pass (`tests/test_omniforcing_contract.py`).
+- [~] Phase 1+2: LTX-2 stack + causal layer — NOT vendored (LTX-2 Community License);
+  installed via the `omniforcing` extra on the pod. `runtime.OmniForcingRuntime` body
+  (CausalLTXModel + VAEs + vocoder + Gemma + CausalAVInferencePipeline wiring) is the
+  documented pod bring-up step (currently raises NotImplementedError).
+- [ ] Phase 4: audio output plumbing — fork's WebRTC is video-only; add
+  `AudioProcessingTrack` + audio track in `server/webrtc.py` (90kHz A/V sync). Pipeline
+  already returns the AV dict; offline MP4-mux is the interim validation path.
+- [ ] Pod bring-up (H100/H200): confirm loader entry points + minimal weight subset,
+  implement `generate_chunk`, render-verify a coherent 5s clip with synced audio.
+
 ## LongLive 2.0 (NVFP4) Integration
 
 See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeline on Wan2.2-TI2V-5B

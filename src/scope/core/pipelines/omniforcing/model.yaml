@@ -1,0 +1,39 @@
+# OmniForcing (LTX-2 5s causal AV) model config.
+#
+# Mirrors longlive2/model.yaml: static, model-level constants that the pipeline
+# reads at construction. Runtime/UI knobs live in schema.py (OmniForcingConfig).
+#
+# Sources:
+#   - OmniForcing defaults: LTX-2/packages/ltx-distillation/scripts/
+#     omniforcing_causal_inference.py (--num-frames 121, 512x768, 24fps,
+#     --denoising-step-list 1000,909,725,421,0, --num-frame-per-block 3,
+#     --num-frame-per-block-first 4, audio sr 24000).
+#   - Base model: Lightricks/LTX-2 (ltx-2-19b-dev.safetensors).
+
+base_model_name: LTX-2-19B-dev
+# Consolidated base checkpoint (transformer + VAEs) that OmniForcing's ltx-core
+# loader reads; resolved under <model_dir>/LTX-2/ at load time.
+base_checkpoint: ltx-2-19b-dev.safetensors
+
+generator_model_name: omniforcing_ltx2_5s_causal
+
+# --- causal-forcing inference params (CausalAVInferencePipeline) ------------
+num_frame_per_block: 3          # frames per autoregressive block
+num_frame_per_block_first: 4    # frames in the first (priming) block
+context_noise: 0                # re-noise level applied to cached context
+num_train_timestep: 1000
+# Distilled per-block denoising schedule (timesteps). Trailing 0 = clean boundary.
+denoising_steps: [1000, 909, 725, 421, 0]
+
+# --- LTX-2 latent geometry --------------------------------------------------
+# LTX-2 video VAE: 32x spatial / 8x temporal compression. Latent frame count is
+# 1 + (num_frames - 1) // 8. Audio frames are aligned to video duration.
+vae_spatial_downsample_factor: 32
+vae_temporal_downsample_factor: 8
+
+# --- audio ------------------------------------------------------------------
+audio_sample_rate: 24000        # base audio VAE sample rate (vocoder may BWE to 48k)
+
+# --- text encoder -----------------------------------------------------------
+# Gemma-3-12B (bundled in the Lightricks/LTX-2 repo under text_encoder/ + tokenizer/).
+text_encoder_name: gemma-3-12b
