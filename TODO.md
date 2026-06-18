@@ -10,13 +10,14 @@
 See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeline on Wan2.2-TI2V-5B
 (text + image), NVFP4 W4A4 on RTX 5090. Native kernel phases run on the 5090, not macOS.
 
-- [~] Phase 0: env/dep spike on Blackwell (RTX PRO 6000, sm_120) — kv_dequant ext BUILDS; fouroversix installs but import fails (transformers `WeightConverter` conflict); transformer-engine needs CUDA math+cudnn dev headers (build in progress). See `docs/longlive2-runpod-bringup.md`.
+- [~] Phase 0: env/dep spike on Blackwell (RTX PRO 6000, sm_120) — kv_dequant ext BUILDS; fouroversix conflict ROOT-CAUSED (needs transformers>=5.0.0 for `WeightConverter`; entrypoint now upgrades it in NVFP4-only branch); transformer-engine dev headers now auto-installed by entrypoint. TE build + render still to validate on pod. See `docs/longlive2-runpod-bringup.md`.
 - [x] Phase 1: scaffold `pipelines/wan2_2/` component layer — causal 5B model loads (825/825 keys match), VAE 2.2 (48ch) decodes
-- [x] Phase 2: `pipelines/longlive2/` BF16 correctness gate PASSED — renders coherent video on GPU after fixing model.yaml load, latent channels (16→48), and denoising schedule (frontend's 2-step [700,500] → 4-step [1000,750,500,250])
-- [ ] Phase 3: NVFP4 path — UNBLOCK: pin transformers for fouroversix, finish TE build; then validate nvfp4-s2 render + fps. Confirm real 5B DMD timesteps (2-step) from upstream.
+- [x] Phase 2: `pipelines/longlive2/` BF16 correctness gate PASSED — renders coherent video on GPU after fixing model.yaml load, latent channels (16→48), and denoising schedule
+- [x] DMD timesteps: confirmed real 5B 4-step from upstream NVlabs/LongLive → `[1000, 946, 854, 681]` (was wrong assumed `[1000,750,500,250]`); set in model.yaml. 2-step s2 still unverified (no upstream sampling_steps:2 config; subsample = `[1000,681]`).
+- [ ] Phase 3: NVFP4 path — local prep DONE (transformers pin, dev-header automation). REMAINING (pod): finish TE build, validate nvfp4-s2 render + measure fps, confirm umt5 tolerates transformers v5.
 - [~] Phase 4: Scope integration — WebRTC/TURN FIXED (Cloudflare direct keys, validated); prompt-switch/I2V/VRAM tuning remain
 - [ ] Phase 5 (optional): VACE/LoRA parity
-- [ ] CI/Dockerfile: runtime image ships without nvcc/CUDA headers — fix so NVFP4 extensions can build on boot (see findings doc)
+- [~] CI/Dockerfile: runtime image was shipping without nvcc/CUDA headers — FIXED in Dockerfile (CUDA_HOME + PATH + build-time `nvcc` assertion) + entrypoint (auto-installs dev headers). Verify on next CI build + pod boot.
 
 ## Phase 1: Foundation — Action Schema & Interpreter
 

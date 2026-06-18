@@ -53,7 +53,32 @@ if [ "$LONGLIVE2_NVFP4" = "1" ]; then
   if [ -n "$KV_ARCH" ]; then
     if ! uv pip show transformer-engine > /dev/null 2>&1; then
       echo "Installing NVFP4 backend (TransformerEngine + FourOverSix + KV-dequant kernel, sm_${KV_ARCH})..."
+
+      # TransformerEngine builds from source (no prebuilt cu12/torch2.9/cp312
+      # wheel) and needs CUDA math + cuDNN *dev* headers. Some CUDA APT packages
+      # ship on hold and the dev headers aren't in the base image. Install them
+      # here so the build finds cudnn.h, cublas headers, and nvcc. Best-effort:
+      # don't abort the whole entrypoint if APT is unavailable.
+      echo "Installing CUDA/cuDNN dev headers for the TransformerEngine source build..."
+      apt-mark unhold libcublas-12-8 libcudnn9-cuda-12 2>/dev/null || true
+      apt-get update || true
+      apt-get install -y --no-install-recommends \
+        cuda-nvcc-12-8 \
+        cuda-cudart-dev-12-8 \
+        cuda-libraries-dev-12-8 \
+        libcudnn9-dev-cuda-12 \
+        ninja-build || echo "CUDA dev header install failed — TE build may fail."
+
       uv pip install --no-build-isolation "transformer-engine[pytorch]" || echo "TransformerEngine install failed."
+
+      # FourOverSix imports `WeightConverter` from transformers, which only exists
+      # in transformers >= 5.0.0 (the base lock pins 4.57.x to keep the BF16 path
+      # stable). Upgrade transformers here, in the NVFP4-only branch, before
+      # installing fouroversix. This runs before the server starts, so the whole
+      # process — including the umt5 tokenizer (AutoTokenizer, v5-safe) — runs on
+      # a single consistent transformers version.
+      echo "Upgrading transformers to >=5 for FourOverSix (NVFP4 path only)..."
+      uv pip install --no-build-isolation "transformers>=5.0.0" || echo "transformers>=5 upgrade failed — fouroversix import will fail."
       CUDA_ARCHS="${GPU_CC}" uv pip install --no-build-isolation fouroversix || echo "FourOverSix install failed."
       KVDIR="/app/src/scope/core/pipelines/wan2_2/nvfp4/kernels/kv_dequant"
       if [ -d "$KVDIR" ]; then
