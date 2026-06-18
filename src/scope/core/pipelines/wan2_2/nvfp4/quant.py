@@ -11,6 +11,7 @@
 # ``RuntimeError`` is raised only when a code path that genuinely needs them is
 # actually executed.
 """FourOverSix / TransformerEngine NVFP4 quantization + KV-cache dequant helpers."""
+
 from __future__ import annotations
 
 import importlib
@@ -63,7 +64,14 @@ def _require_fouroversix():
         quantize_model,
         quantize_to_fp4,
     )
-    from fouroversix.quantize.quantized_tensor import from_blocked
+
+    # `from_blocked` moved between fouroversix releases: newer wheels (>=1.0.x)
+    # re-export it from `fouroversix.quantize` (defined in dequantize_utils);
+    # older/bundled layouts kept it under `quantize.quantized_tensor`.
+    try:
+        from fouroversix.quantize import from_blocked
+    except ImportError:  # pragma: no cover - older fouroversix layout
+        from fouroversix.quantize.quantized_tensor import from_blocked
 
     return {
         "DataType": DataType,
@@ -163,7 +171,9 @@ def make_longlive_quantization_config(**kwargs):
                 raise TypeError("Quantization type must be a string.")
             if self.type not in QUANTIZATION_TYPE:
                 allowed = ", ".join(QUANTIZATION_TYPE.keys())
-                raise ValueError(f"Unknown quantization type '{self.type}'. Expected one of: {allowed}.")
+                raise ValueError(
+                    f"Unknown quantization type '{self.type}'. Expected one of: {allowed}."
+                )
 
             self.type = QUANTIZATION_TYPE[self.type]
 
@@ -223,7 +233,9 @@ def _warn_for_te_config_mismatch(model_quant_config) -> None:
     ScaleRule = syms["ScaleRule"]
 
     config_entries = [("default", model_quant_config)]
-    module_overrides = getattr(model_quant_config, "module_config_overrides", None) or {}
+    module_overrides = (
+        getattr(model_quant_config, "module_config_overrides", None) or {}
+    )
     config_entries.extend(sorted(module_overrides.items()))
 
     mismatched_rules = []
@@ -255,7 +267,9 @@ def _warn_for_te_config_mismatch(model_quant_config) -> None:
         )
 
 
-def _build_te_recipe(module_config: Any, te_recipe_kwargs: dict[str, Any] | None = None):
+def _build_te_recipe(
+    module_config: Any, te_recipe_kwargs: dict[str, Any] | None = None
+):
     syms = _require_fouroversix()
     RoundStyle = syms["RoundStyle"]
 
@@ -389,19 +403,25 @@ class TransformerEngineLinear(nn.Module):
                 return
             except Exception as copy_exc:
                 state_dict = {
-                    "weight": module.weight.detach().to(device=self.linear.weight.device),
+                    "weight": module.weight.detach().to(
+                        device=self.linear.weight.device
+                    ),
                 }
                 if module.bias is not None:
                     state_dict["bias"] = module.bias.detach().to(
                         device=self.linear.weight.device,
                     )
-                incompatible_keys = self.linear.load_state_dict(state_dict, strict=False)
+                incompatible_keys = self.linear.load_state_dict(
+                    state_dict, strict=False
+                )
                 missing_keys = [
                     key
                     for key in getattr(incompatible_keys, "missing_keys", [])
                     if key != "_extra_state"
                 ]
-                unexpected_keys = list(getattr(incompatible_keys, "unexpected_keys", []))
+                unexpected_keys = list(
+                    getattr(incompatible_keys, "unexpected_keys", [])
+                )
                 if missing_keys or unexpected_keys:
                     raise RuntimeError(
                         "Failed to load weights into TransformerEngine linear "
@@ -592,7 +612,8 @@ def _materialize_quantized_weights_for_inference(
 
     for module_name, module in model.named_modules():
         if not hasattr(module, "parameters_to_quantize") or not hasattr(
-            module, "get_quantized_parameters",
+            module,
+            "get_quantized_parameters",
         ):
             continue
 
@@ -615,11 +636,14 @@ def _materialize_quantized_weights_for_inference(
             else:
                 continue
 
-            master_weight_bytes += parameter_tensor.numel() * parameter_tensor.element_size()
+            master_weight_bytes += (
+                parameter_tensor.numel() * parameter_tensor.element_size()
+            )
             get_quantized_parameters = module.get_quantized_parameters
             if (
                 cache_transposed_weights
-                and "include_transposed" in inspect.signature(
+                and "include_transposed"
+                in inspect.signature(
                     get_quantized_parameters,
                 ).parameters
             ):
@@ -674,7 +698,9 @@ def _materialize_quantized_weights_for_inference(
                 delattr(module, "_quantized_weight_transposed")
             if hasattr(module, "_quantized_weights"):
                 delattr(module, "_quantized_weights")
-            if hasattr(module, "config") and hasattr(module.config, "keep_master_weights"):
+            if hasattr(module, "config") and hasattr(
+                module.config, "keep_master_weights"
+            ):
                 module.config.keep_master_weights = False
             materialized_modules.append(module_name)
 
@@ -737,7 +763,9 @@ def quantize_model_with_filter(
         model.to(torch.bfloat16)
 
     resolved_te_low_precision_weights = (
-        te_inference_only if te_low_precision_weights is None else te_low_precision_weights
+        te_inference_only
+        if te_low_precision_weights is None
+        else te_low_precision_weights
     )
 
     te_replaced_modules = quantize_model_with_optional_te(
@@ -767,8 +795,8 @@ def quantize_model_with_filter(
             print(
                 "[quantize_model_with_filter] "
                 f"materialized_modules={len(materialized_modules)}, "
-                f"master_weight={master_bytes / (1024 ** 3):.3f} GiB, "
-                f"quantized_weight={quantized_bytes / (1024 ** 3):.3f} GiB",
+                f"master_weight={master_bytes / (1024**3):.3f} GiB, "
+                f"quantized_weight={quantized_bytes / (1024**3):.3f} GiB",
             )
 
     if verbose:
@@ -794,7 +822,9 @@ def quantize_model_with_filter(
 # --------------------------------------------------------------------------- #
 # KV-cache quantization / dequantization.
 # --------------------------------------------------------------------------- #
-def _dequantize_kv_cache_fused_cuda(kv_list, max_blocks, num_heads, block_token_size, dtype):
+def _dequantize_kv_cache_fused_cuda(
+    kv_list, max_blocks, num_heads, block_token_size, dtype
+):
     global _FUSED_KV_DEQUANT_DISABLED, _FUSED_KV_DEQUANT_WARNED
 
     if _FUSED_KV_DEQUANT_DISABLED or max_blocks <= 0:
@@ -821,7 +851,9 @@ def _dequantize_kv_cache_fused_cuda(kv_list, max_blocks, num_heads, block_token_
             dtype=dtype,
             scale_rule=first_qt.scale_rule,
         )
-    except Exception as exc:  # pragma: no cover - exercised only when extension is stale/missing
+    except (
+        Exception
+    ) as exc:  # pragma: no cover - exercised only when extension is stale/missing
         _FUSED_KV_DEQUANT_DISABLED = True
         if not _FUSED_KV_DEQUANT_WARNED:
             warnings.warn(
@@ -833,14 +865,20 @@ def _dequantize_kv_cache_fused_cuda(kv_list, max_blocks, num_heads, block_token_
         return None
 
 
-def dequantize_kv_cache(kv_list, max_blocks, num_heads, block_token_size, dtype, device):
+def dequantize_kv_cache(
+    kv_list, max_blocks, num_heads, block_token_size, dtype, device
+):
     """
     Dequantize list of QuantizedTensor to a contiguous bf16 tensor.
     kv_list[block_idx] -> QuantizedTensor(block_token_size * num_heads, 128)
     Returns: [1, max_blocks * block_token_size, num_heads, 128]
     """
     fused_result = _dequantize_kv_cache_fused_cuda(
-        kv_list, max_blocks, num_heads, block_token_size, dtype,
+        kv_list,
+        max_blocks,
+        num_heads,
+        block_token_size,
+        dtype,
     )
     if fused_result is not None:
         return fused_result

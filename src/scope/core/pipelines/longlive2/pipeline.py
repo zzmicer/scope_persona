@@ -1,6 +1,7 @@
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -99,56 +100,10 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         # Initialize any additional, user-configured LoRA adapters via shared manager.
         generator.model = self._init_loras(config, generator.model)
 
-        # ------------------------------------------------------------------
-        # NVFP4 quantization (Blackwell-only path).
-        #
-        # For precision in {"nvfp4-s2", "nvfp4-s4"} the released checkpoints are
-        # NVFP4-quantized (model_te.pt = TransformerEngine, model_4o6.pt =
-        # FourOverSix). setup_nvfp4_pipeline (ported from upstream NVlabs/LongLive
-        # utils/inference_utils.py) installs the NVFP4 linears and loads the
-        # quantized weights. nvfp4_available() is False unless CUDA + TE/4o6 are
-        # importable, so on non-Blackwell hosts (incl. macOS) we cleanly fall back
-        # to a bf16 cast instead of erroring.
-        #
-        # The active artifact (repo + files) is PRECISION_ARTIFACTS[precision].
-        #
-        # NOTE: setup_nvfp4_pipeline keeps upstream's config-driven contract
-        # (model_quant_* keys, te/4o6 paths). The exact config-attribute mapping
-        # is reconciled on the Blackwell pod against the real checkpoints; any
-        # mismatch falls back to bf16 here rather than crashing the load.
-        # ------------------------------------------------------------------
-        _active_generator_artifact = PRECISION_ARTIFACTS.get(precision)  # noqa: F841
-
-        if precision in ("nvfp4-s2", "nvfp4-s4"):
-            from ..wan2_2.nvfp4 import nvfp4_available, setup_nvfp4_pipeline
-
-            if nvfp4_available():
-                try:
-                    start = time.time()
-                    generator = setup_nvfp4_pipeline(generator, model_config, device)
-                    print(
-                        f"Set up NVFP4 ({precision}) generator in "
-                        f"{time.time() - start:.3f}s"
-                    )
-                except Exception as exc:  # pragma: no cover - GPU-only path
-                    logger.warning(
-                        "LongLive2: NVFP4 setup for '%s' failed (%s); falling "
-                        "back to bf16 cast.",
-                        precision,
-                        exc,
-                    )
-                    generator = generator.to(device=device, dtype=dtype)
-            else:
-                logger.warning(
-                    "LongLive2: NVFP4 precision '%s' selected but the NVFP4 "
-                    "runtime is unavailable on this host (needs Blackwell + "
-                    "transformer-engine/fouroversix). Falling back to bf16 cast.",
-                    precision,
-                )
-                generator = generator.to(device=device, dtype=dtype)
-        else:
-            generator = generator.to(device=device, dtype=dtype)
-
+        # Text encoder + VAE are created BEFORE NVFP4 setup because
+        # setup_nvfp4_pipeline operates on a pipeline-like object exposing
+        # .generator / .text_encoder / .vae (it quantizes the generator and
+        # casts/moves all three).
         start = time.time()
         text_encoder = WanTextEncoderWrapper(
             model_name=base_model_name,
@@ -165,6 +120,65 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         vae = create_vae(model_dir=model_dir, model_name=base_model_name)
         print(f"Loaded VAE in {time.time() - start:.3f}s")
         vae = vae.to(device=device, dtype=dtype)
+
+        # ------------------------------------------------------------------
+        # NVFP4 quantization (Blackwell-only path).
+        #
+        # For precision in {"nvfp4-s2", "nvfp4-s4"} the released checkpoints are
+        # NVFP4-quantized: model_4o6.pt (FourOverSix, the default backend) is a
+        # pre-materialized NVFP4 state dict; model_te.pt (TransformerEngine) is a
+        # merged BF16 base. setup_nvfp4_pipeline (ported from upstream
+        # NVlabs/LongLive utils/inference_utils.py) installs the NVFP4 linears and
+        # loads the quantized weights onto a pipeline-like object. nvfp4_available()
+        # is False unless CUDA + fouroversix/TE are importable, so on non-Blackwell
+        # hosts (incl. macOS) we cleanly fall back to a bf16 cast instead of
+        # erroring. _inject_nvfp4_config reconciles the on-disk checkpoint path +
+        # quant recipe (model_quant_* keys) that setup_nvfp4_pipeline reads.
+        # ------------------------------------------------------------------
+        nvfp4_active = False
+        if precision in ("nvfp4-s2", "nvfp4-s4"):
+            from ..wan2_2.nvfp4 import nvfp4_available, setup_nvfp4_pipeline
+
+            if nvfp4_available():
+                try:
+                    self._inject_nvfp4_config(
+                        model_config, config, precision, model_dir
+                    )
+                    # setup_nvfp4_pipeline mutates .generator / .text_encoder / .vae
+                    # in place on a pipeline-like object (the bare generator wrapper
+                    # is not one).
+                    nvfp4_pipe = SimpleNamespace(
+                        generator=generator, text_encoder=text_encoder, vae=vae
+                    )
+                    start = time.time()
+                    setup_nvfp4_pipeline(nvfp4_pipe, model_config, device)
+                    generator = nvfp4_pipe.generator
+                    text_encoder = nvfp4_pipe.text_encoder
+                    vae = nvfp4_pipe.vae
+                    nvfp4_active = True
+                    print(
+                        f"Set up NVFP4 ({precision}) generator in "
+                        f"{time.time() - start:.3f}s"
+                    )
+                except Exception as exc:  # pragma: no cover - GPU-only path
+                    logger.warning(
+                        "LongLive2: NVFP4 setup for '%s' failed (%s); falling "
+                        "back to bf16 cast.",
+                        precision,
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "LongLive2: NVFP4 precision '%s' selected but the NVFP4 "
+                    "runtime is unavailable on this host (needs Blackwell + "
+                    "transformer-engine/fouroversix). Falling back to bf16 cast.",
+                    precision,
+                )
+
+        if not nvfp4_active:
+            # bf16 precision, or the NVFP4 fallback path. text_encoder/vae are
+            # already on device; only the generator still needs casting.
+            generator = generator.to(device=device, dtype=dtype)
 
         # Create components config
         components_config = {}
@@ -229,6 +243,39 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         self.first_call = True
         self.last_mode = None  # Track mode for transition detection
 
+    @staticmethod
+    def _inject_nvfp4_config(model_config, config, precision, model_dir):
+        """Reconcile the NVFP4 quant contract onto ``model_config``.
+
+        ``setup_nvfp4_pipeline`` reads ``model_quant`` / ``generator_ckpt`` /
+        scale-rule keys from the config. The released LongLive 2.0 NVFP4 repos ship
+        two backends side by side; we resolve the on-disk checkpoint from
+        ``model_dir`` + the precision artifact (disk layout
+        ``models/<repo-last-segment>/<file>``) and set the quant recipe to match
+        the released ``model_4o6.pt`` metadata (backend=fouroversix, scale_rule=mse).
+        """
+        if not model_dir:
+            raise ValueError("model_dir is required to resolve the NVFP4 checkpoint.")
+        use_te = bool(getattr(config, "model_quant_use_transformer_engine", False))
+        repo_seg = PRECISION_ARTIFACTS[precision].repo_id.split("/")[-1]
+        ckpt_file = "model_te.pt" if use_te else "model_4o6.pt"
+        generator_ckpt = str(Path(model_dir) / repo_seg / ckpt_file)
+        OmegaConf.update(model_config, "model_quant", True, force_add=True)
+        OmegaConf.update(
+            model_config, "model_quant_use_transformer_engine", use_te, force_add=True
+        )
+        OmegaConf.update(model_config, "generator_ckpt", generator_ckpt, force_add=True)
+        # Released NVFP4 checkpoints were quantized with the 'mse' scale rule (per
+        # model_4o6.pt quantization metadata); matching it keeps the quantized
+        # module structure consistent for the strict state-dict load.
+        for key in (
+            "model_quant_scale_rule",
+            "model_quant_activation_scale_rule",
+            "model_quant_weight_scale_rule",
+            "model_quant_gradient_scale_rule",
+        ):
+            OmegaConf.update(model_config, key, "mse", force_add=True)
+
     def prepare(self, **kwargs) -> Requirements | None:
         """Return input requirements based on current mode."""
         return prepare_for_mode(self.__class__, self.components.config, kwargs)
@@ -266,13 +313,15 @@ class LongLive2Pipeline(Pipeline, LoRAEnabledPipeline):
         if "first_frame_image" not in kwargs:
             self.state.set("first_frame_image", None)
 
-        # Enforce the precision-correct DMD schedule. The frontend default
-        # (e.g. [700, 500]) is a 2-step list tuned for the 1.3B LongLive 1 and
-        # produces pure noise on the 5B model. Override it whenever the incoming
-        # list is missing or has the wrong length for this precision.
-        incoming_steps = self.state.get("denoising_step_list")
-        if not incoming_steps or len(incoming_steps) != len(self._denoising_step_list):
-            self.state.set("denoising_step_list", list(self._denoising_step_list))
+        # Enforce the precision-correct DMD schedule UNCONDITIONALLY. These 5B
+        # checkpoints are DMD-distilled for a fixed timestep schedule
+        # (self._denoising_step_list, derived from precision/model.yaml), so the
+        # frontend's denoising_step_list must never be used. A length-only check is
+        # insufficient: the frontend's 2-step list (e.g. [700, 500], tuned for the
+        # 1.3B LongLive 1) has the SAME length as our 2-step schedule but the wrong
+        # VALUES, which slips past a length check and produces pure noise. Always
+        # overwrite with the distilled schedule regardless of what the UI sends.
+        self.state.set("denoising_step_list", list(self._denoising_step_list))
 
         # Apply mode-specific defaults
         mode = resolve_input_mode(kwargs)
