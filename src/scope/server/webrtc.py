@@ -659,34 +659,60 @@ class WebRTCManager:
 
 
 def create_rtc_config() -> RTCConfiguration:
-    """Setup RTCConfiguration with TURN credentials if available."""
+    """Setup RTCConfiguration with TURN credentials if available.
+
+    Provider precedence:
+      1. Cloudflare direct keys (CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN)
+         -> hits rtc.live.cloudflare.com directly.
+      2. Twilio (TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN).
+      3. HF token -> turn.fastrtc.org (deprecated; the Hugging Face FastRTC TURN
+         proxy is unreliable/defunct, so it is tried last).
+
+    A real TURN relay is required behind NAT/firewalls (e.g. RunPod); plain STUN
+    is only a best-effort last resort.
+    """
     try:
         from huggingface_hub import get_token
 
-        hf_token = get_token()
+        cf_key_id = os.getenv("CLOUDFLARE_TURN_KEY_ID")
+        cf_key_token = os.getenv("CLOUDFLARE_TURN_KEY_API_TOKEN")
         twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        hf_token = get_token()
 
         turn_provider = None
-        if hf_token:
-            turn_provider = "cloudflare"
+        turn_credentials = None
+        if cf_key_id and cf_key_token:
+            turn_provider = "cloudflare (direct keys)"
+            # Pass an empty hf_token so the helper uses the Cloudflare keys path
+            # instead of the defunct turn.fastrtc.org HF proxy.
+            turn_credentials = get_turn_credentials(method="cloudflare", hf_token="")
         elif twilio_account_sid and twilio_auth_token:
             turn_provider = "twilio"
-
-        if turn_provider:
-            turn_credentials = get_turn_credentials(method=turn_provider)
-
-            ice_servers = credentials_to_rtc_ice_servers(turn_credentials)
-            logger.info(
-                f"RTCConfiguration created with {turn_provider} and {len(ice_servers)} ICE servers"
+            turn_credentials = get_turn_credentials(method="twilio")
+        elif hf_token:
+            turn_provider = "cloudflare (HF fastrtc, deprecated)"
+            turn_credentials = get_turn_credentials(
+                method="cloudflare", hf_token=hf_token
             )
-            return RTCConfiguration(iceServers=ice_servers)
+
+        if turn_credentials is not None:
+            ice_servers = credentials_to_rtc_ice_servers(turn_credentials)
+            if ice_servers:
+                logger.info(
+                    f"RTCConfiguration created with {turn_provider} and "
+                    f"{len(ice_servers)} ICE servers"
+                )
+                return RTCConfiguration(iceServers=ice_servers)
+            logger.warning(
+                f"{turn_provider} returned no ICE servers; falling back to STUN"
+            )
         else:
             logger.info(
-                "No Twilio or HF_TOKEN credentials found, using default STUN server"
+                "No Cloudflare/Twilio/HF credentials found, using default STUN server"
             )
-            stun_server = RTCIceServer(urls=["stun:stun.l.google.com:19302"])
-            return RTCConfiguration(iceServers=[stun_server])
+        stun_server = RTCIceServer(urls=["stun:stun.l.google.com:19302"])
+        return RTCConfiguration(iceServers=[stun_server])
     except Exception as e:
         logger.warning(f"Failed to get TURN credentials, using default STUN: {e}")
         stun_server = RTCIceServer(urls=["stun:stun.l.google.com:19302"])

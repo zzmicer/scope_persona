@@ -35,7 +35,11 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV DAYDREAM_SCOPE_LOGS_DIR=/workspace/logs
 ENV DAYDREAM_SCOPE_MODELS_DIR=/workspace/models
-ENV PATH="/root/.local/bin:$PATH"
+# Pin CUDA toolkit location and put nvcc on PATH explicitly. The cudnn-devel base
+# already sets these, but we make them unconditional so the NVFP4 extensions
+# (TransformerEngine + kv_dequant) can compile on first boot via entrypoint.sh.
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="/root/.local/bin:/usr/local/cuda/bin:$PATH"
 
 WORKDIR /app
 
@@ -55,6 +59,12 @@ RUN apt-get update && apt-get install -y \
   libgomp1 \
   # Cleanup
   && rm -rf /var/lib/apt/lists/*
+
+# Fail the build loudly if the CUDA toolkit (nvcc + headers) is missing from the
+# runtime stage. The NVFP4 backend compiles native extensions on first boot, so a
+# toolkit-less image is a silent, shipped-to-prod regression. This guards against
+# the base image being swapped to a non-devel variant.
+RUN nvcc --version && test -f "$CUDA_HOME/include/cuda_runtime.h"
 
 # Install Node.js 20.x
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

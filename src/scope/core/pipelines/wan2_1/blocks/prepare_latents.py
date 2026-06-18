@@ -100,12 +100,16 @@ class PrepareLatentsBlock(ModularPipelineBlocks):
         if block_state.current_start_frame == 0 and num_latent_frames < 2:
             num_latent_frames = 2
 
-        # Generate empty latents (noise)
+        # Generate empty latents (noise). The latent channel count is VAE-specific:
+        # Wan2.1 VAE has 16 channels, Wan2.2 (TI2V-5B, LongLive 2.0) has 48. Read it
+        # from the model config so the shared block works for both; default to 16
+        # to preserve LongLive 1 / wan2_1 behavior.
+        latent_channels = getattr(components.config, "latent_channels", 16)
         latents = torch.randn(
             [
                 1,  # batch_size
                 num_latent_frames,
-                16,
+                latent_channels,
                 latent_height,
                 latent_width,
             ],

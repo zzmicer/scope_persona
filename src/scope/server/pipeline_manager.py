@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import logging
+import os
 import threading
 import time
 from enum import Enum
@@ -650,6 +651,7 @@ class PipelineManager:
             "streamdiffusionv2",
             "passthrough",
             "longlive",
+            "longlive2",
             "krea-realtime-video",
             "reward-forcing",
             "memflow",
@@ -823,6 +825,86 @@ class PipelineManager:
                 dtype=torch.bfloat16,
             )
             logger.info("LongLive pipeline initialized")
+            return pipeline
+
+        elif pipeline_id == "longlive2":
+            from scope.core.pipelines.longlive2.pipeline import LongLive2Pipeline
+            from scope.core.pipelines.longlive2.schema import LongLive2Config
+
+            from .models_config import get_model_file_path, get_models_dir
+
+            # Build a real LongLive2Config (the pipeline calls config methods such
+            # as resolve_steps()). Only forward known schema fields from
+            # load_params (the config forbids extra fields).
+            field_names = set(LongLive2Config.model_fields.keys())
+            init_kwargs = {
+                k: v for k, v in (load_params or {}).items() if k in field_names
+            }
+            config = LongLive2Config(**init_kwargs)
+
+            # The entrypoint exposes the TE backend via LONGLIVE2_NVFP4_TE=1. Honor
+            # it as the default when the load params did not set the field, so the
+            # env opt-in actually reaches the config (without it, use_te is always
+            # False and the TE path is unreachable).
+            if "model_quant_use_transformer_engine" not in (load_params or {}):
+                if os.getenv("LONGLIVE2_NVFP4_TE") == "1":
+                    object.__setattr__(
+                        config, "model_quant_use_transformer_engine", True
+                    )
+            # use_te now flows into the config (read by _inject_nvfp4_config +
+            # setup_nvfp4_pipeline); it selects the SETUP-time weights, not the
+            # construction file resolved below.
+
+            # generator_path is the checkpoint loaded at WRAPPER CONSTRUCTION. For
+            # NVFP4 this is intentionally the merged BF16 base (model_te.pt), NOT
+            # the quantized model_4o6.pt:
+            #   * model_te.pt loads cleanly into the non-quantized CausalWanModel,
+            #     giving a valid BF16 model. The NVFP4 weights are then loaded by
+            #     setup_nvfp4_pipeline (it resolves model_4o6.pt / model_te.pt from
+            #     the backend via _inject_nvfp4_config and strict-loads them).
+            #   * model_4o6.pt stores `quantized_weight_values` + metadata and DROPS
+            #     the plain `weight` keys, so loading it into the plain model would
+            #     leave every linear uninitialized — fine once NVFP4 setup runs, but
+            #     it breaks the BF16 fallback used when NVFP4 is unavailable.
+            # So the BF16 base is the correct construction seed for BOTH backends.
+            # Disk layout: models/<repo-last-segment>/<file>.
+            precision_generator = {
+                "nvfp4-s2": "LongLive-2.0-5B-NVFP4-S2/model_te.pt",
+                "nvfp4-s4": "LongLive-2.0-5B-NVFP4-S4/model_te.pt",
+                "bf16": "LongLive-2.0-5B/model_bf16.pt",
+            }
+            generator_rel = precision_generator.get(
+                config.precision, precision_generator["nvfp4-s2"]
+            )
+
+            models_dir = get_models_dir()
+            # Inject runtime paths (not schema fields) onto the config object.
+            runtime_paths = {
+                "model_dir": str(models_dir),
+                "generator_path": str(get_model_file_path(generator_rel)),
+                "text_encoder_path": str(
+                    get_model_file_path(
+                        "WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+                    )
+                ),
+                "tokenizer_path": str(
+                    get_model_file_path("Wan2.2-TI2V-5B/google/umt5-xxl")
+                ),
+            }
+            for k, v in runtime_paths.items():
+                object.__setattr__(config, k, v)
+
+            quantization = None
+            if load_params:
+                quantization = load_params.get("quantization", None)
+
+            pipeline = LongLive2Pipeline(
+                config,
+                quantization=quantization,
+                device=torch.device("cuda"),
+                dtype=torch.bfloat16,
+            )
+            logger.info("LongLive2 pipeline initialized")
             return pipeline
 
         elif pipeline_id == "krea-realtime-video":
