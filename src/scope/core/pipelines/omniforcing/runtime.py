@@ -419,6 +419,15 @@ class OmniForcingRuntime:
 
         # ---- streaming state (persists across generate_chunk calls) --------
         self.streaming = bool(getattr(config, "streaming", True))
+        # Windowed-decode tuning (see schema). The video VAE is non-causal, so we
+        # decode a sliding latent window with left context + right look-ahead and emit
+        # only the interior frames; this both kills the per-block boundary artifacts and
+        # bounds the decode cost (constant throughput instead of re-decoding the take).
+        self.decode_context_latents = int(getattr(config, "decode_context_latents", 2))
+        self.decode_lookahead_latents = int(
+            getattr(config, "decode_lookahead_latents", 1)
+        )
+        self.stream_audio = bool(getattr(config, "stream_audio", False))
         # Snap the requested stream budget (seconds) up to a valid causal block
         # layout: max_video_latent = num_frame_per_block_first + k*num_frame_per_block.
         stream_seconds = float(getattr(config, "stream_max_seconds", 12.0))
@@ -460,8 +469,14 @@ class OmniForcingRuntime:
         self._block_index = 0
         self._video_latent_history = None  # [B, F, 128, h, w] accumulated, on GPU
         self._audio_latent_history = None  # [B, F_a, 128] accumulated, on GPU
-        self._emitted_video_frames = 0  # pixel frames already streamed out
+        # Number of leading latent frames whose pixels have been emitted (windowed
+        # decode bookkeeping). Pixels for a decode of L latents = 1 + 8*(L-1).
+        self._decoded_latent_count = 0
         self._emitted_audio_samples = 0
+        # Per-block timing accumulators (for periodic throughput logging).
+        self._gen_time_acc = 0.0
+        self._decode_time_acc = 0.0
+        self._timed_blocks = 0
 
     def generate_chunk(
         self,
@@ -541,12 +556,38 @@ class OmniForcingRuntime:
             first = True
             v_len = self.num_frame_per_block_first
 
-        with torch.no_grad():
-            denoised_v, denoised_a = self._generate_block(first=first)
-            new_video, new_audio, audio_t0 = self._decode_new(denoised_v, denoised_a)
+        import time
 
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
+        with torch.no_grad():
+            t0 = time.time()
+            denoised_v, denoised_a = self._generate_block(first=first)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.time()
+            new_video, new_audio = self._decode_new(denoised_v, denoised_a)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.time()
+
+        # Periodic throughput log (every 10 blocks) to keep diagnosis cheap.
+        self._gen_time_acc += t1 - t0
+        self._decode_time_acc += t2 - t1
+        self._timed_blocks += 1
+        if self._timed_blocks >= 10:
+            n = self._timed_blocks
+            logger.info(
+                "OmniForcing stream: %d blocks avg gen=%.3fs decode=%.3fs "
+                "(~%.1f fps) latent=%d/%d",
+                n,
+                self._gen_time_acc / n,
+                self._decode_time_acc / n,
+                (self.num_frame_per_block * 8.0)
+                / max(1e-6, (self._gen_time_acc + self._decode_time_acc) / n),
+                self._video_start,
+                self._max_video_latent_frames,
+            )
+            self._gen_time_acc = self._decode_time_acc = 0.0
+            self._timed_blocks = 0
 
         num_new = int(new_video.shape[0])
         # Timestamps are relative to this chunk (scope re-bases per chunk anyway).
@@ -675,35 +716,65 @@ class OmniForcingRuntime:
         self._block_index += 1
         return denoised_v, denoised_a
 
-    def _decode_new(self, denoised_v: Any, denoised_a: Any) -> tuple[Any, Any, float]:
-        """Decode only the newly-revealed pixel frames / audio samples for this block.
+    @staticmethod
+    def _px_for_latents(m: int) -> int:
+        """Pixel frames produced by decoding the first ``m`` latents of a window.
 
-        Strategy (correctness-first; the #1 thing to tune on the pod): the LTX video
-        VAE is causal, so decoding a mid-stream block in isolation mis-aligns frame
-        counts. We instead decode the GROWING accumulated latent and slice off the
-        frames/samples not yet emitted. This is correct but re-decodes the take each
-        block; a left-context-overlap incremental decode is the follow-up optimization.
+        The LTX video VAE upsamples time by 8 but the FIRST latent of any decode input
+        is a key-frame -> 1 pixel frame; every subsequent latent -> 8. So a decode of
+        ``L`` latents yields ``1 + 8*(L-1)`` pixel frames.
+        """
+        return 0 if m <= 0 else 1 + 8 * (m - 1)
+
+    def _decode_new(self, denoised_v: Any, denoised_a: Any) -> tuple[Any, Any]:
+        """Decode the newly-finalized pixel frames for this block (windowed).
+
+        The video VAE is non-causal, so a frame's decode depends on neighbouring latents
+        on both sides. We therefore decode a sliding window
+        ``[decoded - context, F]`` (left context + the new latents + the look-ahead
+        latents), emit only the interior frames up to ``F - lookahead`` (so emitted
+        frames have future context), drop the left-context pixels, and hold back the
+        look-ahead latents for a later block. This bounds the decode to ~``context +
+        block + lookahead`` latents (constant cost) and removes the per-block boundary
+        artifacts of decoding growing prefixes.
+
+        Audio is skipped unless ``stream_audio`` is set (the WebRTC transport is
+        video-only today, so decoding audio per block is pure waste).
         """
         import torch
 
-        # --- video ---
+        # Accumulate latents (kept for left context; bounded by the stream budget).
         self._video_latent_history = (
             denoised_v
             if self._video_latent_history is None
             else torch.cat([self._video_latent_history, denoised_v], dim=1)
         )
-        video_pixel = self.video_vae.decode_to_pixel(self._video_latent_history)
+        total = int(self._video_latent_history.shape[1])
+
+        ctx = self.decode_context_latents
+        look = self.decode_lookahead_latents
+        emit_upto = total - look  # don't emit frames whose future context is unwritten
+        empty = torch.empty((0, self.height, self.width, 3), dtype=torch.float32)
+        if emit_upto <= self._decoded_latent_count:
+            return empty, None  # nothing finalized this block (waiting on look-ahead)
+
+        win_start = max(0, self._decoded_latent_count - ctx)
+        window = self._video_latent_history[:, win_start:total]
+        video_pixel = self.video_vae.decode_to_pixel(window)  # [1, C, T, H, W]
         video = video_pixel[0]
         if video.shape[0] == 3:  # [C, T, H, W] -> [T, C, H, W]
             video = video.permute(1, 0, 2, 3)
         video = video.permute(0, 2, 3, 1).clamp(0, 1).float().cpu()  # [T, H, W, C]
-        new_video = video[self._emitted_video_frames :]
-        self._emitted_video_frames = int(video.shape[0])
 
-        # --- audio ---
+        # Slice out the interior frames for latents [decoded_count, emit_upto), relative
+        # to the window start (which the decoder treats as a key-frame).
+        start_px = self._px_for_latents(self._decoded_latent_count - win_start)
+        end_px = self._px_for_latents(emit_upto - win_start)
+        new_video = video[start_px:end_px]
+        self._decoded_latent_count = emit_upto
+
         new_audio = None
-        audio_t0 = 0.0
-        if denoised_a is not None:
+        if self.stream_audio and denoised_a is not None:
             self._audio_latent_history = (
                 denoised_a
                 if self._audio_latent_history is None
@@ -712,13 +783,12 @@ class OmniForcingRuntime:
             try:
                 waveform = self.audio_vae.decode_to_waveform(self._audio_latent_history)
                 audio_full = waveform[0].float().cpu()  # [channels, samples]
-                audio_t0 = self._emitted_audio_samples / float(self.audio_sample_rate)
                 new_audio = audio_full[..., self._emitted_audio_samples :]
                 self._emitted_audio_samples = int(audio_full.shape[-1])
             except Exception as exc:  # pragma: no cover - audio decode is best-effort
                 logger.warning("OmniForcing: audio decode failed: %s", exc)
 
-        return new_video, new_audio, audio_t0
+        return new_video, new_audio
 
     # ------------------------------------------------------------------
     # One-shot (legacy / non-streaming) path — regenerates a full clip per call.

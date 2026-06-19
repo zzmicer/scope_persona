@@ -32,13 +32,17 @@ Gemma-3-12B text encoder. ~60GB bf16 → H100/H200 only. Weights:
   `AudioProcessingTrack` + audio track in `server/webrtc.py` (90kHz A/V sync). Pipeline
   already returns the AV dict; offline MP4-mux is the interim validation path.
 - [~] Continuous streaming `generate_chunk` (block-by-block + persistent KV cache) —
-  DRAFTED on `omniforcing` branch (runtime `_generate_streaming`/`_generate_block`/
-  `_decode_new`, `streaming`+`stream_max_seconds` schema knobs, 9/9 CPU contract tests).
-  Mirrors upstream `CausalAVInferencePipeline.generate` but one block/call against
-  `init_av_kv_caches`. NOT yet pod-verified. Pod TODO: (1) confirm coherent non-looping
-  long take + measure drift past ~5s (ckpt distilled at 5s); (2) tune incremental decode
-  (`_decode_new` re-decodes the growing latent each block → switch to left-context-
-  overlap decode for real-time); (3) check VRAM at the 12s budget (~18GB video cache).
+  on `omniforcing` branch. First pod test (2026-06-20, H100 NVL 94GB): LOOP FIXED (231
+  continuous frames, no OOM at 12s budget), BUT ~2fps + quality bad from frame 1.
+  Root-caused: `_decode_new` re-decoded the whole growing clip each block (2fps), and the
+  LTX-2 video VAE is NON-causal (`causal_decoder` False) so decoding growing prefixes
+  gave per-block boundary artifacts. FIXED offline: windowed decode (left context +
+  right look-ahead, emit interior frames only → bounded/constant cost + bilateral
+  context), skip audio decode while streaming (WebRTC is video-only), per-block timing
+  logs, knobs `decode_context_latents`/`decode_lookahead_latents`/`stream_audio`.
+  11/11 CPU contract tests (incl. windowed-decode bookkeeping). NOT yet re-tested on pod.
+  Pod TODO: re-test quality + fps; tune ctx/look to the VAE's temporal receptive field;
+  then measure >5s drift (ckpt distilled at 5s).
 - [ ] OmniForcing follow-ups: text-encoder offload (Gemma ~24GB resident → CPU after
   encode for headroom); confirm clean `uv sync --extra omniforcing` from scratch (pod
   was bootstrapped via `uv pip install`).

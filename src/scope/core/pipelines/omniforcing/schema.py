@@ -195,6 +195,43 @@ class OmniForcingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=8, is_load_param=True),
     )
 
+    # Streaming decode tuning. The LTX-2 video VAE is non-causal by default
+    # (config "causal_decoder" False), so a frame's decode depends on neighbouring
+    # latents on BOTH sides. To stream without per-block boundary artifacts we decode
+    # a sliding window of latents with left context + a right look-ahead, emitting only
+    # the well-conditioned interior frames. These bound the per-block decode cost (so
+    # throughput stays constant) and control the artifact/latency trade-off.
+    decode_context_latents: int = Field(
+        default=2,
+        ge=0,
+        le=8,
+        description=(
+            "Left-context latent frames included in each streaming decode window "
+            "(dropped from output). Higher = fewer left-boundary artifacts."
+        ),
+        json_schema_extra=ui_field_config(order=9, is_load_param=True),
+    )
+    decode_lookahead_latents: int = Field(
+        default=1,
+        ge=0,
+        le=8,
+        description=(
+            "Right look-ahead latent frames held back before a frame is emitted, so "
+            "emitted frames have future context (non-causal VAE). Higher = fewer "
+            "right-boundary artifacts but +latency (~0.33s per latent)."
+        ),
+        json_schema_extra=ui_field_config(order=9, is_load_param=True),
+    )
+    stream_audio: bool = Field(
+        default=False,
+        description=(
+            "Decode the audio track during streaming. Off by default because the "
+            "WebRTC transport is video-only (Phase 4); decoding audio per block is "
+            "wasted compute until the audio track lands."
+        ),
+        json_schema_extra=ui_field_config(order=9, is_load_param=True),
+    )
+
     # OmniForcing's distilled per-block denoising schedule (timesteps). The
     # upstream default is [1000, 909, 725, 421, 0] (the trailing 0 is the clean
     # boundary). Exposed as a knob; verify empirically on the pod.

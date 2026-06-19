@@ -44,6 +44,23 @@ def test_streaming_config_defaults():
     c = OmniForcingConfig()
     assert c.streaming is True
     assert 0.0 < c.stream_max_seconds <= 20.0
+    # Windowed-decode tuning knobs (non-causal VAE: left context + right look-ahead).
+    assert c.decode_context_latents >= 0
+    assert c.decode_lookahead_latents >= 0
+    assert c.stream_audio is False  # WebRTC is video-only today
+
+
+def test_latent_to_pixel_mapping():
+    """Decoding L latents yields 1 + 8*(L-1) pixel frames (first latent = key-frame)."""
+    from scope.core.pipelines.omniforcing.runtime import OmniForcingRuntime
+
+    px = OmniForcingRuntime._px_for_latents
+    assert px(0) == 0
+    assert px(1) == 1  # lone key-frame
+    assert px(4) == 25  # first block (4 latents) -> 25 px
+    assert px(16) == 121  # 5s @ 24fps (the released checkpoint's clip length)
+    # Per-block emitted pixels = 8 * num_frame_per_block once past the key-frame.
+    assert px(5) - px(2) == 24
 
 
 def test_snap_to_block_layout_math():
@@ -69,6 +86,55 @@ def test_snap_to_block_layout_math():
     assert snap(stub, 17) == 19  # 4 + 5*3
     # Upstream block-size constants (mask_builder): 4+26 first, 3+25 thereafter.
     assert (_AUDIO_FRAMES_FIRST_BLOCK, _AUDIO_FRAMES_PER_BLOCK) == (26, 25)
+
+
+def test_windowed_decode_bookkeeping():
+    """Drive the real _decode_new with a stub VAE: emitted frame counts must be
+    contiguous and match the global latent->pixel mapping, with no drift, while the
+    decode window stays bounded (constant cost)."""
+    import torch
+
+    from scope.core.pipelines.omniforcing.runtime import OmniForcingRuntime
+
+    px = OmniForcingRuntime._px_for_latents
+    H = W = 32
+
+    class _StubVAE:
+        last_window_len = 0
+
+        def decode_to_pixel(self, window):
+            length = int(window.shape[1])
+            _StubVAE.last_window_len = length
+            return torch.zeros(1, 3, px(length), H, W)
+
+    rt = OmniForcingRuntime.__new__(OmniForcingRuntime)
+    rt.decode_context_latents = 2
+    rt.decode_lookahead_latents = 1
+    rt.stream_audio = False
+    rt.height, rt.width = H, W
+    rt.video_vae = _StubVAE()
+    rt._video_latent_history = None
+    rt._decoded_latent_count = 0
+    rt._emitted_audio_samples = 0
+
+    block_sizes = [4, 3, 3, 3, 3, 3]  # first block 4 latents, then 3
+    total_latents = 0
+    total_emitted = 0
+    max_window = 0
+    for v_len in block_sizes:
+        blk = torch.zeros(1, v_len, 128, 1, 1)
+        new_video, _ = rt._decode_new(blk, None)
+        total_latents += v_len
+        total_emitted += int(new_video.shape[0])
+        max_window = max(max_window, _StubVAE.last_window_len)
+        # Cumulative emitted pixels must equal the global mapping up to emit_upto.
+        emit_upto = total_latents - rt.decode_lookahead_latents
+        assert total_emitted == px(emit_upto), (v_len, total_emitted, px(emit_upto))
+        assert new_video.shape[1:] == (H, W, 3)
+
+    # Window (decode cost) stays bounded ~ context + block + lookahead, never the
+    # whole take -> constant throughput.
+    assert max_window <= 4 + 2 + 1
 
 
 def test_artifacts_point_at_expected_repos():
