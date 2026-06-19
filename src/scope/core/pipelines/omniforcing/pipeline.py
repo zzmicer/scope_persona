@@ -18,6 +18,8 @@ import torch
 from diffusers.modular_pipelines import PipelineState
 from omegaconf import OmegaConf
 
+from scope.core.config import get_models_dir
+
 from ..defaults import prepare_for_mode, resolve_input_mode
 from ..interface import Pipeline, Requirements
 from ..utils import Quantization, validate_resolution
@@ -37,11 +39,23 @@ class OmniForcingPipeline(Pipeline):
 
     def __init__(
         self,
-        config,
+        config=None,
         quantization: Quantization | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        **load_params,
     ):
+        # Plugin load path: the pipeline manager constructs plugin pipelines as
+        # ``pipeline_class(**merged_params)`` where ``merged_params`` are the config
+        # field values (schema defaults overridden by UI load params), NOT a
+        # ``config`` object. Build the config from those; the explicit ``config=``
+        # path (tests / builtin-style construction) is also supported.
+        if config is None:
+            field_names = set(OmniForcingConfig.model_fields)
+            config = OmniForcingConfig(
+                **{k: v for k, v in load_params.items() if k in field_names}
+            )
+
         # LTX-2 video VAE downsamples 32x spatially -> height/width multiples of 32.
         validate_resolution(
             height=config.height,
@@ -55,7 +69,9 @@ class OmniForcingPipeline(Pipeline):
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
 
-        model_dir = getattr(config, "model_dir", None)
+        # The plugin path doesn't inject model_dir; resolve it from scope config
+        # (DAYDREAM_SCOPE_MODELS_DIR / default), matching download_models.
+        model_dir = getattr(config, "model_dir", None) or str(get_models_dir())
         self.model_config = OmegaConf.load(Path(__file__).parent / "model.yaml")
 
         # Build the GPU runtime (loads LTX-2 base + OmniForcing generator + VAEs +

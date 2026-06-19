@@ -48,12 +48,19 @@ OMNIFORCING_GENERATOR_ARTIFACT = HuggingfaceRepoArtifact(
 #     audio VAE + vocoder + connectors (create_vae_wrappers reads the vocoder from
 #     THIS file, so the per-component vae/ audio_vae/ vocoder/ connectors/ dirs are
 #     NOT needed).
-#   - text_encoder/ (model-*.safetensors only) + tokenizer/ : the Gemma-3 text
+#   - text_encoder/ (the model-* shard set only) + tokenizer/ : the Gemma-3 text
 #     encoder. The loader's gemma_root_path is the LTX-2 *root* and does a
 #     recursive rglob for tokenizer.model / preprocessor_config.json / model*.
 #     safetensors, so both dirs must sit under the same root. We fetch only the
 #     `model-*` shard set (the duplicate `diffusion_pytorch_model-*` set in
 #     text_encoder/ is ~24GB and unused).
+# NOTE: the shards are listed EXPLICITLY (not as a `model-*` glob): the
+# download-status check (`models_are_downloaded` → `get_required_model_files`)
+# resolves each `files` entry to a literal Path with no glob expansion, so a glob
+# entry would never `.exists()` and the UI would report models as missing forever.
+_LTX2_GEMMA_SHARDS = [
+    f"text_encoder/model-{i:05d}-of-00011.safetensors" for i in range(1, 12)
+]
 LTX2_BASE_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="Lightricks/LTX-2",
     files=[
@@ -62,7 +69,7 @@ LTX2_BASE_ARTIFACT = HuggingfaceRepoArtifact(
         "text_encoder/config.json",
         "text_encoder/generation_config.json",
         "text_encoder/model.safetensors.index.json",
-        "text_encoder/model-*.safetensors",
+        *_LTX2_GEMMA_SHARDS,
         "tokenizer",
     ],
 )
