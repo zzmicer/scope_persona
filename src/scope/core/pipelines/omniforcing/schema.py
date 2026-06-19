@@ -167,6 +167,34 @@ class OmniForcingConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(order=6, is_load_param=True),
     )
 
+    # --- streaming (continuous long-video) controls ---------------------
+    # When True, generate_chunk runs ONE causal block per call (block-by-block)
+    # against a persistent KV cache, producing a continuous, non-looping stream
+    # instead of regenerating a fresh 5s clip each call. See runtime.py.
+    streaming: bool = Field(
+        default=True,
+        description=(
+            "Continuous block-by-block AV streaming (persistent KV cache). When "
+            "False, falls back to the one-shot full-clip generation (loops)."
+        ),
+        json_schema_extra=ui_field_config(order=8, is_load_param=True),
+    )
+    # KV-cache budget for the stream, in seconds. The causal KV cache is a fixed
+    # pre-allocated buffer (no sliding window), so this bounds both max continuous
+    # length AND VRAM (~1.5GB/s of video cache). RoPE stays valid to ~20s, but the
+    # released checkpoint was distilled at 5s so quality may drift past ~5-6s
+    # (verify on the pod). On overflow the stream re-anchors (a visible seam).
+    stream_max_seconds: float = Field(
+        default=12.0,
+        gt=0.0,
+        le=20.0,
+        description=(
+            "KV-cache budget for continuous streaming, in seconds (bounds max "
+            "length + VRAM; ~1.5GB/s). RoPE valid to ~20s; ckpt distilled at 5s."
+        ),
+        json_schema_extra=ui_field_config(order=8, is_load_param=True),
+    )
+
     # OmniForcing's distilled per-block denoising schedule (timesteps). The
     # upstream default is [1000, 909, 725, 421, 0] (the trailing 0 is the clean
     # boundary). Exposed as a knob; verify empirically on the pod.

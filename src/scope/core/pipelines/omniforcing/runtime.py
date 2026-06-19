@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # Modules that must be importable for the real (GPU) path to run.
 _REQUIRED_MODULES = ("ltx_core", "ltx_causal", "ltx_distillation")
 
+# Audio latent frames per causal block, mirroring ltx_causal.attention.mask_builder
+# (AUDIO_FRAMES_FIRST_BLOCK / AUDIO_FRAMES_PER_BLOCK). Block 0 absorbs the causal-fix
+# asymmetry (4 video + 26 audio); blocks k>=1 are 3 video + 25 audio.
+_AUDIO_FRAMES_FIRST_BLOCK = 26
+_AUDIO_FRAMES_PER_BLOCK = 25
+
 
 def is_available() -> bool:
     """Return True if the OmniForcing LTX runtime is installed on this host.
@@ -395,6 +401,11 @@ class OmniForcingRuntime:
             device=device,
         )
         logger.info("OmniForcing: denoising_sigmas=%s", sigmas.detach().cpu().tolist())
+        self.denoising_sigmas = sigmas
+        self.add_noise_fn = _add_noise
+        self.context_noise = 0
+        self.num_train_timestep = 1000
+        # Kept for the non-streaming (one-shot) fallback path + offline use.
         self.pipeline = CausalAVInferencePipeline(
             generator=self.generator,
             add_noise_fn=_add_noise,
@@ -406,6 +417,52 @@ class OmniForcingRuntime:
             clear_cuda_cache_per_round=True,
         )
 
+        # ---- streaming state (persists across generate_chunk calls) --------
+        self.streaming = bool(getattr(config, "streaming", True))
+        # Snap the requested stream budget (seconds) up to a valid causal block
+        # layout: max_video_latent = num_frame_per_block_first + k*num_frame_per_block.
+        stream_seconds = float(getattr(config, "stream_max_seconds", 12.0))
+        requested_latent = 1 + max(0, round(stream_seconds * self.fps) - 1) // 8
+        self._max_video_latent_frames = self._snap_to_block_layout(requested_latent)
+        # Audio budget aligned to the video block layout (26 first + 25 per block).
+        from ltx_causal.attention.mask_builder import compute_aligned_audio_frames
+
+        self._max_audio_latent_frames = compute_aligned_audio_frames(
+            self._max_video_latent_frames,
+            num_frame_per_block=self.num_frame_per_block,
+            num_frame_per_block_first=self.num_frame_per_block_first,
+        )
+        logger.info(
+            "OmniForcing streaming=%s budget=%.1fs -> max_video_latent=%d "
+            "max_audio_latent=%d",
+            self.streaming,
+            stream_seconds,
+            self._max_video_latent_frames,
+            self._max_audio_latent_frames,
+        )
+        self._reset_streaming_state()
+
+    def _snap_to_block_layout(self, n_latent: int) -> int:
+        """Round a latent-frame count UP to a valid 4 + k*3 causal block layout."""
+        n = max(self.num_frame_per_block_first, int(n_latent))
+        remainder = (n - self.num_frame_per_block_first) % self.num_frame_per_block
+        if remainder:
+            n += self.num_frame_per_block - remainder
+        return n
+
+    def _reset_streaming_state(self) -> None:
+        """Clear all per-stream state so the next call re-primes from block 0."""
+        self._kv_caches = None
+        self._cond_dict = None
+        self._cached_prompt = None
+        self._video_start = 0  # next block's start, in latent frames
+        self._audio_start = 0
+        self._block_index = 0
+        self._video_latent_history = None  # [B, F, 128, h, w] accumulated, on GPU
+        self._audio_latent_history = None  # [B, F_a, 128] accumulated, on GPU
+        self._emitted_video_frames = 0  # pixel frames already streamed out
+        self._emitted_audio_samples = 0
+
     def generate_chunk(
         self,
         *,
@@ -416,18 +473,21 @@ class OmniForcingRuntime:
         num_frames: int,
         init_cache: bool = False,
     ) -> dict[str, Any]:
-        """Run one autoregressive AV pass and return decoded video + audio.
+        """Produce the next AV chunk and return decoded video + audio.
 
         Returns the scope AV-dict shape (see pipeline.OmniForcingPipeline):
         ``{video, video_timestamps, audio, audio_sample_rate, audio_timestamps,
         frame_rate}``. ``video`` is ``[T, H, W, C]`` float in ``[0, 1]`` (scope
         convention); ``audio`` is ``[channels, samples]`` float.
 
-        Resolution is fixed at construction (the causal wrapper bakes it in); the
-        ``height``/``width`` args must match the loaded config.
-        """
-        import torch
+        In **streaming** mode (default) each call advances ONE causal block of a
+        single continuous take (persistent KV cache), so successive calls yield a
+        coherent, non-looping stream rather than independent 5s clips. ``init_cache``
+        (re)starts the take from block 0. In non-streaming mode it falls back to a
+        full-clip one-shot pass (which loops when called repeatedly).
 
+        Resolution is fixed at construction; the ``height``/``width`` args must match.
+        """
         if (height, width) != (self.height, self.width):
             logger.warning(
                 "OmniForcing: generate_chunk resolution (%dx%d) differs from the "
@@ -437,6 +497,237 @@ class OmniForcingRuntime:
                 self.height,
                 self.width,
             )
+
+        if self.streaming:
+            return self._generate_streaming(
+                prompt=prompt, seed=seed, init_cache=init_cache
+            )
+        return self._generate_oneshot(prompt=prompt, seed=seed, num_frames=num_frames)
+
+    # ------------------------------------------------------------------
+    # Streaming (continuous block-by-block) path.
+    # ------------------------------------------------------------------
+
+    def _full_sigma(self, sigma: Any, frames: int) -> Any:
+        """Broadcast a scalar sigma to a [1, frames] block timestep tensor."""
+        return sigma.to(device=self.device, dtype=self.dtype).expand(1, frames)
+
+    def _generate_streaming(
+        self, *, prompt: str, seed: int, init_cache: bool
+    ) -> dict[str, Any]:
+        import torch
+
+        # (Re)start the take: allocate KV caches, re-seed, encode text, reset counters.
+        if init_cache or self._kv_caches is None:
+            self._start_stream(prompt=prompt, seed=seed)
+        # Prompt change mid-stream: re-encode the conditioning but KEEP the cache so
+        # the character/scene stays continuous (the new prompt steers from here on).
+        elif prompt != self._cached_prompt:
+            with torch.no_grad():
+                self._cond_dict = self.text_encoder(text_prompts=[prompt])
+            self._cached_prompt = prompt
+
+        # Budget guard: the KV cache is a fixed buffer with no sliding window, so once
+        # the take fills it we must re-anchor (a visible seam). Documented limitation.
+        first = self._block_index == 0
+        v_len = self.num_frame_per_block_first if first else self.num_frame_per_block
+        if self._video_start + v_len > self._max_video_latent_frames:
+            logger.warning(
+                "OmniForcing: stream reached the %d-frame KV budget; re-anchoring "
+                "(seam). Increase stream_max_seconds for longer takes.",
+                self._max_video_latent_frames,
+            )
+            self._start_stream(prompt=prompt, seed=seed)
+            first = True
+            v_len = self.num_frame_per_block_first
+
+        with torch.no_grad():
+            denoised_v, denoised_a = self._generate_block(first=first)
+            new_video, new_audio, audio_t0 = self._decode_new(denoised_v, denoised_a)
+
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        num_new = int(new_video.shape[0])
+        # Timestamps are relative to this chunk (scope re-bases per chunk anyway).
+        video_timestamps = [i / float(self.fps) for i in range(num_new)]
+        audio = None
+        audio_timestamps = None
+        if new_audio is not None:
+            audio = new_audio
+            num_samples = int(audio.shape[-1])
+            audio_timestamps = [0.0, num_samples / float(self.audio_sample_rate)]
+
+        return {
+            "video": new_video,
+            "video_timestamps": video_timestamps,
+            "audio": audio,
+            "audio_sample_rate": self.audio_sample_rate,
+            "audio_timestamps": audio_timestamps,
+            "frame_rate": self.fps,
+        }
+
+    def _start_stream(self, *, prompt: str, seed: int) -> None:
+        """Reset state + allocate fresh KV caches and conditioning for a new take."""
+        import torch
+
+        self._reset_streaming_state()
+        with torch.no_grad():
+            self._cond_dict = self.text_encoder(text_prompts=[prompt])
+        self._cached_prompt = prompt
+        text_seq_len = int(self._cond_dict["video_context"].shape[1])
+        gen = self.generator
+        while hasattr(gen, "module"):
+            gen = gen.module
+        self._kv_caches = gen.init_av_kv_caches(
+            batch_size=1,
+            max_video_frames=self._max_video_latent_frames,
+            max_audio_frames=self._max_audio_latent_frames,
+            text_seq_len=text_seq_len,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        torch.manual_seed(seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed(seed)
+
+    def _generate_block(self, *, first: bool) -> tuple[Any, Any]:
+        """Denoise + cache-refresh ONE causal block; returns (denoised_v, denoised_a).
+
+        Mirrors the per-block body of ``CausalAVInferencePipeline.generate`` but for a
+        single block, reading/writing the persistent ``self._kv_caches`` at the running
+        ``self._video_start``/``self._audio_start`` offsets, then advancing them.
+        """
+        import torch
+
+        v_len = self.num_frame_per_block_first if first else self.num_frame_per_block
+        a_len = _AUDIO_FRAMES_FIRST_BLOCK if first else _AUDIO_FRAMES_PER_BLOCK
+        lh, lw = self.height // 32, self.width // 32
+
+        current_video = torch.randn(
+            (1, v_len, 128, lh, lw), device=self.device, dtype=self.dtype
+        )
+        current_audio = torch.randn(
+            (1, a_len, 128), device=self.device, dtype=self.dtype
+        )
+
+        pred_v = pred_a = None
+        for sigma_idx, sigma in enumerate(self.denoising_sigmas[:-1]):
+            pred_v, pred_a = self.generator(
+                noisy_image_or_video=current_video,
+                conditional_dict=self._cond_dict,
+                timestep=self._full_sigma(sigma, v_len),
+                noisy_audio=current_audio,
+                audio_timestep=self._full_sigma(sigma, a_len),
+                kv_caches=self._kv_caches,
+                current_video_start_frame=self._video_start,
+                current_audio_start_frame=self._audio_start,
+            )
+            next_sigma = self.denoising_sigmas[sigma_idx + 1]
+            if float(next_sigma.item()) > 0.0:
+                current_video = self.add_noise_fn(
+                    pred_v,
+                    torch.randn_like(pred_v),
+                    self._full_sigma(next_sigma, v_len),
+                )
+                current_audio = self.add_noise_fn(
+                    pred_a,
+                    torch.randn_like(pred_a),
+                    self._full_sigma(next_sigma, a_len),
+                )
+            else:
+                current_video, current_audio = pred_v, pred_a
+
+        denoised_v, denoised_a = pred_v, pred_a
+
+        # Context-noise refresh: overwrite the cache entries for this block with the
+        # clean (context_noise=0) representation the next block expects to read.
+        ctx_t = float(self.context_noise) / float(self.num_train_timestep)
+        ctx_sigma_v = torch.full(
+            (1, v_len), ctx_t, device=self.device, dtype=self.dtype
+        )
+        ctx_sigma_a = torch.full(
+            (1, a_len), ctx_t, device=self.device, dtype=self.dtype
+        )
+        noisy_ctx_v = (
+            self.add_noise_fn(denoised_v, torch.randn_like(denoised_v), ctx_sigma_v)
+            if ctx_t > 0.0
+            else denoised_v
+        )
+        noisy_ctx_a = (
+            self.add_noise_fn(denoised_a, torch.randn_like(denoised_a), ctx_sigma_a)
+            if ctx_t > 0.0
+            else denoised_a
+        )
+        self.generator(
+            noisy_image_or_video=noisy_ctx_v,
+            conditional_dict=self._cond_dict,
+            timestep=ctx_sigma_v,
+            noisy_audio=noisy_ctx_a,
+            audio_timestep=ctx_sigma_a,
+            kv_caches=self._kv_caches,
+            current_video_start_frame=self._video_start,
+            current_audio_start_frame=self._audio_start,
+        )
+
+        self._video_start += v_len
+        self._audio_start += a_len
+        self._block_index += 1
+        return denoised_v, denoised_a
+
+    def _decode_new(self, denoised_v: Any, denoised_a: Any) -> tuple[Any, Any, float]:
+        """Decode only the newly-revealed pixel frames / audio samples for this block.
+
+        Strategy (correctness-first; the #1 thing to tune on the pod): the LTX video
+        VAE is causal, so decoding a mid-stream block in isolation mis-aligns frame
+        counts. We instead decode the GROWING accumulated latent and slice off the
+        frames/samples not yet emitted. This is correct but re-decodes the take each
+        block; a left-context-overlap incremental decode is the follow-up optimization.
+        """
+        import torch
+
+        # --- video ---
+        self._video_latent_history = (
+            denoised_v
+            if self._video_latent_history is None
+            else torch.cat([self._video_latent_history, denoised_v], dim=1)
+        )
+        video_pixel = self.video_vae.decode_to_pixel(self._video_latent_history)
+        video = video_pixel[0]
+        if video.shape[0] == 3:  # [C, T, H, W] -> [T, C, H, W]
+            video = video.permute(1, 0, 2, 3)
+        video = video.permute(0, 2, 3, 1).clamp(0, 1).float().cpu()  # [T, H, W, C]
+        new_video = video[self._emitted_video_frames :]
+        self._emitted_video_frames = int(video.shape[0])
+
+        # --- audio ---
+        new_audio = None
+        audio_t0 = 0.0
+        if denoised_a is not None:
+            self._audio_latent_history = (
+                denoised_a
+                if self._audio_latent_history is None
+                else torch.cat([self._audio_latent_history, denoised_a], dim=1)
+            )
+            try:
+                waveform = self.audio_vae.decode_to_waveform(self._audio_latent_history)
+                audio_full = waveform[0].float().cpu()  # [channels, samples]
+                audio_t0 = self._emitted_audio_samples / float(self.audio_sample_rate)
+                new_audio = audio_full[..., self._emitted_audio_samples :]
+                self._emitted_audio_samples = int(audio_full.shape[-1])
+            except Exception as exc:  # pragma: no cover - audio decode is best-effort
+                logger.warning("OmniForcing: audio decode failed: %s", exc)
+
+        return new_video, new_audio, audio_t0
+
+    # ------------------------------------------------------------------
+    # One-shot (legacy / non-streaming) path — regenerates a full clip per call.
+    # ------------------------------------------------------------------
+
+    def _generate_oneshot(
+        self, *, prompt: str, seed: int, num_frames: int
+    ) -> dict[str, Any]:
+        import torch
 
         video_shape, audio_shape = _compute_latent_shapes(
             num_frames=num_frames,

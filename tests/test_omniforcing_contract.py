@@ -39,6 +39,38 @@ def test_config_metadata_and_defaults():
     assert c.height % 32 == 0 and c.width % 32 == 0
 
 
+def test_streaming_config_defaults():
+    """Continuous streaming is the default; the KV budget knob is bounded."""
+    c = OmniForcingConfig()
+    assert c.streaming is True
+    assert 0.0 < c.stream_max_seconds <= 20.0
+
+
+def test_snap_to_block_layout_math():
+    """Stream budget must snap UP to a valid 4 + k*3 causal block layout.
+
+    Exercised without the LTX stack via an unbound call with a stub `self`
+    (the method only reads num_frame_per_block{,_first}).
+    """
+    from types import SimpleNamespace
+
+    from scope.core.pipelines.omniforcing.runtime import (
+        _AUDIO_FRAMES_FIRST_BLOCK,
+        _AUDIO_FRAMES_PER_BLOCK,
+        OmniForcingRuntime,
+    )
+
+    snap = OmniForcingRuntime._snap_to_block_layout
+    stub = SimpleNamespace(num_frame_per_block=3, num_frame_per_block_first=4)
+    assert snap(stub, 1) == 4  # clamp to the first-block minimum
+    assert snap(stub, 4) == 4  # already valid
+    assert snap(stub, 5) == 7  # 4 + 1*3
+    assert snap(stub, 16) == 16  # 4 + 4*3 (the released 5s layout)
+    assert snap(stub, 17) == 19  # 4 + 5*3
+    # Upstream block-size constants (mask_builder): 4+26 first, 3+25 thereafter.
+    assert (_AUDIO_FRAMES_FIRST_BLOCK, _AUDIO_FRAMES_PER_BLOCK) == (26, 25)
+
+
 def test_artifacts_point_at_expected_repos():
     assert (
         OMNIFORCING_GENERATOR_ARTIFACT.repo_id

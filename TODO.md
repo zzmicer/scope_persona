@@ -31,10 +31,17 @@ Gemma-3-12B text encoder. ~60GB bf16 → H100/H200 only. Weights:
 - [ ] Phase 4: audio output plumbing — fork's WebRTC is video-only; add
   `AudioProcessingTrack` + audio track in `server/webrtc.py` (90kHz A/V sync). Pipeline
   already returns the AV dict; offline MP4-mux is the interim validation path.
+- [~] Continuous streaming `generate_chunk` (block-by-block + persistent KV cache) —
+  DRAFTED on `omniforcing` branch (runtime `_generate_streaming`/`_generate_block`/
+  `_decode_new`, `streaming`+`stream_max_seconds` schema knobs, 9/9 CPU contract tests).
+  Mirrors upstream `CausalAVInferencePipeline.generate` but one block/call against
+  `init_av_kv_caches`. NOT yet pod-verified. Pod TODO: (1) confirm coherent non-looping
+  long take + measure drift past ~5s (ckpt distilled at 5s); (2) tune incremental decode
+  (`_decode_new` re-decodes the growing latent each block → switch to left-context-
+  overlap decode for real-time); (3) check VRAM at the 12s budget (~18GB video cache).
 - [ ] OmniForcing follow-ups: text-encoder offload (Gemma ~24GB resident → CPU after
-  encode for headroom); true streaming `generate_chunk` (block-by-block + KV cache reuse,
-  `init_cache` not yet wired for incremental decode); confirm clean `uv sync --extra
-  omniforcing` from scratch (pod was bootstrapped via `uv pip install`).
+  encode for headroom); confirm clean `uv sync --extra omniforcing` from scratch (pod
+  was bootstrapped via `uv pip install`).
 
 ## LongLive 2.0 (NVFP4) Integration
 

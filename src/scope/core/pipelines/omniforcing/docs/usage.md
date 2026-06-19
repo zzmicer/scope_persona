@@ -112,11 +112,45 @@ Layout on disk: `<DAYDREAM_SCOPE_MODELS_DIR>/LTX-2/...` and
 
 - **Text-encoder offload** for headroom (peak 77.5GB on 80GB): move Gemma to CPU after
   prompt encode (it's used once per generation), mirroring the longlive2 plan.
-- **True streaming `generate_chunk`**: today each call regenerates a full clip with a
-  fresh KV cache (`init_cache` is accepted but not yet used for incremental decode).
-  Block-by-block streaming + the WebRTC audio track (below) are the path to live AV.
+- **Incremental VAE decode** (the remaining streaming optimization). The streaming
+  path below is implemented; the open item is making per-block decode cheap (left-
+  context overlap) instead of re-decoding the growing take each block.
 - Confirm `uv sync --extra omniforcing` (with the new torchaudio pin) resolves cleanly
   from scratch — the pod was bootstrapped via `uv pip install` over the prebuilt image.
+
+## Continuous streaming (block-by-block) — DRAFTED, pod-verify pending
+
+The default path is now **continuous streaming**: instead of regenerating a fresh 5s
+clip every call (which loops), `generate_chunk` advances **one causal block** of a
+single take against a persistent KV cache. Successive calls continue the same shot,
+so the output is a coherent, non-looping stream — the basis for "long video".
+
+How it works (`runtime.OmniForcingRuntime._generate_streaming`), mirroring the upstream
+`CausalAVInferencePipeline.generate` body but one block per call:
+
+- `init_cache=True` (re)starts the take: allocate `gen.init_av_kv_caches(...)` once,
+  re-seed, encode the prompt, reset the running `current_video/audio_start_frame`.
+- Each call denoises one block (`num_frame_per_block`, first block `_first`) over the
+  distilled `denoising_sigmas`, runs the context-noise cache refresh, advances the
+  frame counters, and decodes **only the newly-revealed** frames/samples.
+- A mid-stream **prompt change** re-encodes the conditioning but KEEPS the cache, so
+  the character/scene stays continuous while the new prompt steers from there.
+
+Config knobs (`schema.py`): `streaming` (default True; False = old one-shot loop) and
+`stream_max_seconds` (KV-cache budget; default 12s, max 20s).
+
+Limits to verify on the pod:
+
+- The KV cache is a **fixed buffer with no sliding window** (no `local_attn_size`), so
+  `stream_max_seconds` bounds both max continuous length and VRAM (~1.5GB/s of video
+  cache). On overflow the stream **re-anchors** (a visible seam) and logs a warning.
+- RoPE stays valid to ~20s (`pe_max_pos[0]` is in seconds), but the released checkpoint
+  was **distilled at 5s**, so coherence/identity may drift past ~5–6s — empirical.
+- **Incremental decode** is correctness-first today: `_decode_new` re-decodes the
+  growing latent each block (the LTX video VAE is causal, so decoding a block in
+  isolation mis-aligns frame counts) and slices off new frames. This re-decode cost
+  grows with take length — the optimization is a left-context-overlap decode. This is
+  the #1 thing to tune/verify on the H100.
 
 ## Audio output gap (Phase 4)
 
