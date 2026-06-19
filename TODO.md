@@ -18,15 +18,23 @@ Gemma-3-12B text encoder. ~60GB bf16 → H100/H200 only. Weights:
 - [x] Phase 3: scope-side scaffold — `omniforcing/{schema,pipeline,runtime,model.yaml,
   __init__}.py`, registry entry, import-safe offline; `runtime.is_available()` gates the
   LTX stack. 7/7 CPU contract tests pass (`tests/test_omniforcing_contract.py`).
-- [~] Phase 1+2: LTX-2 stack + causal layer — NOT vendored (LTX-2 Community License);
-  installed via the `omniforcing` extra on the pod. `runtime.OmniForcingRuntime` body
-  (CausalLTXModel + VAEs + vocoder + Gemma + CausalAVInferencePipeline wiring) is the
-  documented pod bring-up step (currently raises NotImplementedError).
+- [x] Phase 1+2: LTX-2 stack + causal layer — NOT vendored (LTX-2 Community License);
+  installed via the `omniforcing` extra on the pod. `runtime.OmniForcingRuntime` is
+  IMPLEMENTED + verified (CausalLTXModel + VAEs + vocoder + Gemma +
+  CausalAVInferencePipeline). torchaudio pinned to 2.9.1 (PyPI 2.11 breaks the ABI).
+- [x] Pod bring-up (H100 80GB, 2026-06-19): loader entry points confirmed (all as
+  scaffolded); minimal weight subset confirmed + `LTX2_BASE_ARTIFACT` trimmed
+  (consolidated safetensors carries VAEs+vocoder; gemma_root = LTX-2 root, not
+  text_encoder/); `generate_chunk` implemented; **render-verified a coherent 5s clip
+  with synced stereo audio** ("rainy night street", 121 frames in 7.8s ≈ 15.6 fps,
+  peak 77.5GB). MP4 muxed offline. See `docs/.../omniforcing/docs/usage.md`.
 - [ ] Phase 4: audio output plumbing — fork's WebRTC is video-only; add
   `AudioProcessingTrack` + audio track in `server/webrtc.py` (90kHz A/V sync). Pipeline
   already returns the AV dict; offline MP4-mux is the interim validation path.
-- [ ] Pod bring-up (H100/H200): confirm loader entry points + minimal weight subset,
-  implement `generate_chunk`, render-verify a coherent 5s clip with synced audio.
+- [ ] OmniForcing follow-ups: text-encoder offload (Gemma ~24GB resident → CPU after
+  encode for headroom); true streaming `generate_chunk` (block-by-block + KV cache reuse,
+  `init_cache` not yet wired for incremental decode); confirm clean `uv sync --extra
+  omniforcing` from scratch (pod was bootstrapped via `uv pip install`).
 
 ## LongLive 2.0 (NVFP4) Integration
 

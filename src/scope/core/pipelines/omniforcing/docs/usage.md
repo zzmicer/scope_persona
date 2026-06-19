@@ -9,14 +9,25 @@ prompt with a **Gemma-3-12B** text encoder. It is the LTX-2-family analogue of t
 
 Weights: `Exploration/omniforcing-ltx2-5s-causal` (distilled causal generator only).
 
-## Status (scaffold)
+## Status (VERIFIED on H100, 2026-06-19)
 
-This pipeline is **scaffolded**: the scope-side integration (config/schema, HF
-artifacts, registry entry, CPU contract tests, dependency wiring) is complete and
-import-safe on any host. The **GPU runtime** (`runtime.py` → `OmniForcingRuntime`) is
-finalized on the pod — it raises `NotImplementedError` until the LTX stack is installed
-and the loader/AR-loop is wired against the installed package. The WebRTC **audio
-output track** is a separate follow-up (see "Audio output gap" below).
+This pipeline **renders end-to-end on an H100 80GB** (secure cloud). The scope-side
+integration (config/schema, HF artifacts, registry, CPU contract tests, dependency
+wiring) is complete and import-safe on any host, and `runtime.OmniForcingRuntime` is
+fully implemented + verified: it loads the LTX-2 base + distilled OmniForcing
+generator + Gemma text encoder + video/audio VAEs + vocoder and drives
+`CausalAVInferencePipeline` to produce **synchronized audio + video**.
+
+Verified result (prompt "Realistic. Rain falls on a quiet street at night."):
+
+- Build (model load): ~148s. Generation: **121 frames (5s @ 24fps) in 7.8s ≈ 15.6 fps**.
+- Peak GPU memory **77.5GB** — fits 80GB but tight (the Gemma text encoder is ~24GB
+  resident; offload-after-encode is the obvious headroom win, mirroring longlive2).
+- Output: coherent photorealistic video `[121,512,768,3]` + synced stereo audio
+  `[2,120240]` (5.01s vs video 5.04s). Muxed to MP4 with AAC.
+
+The WebRTC **audio output track** is still a separate follow-up (see "Audio output
+gap" below) — verification used offline MP4 mux.
 
 ## Hardware
 
@@ -37,16 +48,32 @@ This maps `ltx-core`, `ltx-causal`, `ltx-pipelines`, `ltx-distillation` to the
 `pyproject.toml`) and adds `soundfile` / `sentencepiece`. `ltx-distillation` pulls in
 training extras (wandb, lmdb) — acceptable for the pod.
 
+**torchaudio gotcha (fixed):** `ltx-core` imports `torchaudio` (audio VAE ops). Left
+unpinned, resolution pulls `torchaudio==2.11` from PyPI, whose C++ extension
+(`_torchaudio.abi3.so`) is ABI-incompatible with our `torch 2.9.1+cu128` and fails to
+load (`OSError: Could not load this library`). The extra now pins
+`torchaudio==2.9.1` with a `pytorch-cu128` source so it stays matched to torch.
+
 ## Weights
 
 `download_models --pipeline omniforcing` fetches:
 
-- **`Exploration/omniforcing-ltx2-5s-causal`** — the 5 generator shards + index.
-- **`Lightricks/LTX-2`** (gated; needs `HF_TOKEN` with access) — the consolidated
-  `ltx-2-19b-dev.safetensors` plus the diffusers-layout `vae/` (video), `audio_vae/`,
-  `vocoder/`, `connectors/`, and `text_encoder/` + `tokenizer/` (the Gemma-3-12B
-  encoder). One repo covers base + both VAEs + vocoder + text encoder, so no separate
-  gated `google/gemma-*` download is required.
+- **`Exploration/omniforcing-ltx2-5s-causal`** — the 5 generator shards + index (~36GB).
+- **`Lightricks/LTX-2`** (**PUBLIC** — no `HF_TOKEN` needed, verified 2026-06-19). The
+  CONFIRMED minimal subset is:
+  - `ltx-2-19b-dev.safetensors` (~41GB) — the consolidated base. It carries the
+    transformer, **both VAEs, the vocoder and the connectors**; `create_vae_wrappers`
+    reads the vocoder from this file, so the per-component `vae/` `audio_vae/`
+    `vocoder/` `connectors/` `scheduler/` dirs are NOT downloaded.
+  - `text_encoder/` (the `model-*` shard set only) + `tokenizer/` — the Gemma-3 text
+    encoder (~24GB; stored fp32 on disk, loaded as bf16). The duplicate
+    `diffusion_pytorch_model-*` set in `text_encoder/` (~24GB) is skipped.
+
+  The text-encoder loader (`ModelLedger` → `module_ops_from_gemma_root`) takes a
+  `gemma_root_path` and does a recursive `rglob` for `tokenizer.model`,
+  `preprocessor_config.json` and `model*.safetensors`. So the gemma root must be the
+  **LTX-2 repo root** (which contains both `text_encoder/` and `tokenizer/`), NOT
+  `text_encoder/` — `runtime._resolve_paths["gemma"]` points at the base dir.
 
 Layout on disk: `<DAYDREAM_SCOPE_MODELS_DIR>/LTX-2/...` and
 `<...>/omniforcing-ltx2-5s-causal/...` (see `runtime._resolve_paths`).
@@ -62,22 +89,34 @@ Layout on disk: `<DAYDREAM_SCOPE_MODELS_DIR>/LTX-2/...` and
 | block size | 3 (first block 4) |
 | audio sample rate | 24000 Hz (vocoder may BWE to 48k) |
 
-## Pod bring-up checklist (the remaining work)
+## Pod bring-up checklist (DONE — 2026-06-19, H100 80GB)
 
-1. **Confirm loader entry points** against the installed packages:
-   `ltx_causal.transformer.causal_model.CausalLTXModel`,
+1. ✅ **Loader entry points confirmed** against the installed packages — all exist as
+   scaffolded: `ltx_causal.transformer.causal_model.{CausalLTXModel,CausalLTXModelConfig}`,
+   `ltx_causal.wrapper.CausalLTX2DiffusionWrapper`,
    `ltx_distillation.inference.causal_pipeline.CausalAVInferencePipeline`,
-   `ltx_distillation.models.text_encoder_wrapper.create_text_encoder_wrapper`. Mirror
-   the construction sequence in `scripts/omniforcing_causal_inference.py` (load base →
-   strip audio tokens → load distilled generator weights; build VAEs/vocoder; build the
-   pipeline with `add_noise_fn` + `denoising_sigmas` derived from the timestep schedule).
-2. **Confirm the minimal weight subset** the loader actually reads (single
-   `ltx-2-19b-dev.safetensors` vs. the per-component diffusers dirs; bundled
-   `text_encoder/` vs. a standalone Gemma path). Trim `LTX2_BASE_ARTIFACT.files` to match.
-3. **Implement `OmniForcingRuntime.__init__` + `generate_chunk`** to run one AR block and
-   decode video (video VAE) + audio (audio VAE → vocoder), returning the AV dict.
-4. **Render-verify**: a coherent 5s clip with synchronized audio. Write an MP4 with muxed
-   audio first (as the upstream script does), then move to live streaming.
+   `ltx_distillation.models.{text_encoder_wrapper.create_text_encoder_wrapper,
+   vae_wrapper.create_vae_wrappers}`, `ltx_core.loader.registry.StateDictRegistry`.
+   `runtime.py` mirrors the construction sequence in
+   `scripts/omniforcing_causal_inference.py` (load base → strip `audio_sink_tokens` →
+   load distilled generator weights; build text encoder + VAEs; convert the timestep
+   schedule to flow-matching sigmas via `LTX2Scheduler`; drive the pipeline).
+2. ✅ **Minimal weight subset confirmed** — see Weights above. `LTX2_BASE_ARTIFACT.files`
+   trimmed to the consolidated safetensors + `text_encoder/model-*` + `tokenizer/`.
+3. ✅ **`OmniForcingRuntime.__init__` + `generate_chunk` implemented** — loads everything
+   and runs a full 5s AV generation, decoding video (video VAE) + audio (audio VAE →
+   vocoder) into the scope AV dict.
+4. ✅ **Render-verified** — coherent 5s clip with synchronized stereo audio, muxed to MP4.
+
+### Remaining (follow-ups)
+
+- **Text-encoder offload** for headroom (peak 77.5GB on 80GB): move Gemma to CPU after
+  prompt encode (it's used once per generation), mirroring the longlive2 plan.
+- **True streaming `generate_chunk`**: today each call regenerates a full clip with a
+  fresh KV cache (`init_cache` is accepted but not yet used for incremental decode).
+  Block-by-block streaming + the WebRTC audio track (below) are the path to live AV.
+- Confirm `uv sync --extra omniforcing` (with the new torchaudio pin) resolves cleanly
+  from scratch — the pod was bootstrapped via `uv pip install` over the prebuilt image.
 
 ## Audio output gap (Phase 4)
 

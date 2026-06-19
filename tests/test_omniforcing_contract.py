@@ -52,17 +52,20 @@ def test_artifacts_point_at_expected_repos():
     assert any(f.endswith(".index.json") for f in OMNIFORCING_GENERATOR_ARTIFACT.files)
 
     assert LTX2_BASE_ARTIFACT.repo_id == "Lightricks/LTX-2"
-    # The base repo must supply the consolidated checkpoint + every decoder/encoder
-    # component OmniForcing needs (so no separate gated google/gemma repo).
-    for needed in (
-        "ltx-2-19b-dev.safetensors",
-        "vae",
-        "audio_vae",
-        "vocoder",
-        "text_encoder",
-        "tokenizer",
-    ):
-        assert needed in LTX2_BASE_ARTIFACT.files, needed
+    # Minimal subset CONFIRMED on H100 (2026-06-19): the consolidated checkpoint
+    # carries the transformer + both VAEs + vocoder + connectors, so only it plus the
+    # Gemma text encoder (text_encoder/model-* + tokenizer/) are needed — no separate
+    # google/gemma repo and no per-component vae/audio_vae/vocoder/connectors dirs.
+    assert "ltx-2-19b-dev.safetensors" in LTX2_BASE_ARTIFACT.files
+    assert "tokenizer" in LTX2_BASE_ARTIFACT.files
+    # The Gemma model shards (the model-* set, not the duplicate diffusion_pytorch_model-*).
+    assert any(
+        f.startswith("text_encoder/model-") and f.endswith(".safetensors")
+        for f in LTX2_BASE_ARTIFACT.files
+    )
+    # The per-component decoder dirs must NOT be downloaded (they live in the base ckpt).
+    for unused in ("vae", "audio_vae", "vocoder", "connectors", "scheduler"):
+        assert unused not in LTX2_BASE_ARTIFACT.files, unused
 
 
 def test_config_listed_in_pipeline_artifacts():

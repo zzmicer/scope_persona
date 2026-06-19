@@ -81,6 +81,11 @@ omniforcing = [
     "ltx-distillation; sys_platform == 'linux'",
     "soundfile; sys_platform == 'linux'",
     "sentencepiece; sys_platform == 'linux'",
+    # ltx-core imports torchaudio (audio VAE ops). Pin it to the torch build —
+    # left unpinned, resolution pulls torchaudio 2.11 (PyPI) whose C++ extension
+    # is ABI-incompatible with our torch 2.9.1+cu128 and fails to load. The
+    # cu128-index source (below) keeps it matched to torch. Verified on H100 pod.
+    "torchaudio==2.9.1; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -119,6 +124,9 @@ torch = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 flash-attn = [

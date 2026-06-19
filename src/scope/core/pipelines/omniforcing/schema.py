@@ -24,9 +24,10 @@ from ..base_schema import BasePipelineConfig, ModeDefaults, ui_field_config
 #
 # OmniForcing ships ONLY the distilled causal generator (5 safetensors shards +
 # index). The LTX-2 base transformer, video VAE, audio VAE, vocoder, text
-# projection (connectors) AND the Gemma-3-12B text encoder all live in the
-# (gated) Lightricks/LTX-2 diffusers repo, so a single base artifact covers them.
-# Requires HF_TOKEN with access to the gated LTX-2 repo.
+# projection (connectors) AND the Gemma-3 text encoder all live in the
+# Lightricks/LTX-2 diffusers repo, so a single base artifact covers them.
+# NOTE: Lightricks/LTX-2 is PUBLIC (verified 2026-06-19, HTTP 200, gated=false) —
+# no HF_TOKEN is required.
 # ---------------------------------------------------------------------------
 
 # OmniForcing distilled causal generator (5s, LTX-2). Sharded safetensors.
@@ -42,28 +43,27 @@ OMNIFORCING_GENERATOR_ARTIFACT = HuggingfaceRepoArtifact(
     ],
 )
 
-# LTX-2 base (gated). Provides everything the generator needs at inference:
-#   - ltx-2-19b-dev.safetensors : consolidated base checkpoint (transformer + VAEs)
-#   - vae/, audio_vae/, vocoder/ : decoders (diffusers layout)
-#   - connectors/                : text projection
-#   - text_encoder/ + tokenizer/ : Gemma-3-12B text encoder (transformers layout)
-#   - scheduler/, model_index.json
-# NOTE: the exact minimal subset OmniForcing's loader reads (single dev safetensors
-# vs. the per-component diffusers dirs, and whether it wants the bundled Gemma vs.
-# google/gemma-3-12b-it-qat-q4_0-unquantized) is a pod-verification item — see
-# docs/usage.md. We download the per-component dirs to be safe.
+# LTX-2 base. Minimal inference subset CONFIRMED on an H100 pod (2026-06-19):
+#   - ltx-2-19b-dev.safetensors : consolidated base — transformer + video VAE +
+#     audio VAE + vocoder + connectors (create_vae_wrappers reads the vocoder from
+#     THIS file, so the per-component vae/ audio_vae/ vocoder/ connectors/ dirs are
+#     NOT needed).
+#   - text_encoder/ (model-*.safetensors only) + tokenizer/ : the Gemma-3 text
+#     encoder. The loader's gemma_root_path is the LTX-2 *root* and does a
+#     recursive rglob for tokenizer.model / preprocessor_config.json / model*.
+#     safetensors, so both dirs must sit under the same root. We fetch only the
+#     `model-*` shard set (the duplicate `diffusion_pytorch_model-*` set in
+#     text_encoder/ is ~24GB and unused).
 LTX2_BASE_ARTIFACT = HuggingfaceRepoArtifact(
     repo_id="Lightricks/LTX-2",
     files=[
         "ltx-2-19b-dev.safetensors",
         "model_index.json",
-        "vae",
-        "audio_vae",
-        "vocoder",
-        "connectors",
-        "text_encoder",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/model.safetensors.index.json",
+        "text_encoder/model-*.safetensors",
         "tokenizer",
-        "scheduler",
     ],
 )
 
@@ -94,8 +94,8 @@ class OmniForcingConfig(BasePipelineConfig):
     # This pipeline is an integration of external (LTX-2 Community License) model code.
     modified = True
     # Auto-downloaded weights (download_models --pipeline omniforcing): the
-    # distilled causal generator + the gated LTX-2 base (transformer + VAEs +
-    # vocoder + Gemma text encoder). Requires HF_TOKEN with LTX-2 access.
+    # distilled causal generator + the (public) LTX-2 base (transformer + VAEs +
+    # vocoder + Gemma text encoder). No HF_TOKEN required.
     artifacts = [
         OMNIFORCING_GENERATOR_ARTIFACT,
         LTX2_BASE_ARTIFACT,
