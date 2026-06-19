@@ -102,11 +102,16 @@ class OmniForcingPipeline(Pipeline):
     def _generate(self, **kwargs) -> dict:
         # Resolve the prompt for this chunk. Scope passes prompts via "prompts"
         # (list) or "prompt"; fall back to empty string.
-        prompts = kwargs.get("prompts") or kwargs.get("prompt")
-        if isinstance(prompts, (list, tuple)):
-            prompt = prompts[0] if prompts else ""
+        # The UI/frame processor sends prompts as a list of
+        # {"text": str, "weight": float} dicts; also accept a plain string, a
+        # list of strings, or a single dict.
+        raw = kwargs.get("prompts") or kwargs.get("prompt")
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else ""
+        if isinstance(raw, dict):
+            prompt = raw.get("text", "")
         else:
-            prompt = prompts or ""
+            prompt = raw or ""
 
         mode = resolve_input_mode(kwargs)  # noqa: F841 - text-only today; reserved
         init_cache = bool(kwargs.get("init_cache", self.first_call))
