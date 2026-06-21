@@ -394,6 +394,16 @@ class OmniForcingRuntime:
             registry=registry,
         )
 
+        # Gemma-3-12B is ~24GB resident. On a single 80GB GPU it must NOT stay on
+        # the device: the generator + VAEs already use ~53GB, and the persistent
+        # streaming KV cache (init_av_kv_caches) then OOMs. So keep the encoder on
+        # CPU between calls and page it onto the GPU only for the (infrequent)
+        # prompt encode (see _encode), mirroring the longlive2 text-encoder offload.
+        self._te_offload = device.type == "cuda"
+        if self._te_offload:
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+
         # ---- inference pipeline --------------------------------------------
         sigmas = _denoising_sigmas(
             denoising_step_list=denoising_steps,
@@ -538,8 +548,7 @@ class OmniForcingRuntime:
         # Prompt change mid-stream: re-encode the conditioning but KEEP the cache so
         # the character/scene stays continuous (the new prompt steers from here on).
         elif prompt != self._cached_prompt:
-            with torch.no_grad():
-                self._cond_dict = self.text_encoder(text_prompts=[prompt])
+            self._cond_dict = self._encode(prompt)
             self._cached_prompt = prompt
 
         # Budget guard: the KV cache is a fixed buffer with no sliding window, so once
@@ -608,13 +617,35 @@ class OmniForcingRuntime:
             "frame_rate": self.fps,
         }
 
+    def _encode(self, prompt: str) -> dict[str, Any]:
+        """Encode a prompt, paging the Gemma encoder on/off the GPU.
+
+        The ~24GB Gemma encoder lives on CPU between calls (see __init__) so the
+        resident generator + VAEs + streaming KV cache fit in 80GB. We move it to
+        the GPU for the encode, then evict it again and free the VRAM. The returned
+        conditioning tensors are on ``self.device``.
+
+        NOTE: mid-stream prompt changes pay this ~24GB H2D/D2H round-trip (~a few
+        seconds) and transiently need the encoder's VRAM free; with a large
+        ``stream_max_seconds`` KV cache already resident this can be tight.
+        """
+        import torch
+
+        if self._te_offload:
+            self.text_encoder.to(self.device)
+        with torch.no_grad():
+            cond = self.text_encoder(text_prompts=[prompt])
+        if self._te_offload:
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+        return cond
+
     def _start_stream(self, *, prompt: str, seed: int) -> None:
         """Reset state + allocate fresh KV caches and conditioning for a new take."""
         import torch
 
         self._reset_streaming_state()
-        with torch.no_grad():
-            self._cond_dict = self.text_encoder(text_prompts=[prompt])
+        self._cond_dict = self._encode(prompt)
         self._cached_prompt = prompt
         text_seq_len = int(self._cond_dict["video_context"].shape[1])
         gen = self.generator
@@ -807,8 +838,8 @@ class OmniForcingRuntime:
             batch_size=1,
         )
 
+        conditional_dict = self._encode(prompt)
         with torch.no_grad():
-            conditional_dict = self.text_encoder(text_prompts=[prompt])
             fork_devices = (
                 [torch.cuda.current_device()] if self.device.type == "cuda" else []
             )
