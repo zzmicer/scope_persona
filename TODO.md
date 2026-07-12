@@ -71,7 +71,10 @@ per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling K
   Q/E/mouse) → per-chunk camera pose deltas, prompt updates → events,
   first_frame_image seeds the world, horizon exhaustion re-seeds from last
   frame. Deployed on the H200 pod (/workspace/scope, Cloudflare TURN).
-  Follow-ups: [ ] browser-verified end-to-end stream; [ ] add scipy/easydict/
+  Browser/WebRTC verified: 1,043-frame interactive stream at 256×448 (~1.2s per
+  16-frame chunk); parameter updates now coalesce latest keys + accumulated mouse
+  motion instead of dropping new controls during generation (100-update burst,
+  zero drops). Follow-ups: [x] browser-verified end-to-end stream; [x] add scipy/easydict/
   ftfy as a `lingbot` extra in pyproject (uv-pip-installed on pod for now);
   [ ] frame pacing vs ~4s/chunk generation (buffer tuning); [ ] chat UI.
 - [ ] LLM-based action interpreter (free text → motion/event tuples) per CLAUDE.md

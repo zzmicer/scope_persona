@@ -210,13 +210,45 @@ class PipelineProcessor:
 
     def update_parameters(self, parameters: dict[str, Any]):
         """Update parameters that will be used in the next pipeline call."""
+        # Parameter updates (especially mouse motion) can arrive much faster than
+        # a diffusion pipeline produces a chunk.  Keeping every intermediate
+        # snapshot makes control lag behind the user and eventually drops the
+        # newest input when the bounded queue fills.  Coalesce pending snapshots
+        # into one: ordinary values are latest-wins, while mouse deltas are
+        # accumulated and the newest key state is retained.
+        pending: list[dict[str, Any]] = []
         try:
-            self.parameters_queue.put_nowait(parameters)
+            while True:
+                pending.append(self.parameters_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+        merged: dict[str, Any] = {}
+        mouse = [0.0, 0.0]
+        for update in [*pending, parameters]:
+            ctrl = update.get("ctrl_input")
+            merged.update(update)
+            if ctrl is not None:
+                delta = ctrl.get("mouse", [0.0, 0.0])
+                mouse[0] += delta[0]
+                mouse[1] += delta[1]
+                merged["ctrl_input"] = {
+                    "button": ctrl.get("button", []),
+                    "mouse": mouse.copy(),
+                }
+
+        # With one producer per WebRTC session this should not fill after the
+        # drain.  Retry once defensively if a concurrent producer won the race.
+        try:
+            self.parameters_queue.put_nowait(merged)
         except queue.Full:
-            logger.info(
-                f"Parameter queue full for {self.pipeline_id}, dropping parameter update"
-            )
-            return False
+            logger.debug("Coalescing concurrent parameter update for %s", self.pipeline_id)
+            try:
+                self.parameters_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.parameters_queue.put_nowait(merged)
+        return True
 
     def worker_loop(self):
         """Main worker loop that processes frames."""

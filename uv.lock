@@ -569,6 +569,11 @@ dependencies = [
 kafka = [
     { name = "aiokafka" },
 ]
+lingbot = [
+    { name = "easydict" },
+    { name = "ftfy" },
+    { name = "scipy", marker = "sys_platform == 'linux'" },
+]
 longlive2-nvfp4 = [
     { name = "transformer-engine", extra = ["pytorch"], marker = "sys_platform == 'linux'" },
 ]
@@ -611,6 +616,8 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.25.0" },
     { name = "kernels", specifier = ">=0.10.4" },
     { name = "lmdb", specifier = ">=1.7.3" },
+    { name = "easydict", marker = "extra == 'lingbot'", specifier = ">=1.13" },
+    { name = "ftfy", marker = "extra == 'lingbot'", specifier = ">=6.3.1" },
     { name = "ltx-causal", marker = "sys_platform == 'linux' and extra == 'omniforcing'", git = "https://github.com/OmniForcing/OmniForcing?subdirectory=LTX-2%2Fpackages%2Fltx-causal" },
     { name = "ltx-core", marker = "sys_platform == 'linux' and extra == 'omniforcing'", git = "https://github.com/OmniForcing/OmniForcing?subdirectory=LTX-2%2Fpackages%2Fltx-core" },
     { name = "ltx-distillation", marker = "sys_platform == 'linux' and extra == 'omniforcing'", git = "https://github.com/OmniForcing/OmniForcing?subdirectory=LTX-2%2Fpackages%2Fltx-distillation" },
@@ -620,6 +627,7 @@ requires-dist = [
     { name = "pyopengl", marker = "sys_platform == 'win32'", specifier = ">=3.1.10" },
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "sageattn3", marker = "sys_platform == 'linux' or sys_platform == 'win32'", git = "https://github.com/thu-ml/SageAttention?subdirectory=sageattention3_blackwell" },
+    { name = "scipy", marker = "sys_platform == 'linux' and extra == 'lingbot'", specifier = ">=1.14.0" },
     { name = "sentencepiece", marker = "sys_platform == 'linux' and extra == 'omniforcing'" },
     { name = "soundfile", marker = "sys_platform == 'linux' and extra == 'omniforcing'" },
     { name = "spoutgl", marker = "sys_platform == 'win32'", specifier = ">=0.1.1" },
@@ -636,7 +644,7 @@ requires-dist = [
     { name = "twilio", specifier = ">=9.8.0" },
     { name = "uvicorn", specifier = ">=0.35.0" },
 ]
-provides-extras = ["kafka", "longlive2-nvfp4", "omniforcing"]
+provides-extras = ["kafka", "lingbot", "longlive2-nvfp4", "omniforcing"]
 
 [package.metadata.requires-dev]
 dev = [
