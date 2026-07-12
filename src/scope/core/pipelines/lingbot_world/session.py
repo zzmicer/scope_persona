@@ -286,8 +286,9 @@ class LingbotWorldSession:
                 decoded = decoded[:, -n_lat * 4 :]
             # first turn: (n_lat-1)*4+1 frames, all new
 
+        decoded = decoded.cpu()
         self.latents.append(new_latents)
-        self.frames.append(decoded.cpu())
+        self.frames.append(decoded)
         self.cur_c2w = poses_c2w[-1].copy()
         self.lat_next += n_lat
 
