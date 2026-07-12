@@ -154,9 +154,10 @@ def _step_delta(kind: str, speed: str) -> np.ndarray:
     if kind == "turn_right":
         return _yaw(r)
     if kind == "look_up":
-        return _pitch(-r)
-    if kind == "look_down":
+        # OpenCV camera (+y down): positive x-rotation tilts the view up
         return _pitch(r)
+    if kind == "look_down":
+        return _pitch(-r)
     if kind == "orbit_left":
         # translate sideways while counter-yawing toward a pivot ~3 units ahead
         arc = np.deg2rad(r) * 3.0
