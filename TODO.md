@@ -47,6 +47,32 @@ Gemma-3-12B text encoder. ~60GB bf16 → H100/H200 only. Weights:
   encode for headroom); confirm clean `uv sync --extra omniforcing` from scratch (pod
   was bootstrapped via `uv pip install`).
 
+## LingBot-World-V2 (interactive world model) — branch `lingbot-world`
+
+14B causal-fast world model (Wan2.2-based, CC BY-NC-SA) from
+github.com/Robbyant/lingbot-world-v2: image → interactive world, camera controlled by
+per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling KV cache
+(`local_attn_size=18` + sink 6) → unbounded horizon. Runs on 1×H200 (~70GB, no offload,
+~4.5s per 4-latent-frame chunk ≈ 3.5 video-fps at 480×832).
+
+- [x] Pod bring-up (4×H200, 2026-07-12): deps + prebuilt flash-attn 2.7.4.post1
+  (cu12torch2.4 cp311) + weights (~93GB) on /workspace; stock `generate.py` verified
+  single-GPU (161 frames in 45s; text prompt morphed lakeside→Great Wall = text-driven
+  world change confirmed).
+- [x] `src/scope/core/pipelines/lingbot_world/`: `actions.py` (text → camera
+  trajectories), `session.py` (turn-based generation over persistent KV cache +
+  windowed VAE decode), `demo.py` (interactive/scripted CLI), README.
+- [x] Interactive demo verified on pod: event prompts animate the character (she
+  waves, identity preserved); camera motion navigates the world. Event prompts must be
+  composed with the base world prompt and reverted after one turn (else the world
+  morphs into the event's subject — learned from smoke test).
+- [ ] Wire into scope pipeline registry (schema/model.yaml/runtime like omniforcing)
+  + WebRTC streaming + chat UI as the persona front-end.
+- [ ] LLM-based action interpreter (free text → motion/event tuples) per CLAUDE.md
+  persona architecture (current parser is keyword-based).
+- [ ] Explore upstream `wasd_action`/`ijkl_action` channels (present in examples but
+  unused by released code) and the causal-pretrain 1.3B when released (speed).
+
 ## LongLive 2.0 (NVFP4) Integration
 
 See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeline on Wan2.2-TI2V-5B

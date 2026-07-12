@@ -1,0 +1,8 @@
+# interactive AI-girl world demo script
+she smiles and waves at the camera
+walk forward slowly for 2 seconds
+orbit around her for 3 seconds
+turn left for 2 seconds
+walk forward for 3 seconds
+scene: a golden eagle lands on a rock beside the trail, mountain valley in the background
+look up for 2 seconds
