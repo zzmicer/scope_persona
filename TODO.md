@@ -76,7 +76,10 @@ per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling K
   motion instead of dropping new controls during generation (100-update burst,
   zero drops). Follow-ups: [x] browser-verified end-to-end stream; [x] add scipy/easydict/
   ftfy as a `lingbot` extra in pyproject (uv-pip-installed on pod for now);
-  [ ] frame pacing vs ~4s/chunk generation (buffer tuning); [ ] chat UI.
+  [x] reproduce `beauty.mp4` interaction with a dedicated Event Proposals panel
+  (1 hair, 2 chin-in-hands, 3 candle, F butterfly, G snow) and persistent
+  base+event prompt composition; [ ] frame pacing vs ~4s/chunk generation (buffer
+  tuning); [ ] chat UI / agent-generated event proposals.
 - [ ] LLM-based action interpreter (free text → motion/event tuples) per CLAUDE.md
   persona architecture (current parser is keyword-based).
 - [ ] Explore upstream `wasd_action`/`ijkl_action` channels (present in examples but

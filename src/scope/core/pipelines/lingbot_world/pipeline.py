@@ -102,6 +102,7 @@ class LingbotWorldPipeline(Pipeline):
 
         self._session = None
         self._prompt = ""
+        self._event_prompt = ""
         self._seed = config.base_seed
         self.first_call = True
 
@@ -131,9 +132,15 @@ class LingbotWorldPipeline(Pipeline):
         self.first_call = False
 
         session = self._session
-        if prompt and prompt != self._prompt:
-            session.set_prompt(prompt)
-            self._prompt = prompt
+        event_changed = "event_prompt" in kwargs and (
+            kwargs["event_prompt"] or ""
+        ) != self._event_prompt
+        if event_changed:
+            self._event_prompt = kwargs["event_prompt"] or ""
+        if (prompt and prompt != self._prompt) or event_changed:
+            if prompt:
+                self._prompt = prompt
+            session.set_prompt(self._composed_prompt())
 
         # Horizon exhausted -> re-seed from the last generated frame so the
         # stream continues (KV cache restarts; world persists via the image).
@@ -168,6 +175,17 @@ class LingbotWorldPipeline(Pipeline):
             return raw.get("text", "")
         return raw or ""
 
+    def _composed_prompt(self) -> str:
+        """Keep identity/world conditioning present while applying an event."""
+        if not self._event_prompt:
+            return self._prompt
+        return (
+            f"{self._prompt.rstrip().rstrip('.')}."
+            f" The same character in the same clothing and environment now "
+            f"{self._event_prompt.strip().rstrip('.')}. Preserve her identity, "
+            "clothing, camera framing, and surroundings."
+        )
+
     def _start_session(
         self, image_path: str | None, prompt: str, from_last_frame: bool = False
     ) -> None:
@@ -190,6 +208,7 @@ class LingbotWorldPipeline(Pipeline):
             img = Image.open(path).convert("RGB")
 
         self._prompt = prompt or self._prompt or "an explorable world"
+        self._event_prompt = ""
         logger.info(
             "lingbot-world: new session (from_last_frame=%s, prompt=%r)",
             from_last_frame,

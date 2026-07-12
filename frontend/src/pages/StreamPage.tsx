@@ -3,6 +3,7 @@ import { Header } from "../components/Header";
 import { InputAndControlsPanel } from "../components/InputAndControlsPanel";
 import { VideoOutput } from "../components/VideoOutput";
 import { SettingsPanel } from "../components/SettingsPanel";
+import { LingbotEventPanel } from "../components/LingbotEventPanel";
 import { PromptInputWithTimeline } from "../components/PromptInputWithTimeline";
 import { DownloadDialog } from "../components/DownloadDialog";
 import type { TimelinePrompt } from "../components/PromptTimeline";
@@ -1597,6 +1598,14 @@ export function StreamPage() {
 
         {/* Right Panel - Settings */}
         <div className="w-1/5 flex flex-col gap-3">
+          {settings.pipelineId === "lingbot-world" && (
+            <LingbotEventPanel
+              disabled={!isStreaming}
+              onEvent={eventPrompt =>
+                sendParameterUpdate({ event_prompt: eventPrompt })
+              }
+            />
+          )}
           <SettingsPanel
             className="flex-1 min-h-0 overflow-auto"
             pipelines={pipelines}

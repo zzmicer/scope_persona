@@ -67,6 +67,14 @@ class LingbotWorldConfig(BasePipelineConfig):
 
     # Presence of this field enables frontend keyboard/mouse capture.
     ctrl_input: CtrlInput | None = None
+    event_prompt: str = Field(
+        default="",
+        description=(
+            "Character action or world event composed with the persistent base "
+            "prompt (for example: 'she rests her chin in both hands')."
+        ),
+        json_schema_extra=ui_field_config(order=4),
+    )
 
     height: int = Field(
         default=480,

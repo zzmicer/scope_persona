@@ -54,6 +54,27 @@ Measured on 1×H200 (2026-07-12): ~4.5s per 4-latent-frame chunk at 480×832
 | `she waves at the camera` | event: prompt swap, camera idles 2s |
 | `scene: a dragon lands on the ridge` | explicit event prefix |
 
+## Reproducing `beauty.mp4`
+
+The Scope UI shows an **Event Proposals** panel for `lingbot-world`, matching the
+reference interaction: press/click **1** Run Through Hair, **2** Rest Chin In
+Hands, and **3** Hold Candle. **F** adds a butterfly and **G** blankets the room
+with snow. Event prompts are composed with the persistent character/world prompt
+instead of replacing it, which keeps identity, clothing, camera framing, and the
+bedroom anchored while the action or object changes.
+
+For a direct-to-MP4 GPU check without WebRTC, use the included script:
+
+```bash
+python src/scope/core/pipelines/lingbot_world/demo.py \
+  --lingbot-repo /workspace/lingbot-world-v2 \
+  --ckpt-dir /workspace/lingbot-world-v2-14b-causal-fast \
+  --image /assets/beauty_seed.png \
+  --prompt "A beautiful young woman with long dark hair in a black ribbed sweater sits beside a blue bed in a dim bedroom, intimate close-up fixed camera" \
+  --script src/scope/core/pipelines/lingbot_world/beauty_commands.txt \
+  --out /workspace/lingbot_out/beauty_interaction.mp4
+```
+
 ## Persona notes / limitations
 
 - Control is **camera-level** (world navigation) + **prompt-level** (events,
