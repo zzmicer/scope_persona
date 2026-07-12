@@ -84,6 +84,13 @@ per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling K
   persona architecture (current parser is keyword-based).
 - [ ] Explore upstream `wasd_action`/`ijkl_action` channels (present in examples but
   unused by released code) and the causal-pretrain 1.3B when released (speed).
+- [x] Dedicated LingBot web studio: focused start-image → world flow, explicit
+  model/WebRTC/warm-up states, full-size video stage, Beauty event controls,
+  custom natural-language actions, and WASD/mouse camera input. Replaces the
+  generic multi-pipeline editor at `/`; advanced editor remains at `/scope`.
+  Production build + deployed HTTP assets verified; live H200 E2E verified
+  (WebRTC connected, data channel open, seed accepted, event delivered, 13+16
+  frames generated without runtime errors).
 
 ## LongLive 2.0 (NVFP4) Integration
 

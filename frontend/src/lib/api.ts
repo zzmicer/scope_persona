@@ -27,6 +27,8 @@ export interface WebRTCOfferRequest {
     vace_context_scale?: number;
     pipeline_ids?: string[];
     images?: string[];
+    first_frame_image?: string;
+    input_mode?: "text" | "video";
   };
 }
 

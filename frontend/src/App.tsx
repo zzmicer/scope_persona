@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { StreamPage } from "./pages/StreamPage";
+import { LingbotPage } from "./pages/LingbotPage";
 import { Toaster } from "./components/ui/sonner";
 import { PipelinesProvider } from "./contexts/PipelinesContext";
 import { CloudProvider } from "./lib/cloudContext";
@@ -89,6 +90,17 @@ function App() {
         </div>
         <Toaster />
       </div>
+    );
+  }
+
+  // This branch ships a focused LingBot studio at the default route. Keep the
+  // full multi-pipeline Scope editor available at /scope for advanced use.
+  if (window.location.pathname !== "/scope") {
+    return (
+      <>
+        <LingbotPage />
+        <Toaster />
+      </>
     );
   }
 

@@ -56,7 +56,12 @@ Measured on 1×H200 (2026-07-12): ~4.5s per 4-latent-frame chunk at 480×832
 
 ## Reproducing `beauty.mp4`
 
-The Scope UI shows an **Event Proposals** panel for `lingbot-world`, matching the
+The dedicated LingBot studio is served at `/` (the full advanced Scope editor is
+still available at `/scope`). It provides a direct start-image → live-world flow,
+clear model/connection/first-frame status, a large video stage, custom action
+input, and pointer-lock WASD/mouse camera control.
+
+The studio shows an **Event Proposals** panel matching the
 reference interaction: press/click **1** Run Through Hair, **2** Rest Chin In
 Hands, and **3** Hold Candle. **F** adds a butterfly and **G** blankets the room
 with snow. Event prompts are composed with the persistent character/world prompt
