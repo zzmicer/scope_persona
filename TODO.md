@@ -66,8 +66,14 @@ per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling K
   waves, identity preserved); camera motion navigates the world. Event prompts must be
   composed with the base world prompt and reverted after one turn (else the world
   morphs into the event's subject — learned from smoke test).
-- [ ] Wire into scope pipeline registry (schema/model.yaml/runtime like omniforcing)
-  + WebRTC streaming + chat UI as the persona front-end.
+- [x] Wire into scope pipeline registry + WebRTC streaming (2026-07-12):
+  `lingbot-world` registered (schema.py/pipeline.py), ctrl_input (WASD/arrows/
+  Q/E/mouse) → per-chunk camera pose deltas, prompt updates → events,
+  first_frame_image seeds the world, horizon exhaustion re-seeds from last
+  frame. Deployed on the H200 pod (/workspace/scope, Cloudflare TURN).
+  Follow-ups: [ ] browser-verified end-to-end stream; [ ] add scipy/easydict/
+  ftfy as a `lingbot` extra in pyproject (uv-pip-installed on pod for now);
+  [ ] frame pacing vs ~4s/chunk generation (buffer tuning); [ ] chat UI.
 - [ ] LLM-based action interpreter (free text → motion/event tuples) per CLAUDE.md
   persona architecture (current parser is keyword-based).
 - [ ] Explore upstream `wasd_action`/`ijkl_action` channels (present in examples but
