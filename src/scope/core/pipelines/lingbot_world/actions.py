@@ -205,3 +205,60 @@ def default_intrinsics(width: int, height: int) -> np.ndarray:
         [415.53 * width / 832.0, 415.69 * height / 480.0, width / 2.0, height / 2.0],
         dtype=np.float32,
     )
+
+
+def delta_from_ctrl(
+    ctrl,
+    move_speed: float = 0.4,
+    turn_deg: float = 4.5,
+) -> np.ndarray:
+    """One latent-frame camera delta from held keys/mouse (scope CtrlInput).
+
+    WASD translate, arrow keys yaw/pitch, Q/E orbit, Shift doubles move speed.
+    Mouse deltas add yaw/pitch on top. No input -> identity (camera holds).
+    """
+    keys = getattr(ctrl, "button", None) or set()
+    mouse = getattr(ctrl, "mouse", (0.0, 0.0)) or (0.0, 0.0)
+
+    if "ShiftLeft" in keys or "ShiftRight" in keys:
+        move_speed = move_speed * 2.0
+
+    tx = ty = tz = 0.0
+    if "KeyW" in keys:
+        tz += move_speed
+    if "KeyS" in keys:
+        tz -= move_speed
+    if "KeyA" in keys:
+        tx -= move_speed
+    if "KeyD" in keys:
+        tx += move_speed
+    if "KeyR" in keys:  # rise
+        ty -= move_speed
+    if "KeyF" in keys:  # fall
+        ty += move_speed
+
+    yaw = pitch = 0.0
+    if "ArrowLeft" in keys:
+        yaw -= turn_deg
+    if "ArrowRight" in keys:
+        yaw += turn_deg
+    if "ArrowUp" in keys:
+        pitch += turn_deg
+    if "ArrowDown" in keys:
+        pitch -= turn_deg
+    # Mouse look: frontend sends normalized deltas; scale to degrees.
+    yaw += float(mouse[0]) * turn_deg
+    pitch -= float(mouse[1]) * turn_deg
+
+    delta = _trans(tx, ty, tz)
+    if "KeyQ" in keys:  # orbit left around a pivot ~3 units ahead
+        arc = np.deg2rad(turn_deg) * 3.0
+        delta = delta @ _trans(-arc, 0, 0) @ _yaw(turn_deg)
+    if "KeyE" in keys:
+        arc = np.deg2rad(turn_deg) * 3.0
+        delta = delta @ _trans(arc, 0, 0) @ _yaw(-turn_deg)
+    if yaw:
+        delta = delta @ _yaw(yaw)
+    if pitch:
+        delta = delta @ _pitch(pitch)
+    return delta
