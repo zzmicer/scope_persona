@@ -118,6 +118,13 @@ class LingbotWorldPipeline(Pipeline):
         # (Re)seed the world: first call, explicit new image, or cache reset.
         want_reset = bool(kwargs.get("init_cache", False)) and not self.first_call
         if self._session is None or image_path:
+            if self._session is None and not (image_path or self.config.start_image):
+                # No world yet: emit black frames until an image is picked in
+                # the UI instead of erroring the stream loop.
+                f = self.config.chunk_size * 4
+                return {
+                    "video": torch.zeros(f, self.config.height, self.config.width, 3)
+                }
             self._start_session(image_path, prompt)
         elif want_reset:
             self._start_session(None, prompt, from_last_frame=True)
