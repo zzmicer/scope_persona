@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python '/Users/zmicer/Dev/scope_persona/.codex/hooks/format.py'"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/zmicer/Dev/scope_persona/.codex/hooks/pre-compact.sh'"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/zmicer/Dev/scope_persona/.codex/hooks/session-start.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
