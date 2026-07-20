@@ -3,6 +3,9 @@
 ## In Progress
 
 - [~] Define product direction and update CLAUDE.md with persona vision
+- [x] Write product vision doc (`VISION.md`) — target product modeled on Vidu S1
+  (arXiv:2607.03118) / Vidu Stream: voice/chat-controlled persona, infinite
+  drift-free streaming, 540p ≥24fps, single-image characters, joint AV lipsync
 - [~] Research character consistency techniques (persistent latent conditioning, reference image anchoring, IP-Adapter)
 
 ## OmniForcing (LTX-2 causal AV) Integration
@@ -84,6 +87,67 @@ per-latent-frame pose deltas (Plücker), events/scene by prompt swaps, rolling K
   persona architecture (current parser is keyword-based).
 - [ ] Explore upstream `wasd_action`/`ijkl_action` channels (present in examples but
   unused by released code) and the causal-pretrain 1.3B when released (speed).
+
+## SoulX-LiveAct (interactive talking/acting persona) — pod /workspace/soulx
+
+18B (Wan2.1 14B + 4B audio) realtime streaming human animation from
+github.com/Soul-AILab/SoulX-LiveAct: reference image + audio → lip-synced video at
+20fps on 2×H200; motion/emotion controlled by per-chunk prompt swaps (edit_prompt).
+Goal: chat with the chano39 anime character; she speaks (kokoro TTS) and performs
+moves from prompts in realtime.
+
+- [x] Pod bring-up (4×H200, 2026-07-16): weights (51GB LiveAct + wav2vec2) on
+  /workspace/soulx/weights; conda env on /workspace/soulx/env (root disk full);
+  torch 2.8 cu128 + vllm 0.11 + SageAttention v2.2 + LightVAE + flash-attn 2.8.3
+  wheel (nvcc 12.8 via conda; xformers needs XFORMERS_IGNORE_FLASH_VERSION_CHECK=1).
+- [x] E2E VERIFIED (2026-07-17): interactive demo live on GPUs 2,3 port 8090 —
+  chat (Qwen2.5 → {say, action}), kokoro TTS lipsync, realtime action prompts,
+  clean 720×416 stream at ~14.9fps gen (target 20).
+  CRITICAL fixes: (1) SageAttention sm90 kernels produce noise/NaN on this
+  pod — run SDPA/flash-attn instead (sage import blocked via PYTHONPATH shim,
+  model_memory_sp.py AttnType.SAGE_FP8_SM90→FA); FP8 GEMM (vllm) also noise —
+  `--no_fp8_gemm`; (2) rank0-only kokoro/LLM sampling desyncs CUDA RNG across
+  SP ranks → half-frame corruption; latents now use a dedicated torch.Generator.
+- [x] Realtime no-player streaming (2026-07-17): HLS replaced by /ws WebSocket
+  (JPEG frames + PCM16, ts-prefixed) → canvas + WebAudio client, ~0.4s latency;
+  fps 20→16 so ~15fps generation keeps up. Session-OOM leak fixed
+  (per-forward xFuserLongContextAttention → singleton; mem flat 76GB, 150+ chunks);
+  sessions auto-restart on error (≤3).
+- [x] Vidu-goal reconciliation (2026-07-20): SoulX is now the primary open/local
+  product baseline, not an isolated demo. Official Vidu S1 currently exposes a
+  product/API/agent skill but no model code or weights; keep Vidu as the hosted
+  reference/evaluation oracle and keep the persona contracts provider-neutral.
+  Latest API path is Aliyun RTC media + a server-proxied control WebSocket and
+  currently hard-caps calls at 600s (fresh session/credentials required).
+- [ ] Integrate SoulX as a Scope persona service/provider: preserve its persistent
+  distributed session and A/V clock; expose lifecycle, structured directives,
+  status, and media through Scope without coupling `scope.core.persona` to Flask
+  or the SoulX runtime.
+- [~] Add Vidu-style voice interaction: FIRST PROTOTYPE DEPLOYED 2026-07-20 —
+  browser SpeechRecognition mic → the existing chat/action interpreter, live
+  captions, plus retained Chat/Say/Do modes and shortcuts. Follow-up: replace
+  browser-dependent one-shot recognition with provider-neutral streaming ASR.
+- [~] Add camera perception: local camera preview + permission UX deployed;
+  follow-up is vision/emotion context for the conversation manager, never direct
+  coupling to the SoulX generator.
+- [~] Add character creation flow: deployed name, personality, reference-image
+  upload/validation, and four Kokoro voice choices; chano39 remains the default
+  fixture. Follow-ups: template gallery and content-safety validation.
+- [x] Vidu-style live-call shell deployed on the H200 pod (2026-07-20): full-screen
+  generated character, create/join screen, presence state, captions, mic/camera/
+  end/chat controls, action drawer, mobile layout. Verified persona config,
+  action, and chat→Qwen→Kokoro→SoulX paths live at stable ~14.9fps. Qwen/Kokoro
+  isolated in `persona_aux.py` on physical GPU 0; SoulX/NCCL sees only GPUs 2,3.
+  Warm chat+TTS request verified in 1.85s without stopping generation.
+- [ ] Establish Vidu-aligned baseline metrics: action latency (next chunk), A/V
+  sync, FPS, identity/quality curves over >=30 minutes, and automatic-recovery
+  behavior. Live check 2026-07-20: active, no error, 132,339 chunks.
+- [ ] Optional hosted-reference adapter: evaluate Vidu API behind the same
+  session/provider boundary (Aliyun RTC + proxied control WS); handle NOT_READY
+  retries, heartbeat, billing state, stale events, and the 600s renewal boundary.
+- [ ] Perf: try plain torch.compile (safe subset) to close 15→20fps. Re-enable
+  SageAttention/FP8 only behind isolated numerical tests; both are known-bad on
+  the current torch 2.8/cu128/H200 stack.
 - [x] Dedicated LingBot web studio: focused start-image → world flow, explicit
   model/WebRTC/warm-up states, full-size video stage, Beauty event controls,
   custom natural-language actions, and WASD/mouse camera input. Replaces the
