@@ -652,21 +652,36 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             Nod
           </button>
           <button
-            onclick="doAction('She sits down gracefully.', 'She is sitting down, relaxed.')"
+            onclick="doAction('She sits down gracefully.', 'She is sitting down, relaxed.', 5)"
           >
             🪑 Sit
           </button>
           <button
-            onclick="doAction('She stands up.', 'She is standing, relaxed.')"
+            onclick="doAction('She stands up.', 'She is standing, relaxed.', 6)"
           >
             🧍 Stand
           </button>
           <button
-            onclick="doAction('She turns around slowly.', 'She is seen from behind, turned away.')"
+            onclick="doAction('She turns around slowly.', 'She is seen from behind, turned away.', 6)"
           >
             🔄 Turn
           </button>
           <button onclick="doAction('')">Idle</button>
+        </div>
+        <div class="composer">
+          <label for="holdS" style="font-size: 12px; opacity: 0.7"
+            >Hold&nbsp;(s)</label
+          ><input
+            id="holdS"
+            type="number"
+            min="1"
+            max="20"
+            step="1"
+            placeholder="auto"
+            style="width: 64px"
+          /><span style="font-size: 11px; opacity: 0.55"
+            >how long a motion plays before settling</span
+          >
         </div>
         <div class="composer">
           <select id="mode">
@@ -867,11 +882,19 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         document.getElementById("setup").classList.remove("hidden");
         document.getElementById("call-button").textContent = "Start live call";
       }
-      async function doAction(text, pose) {
+      function holdInput() {
+        const v = parseFloat(document.getElementById("holdS").value);
+        return v > 0 ? v : undefined;
+      }
+      async function doAction(text, pose, holdS) {
         // pose undefined -> momentary gesture; pose string -> sustained state
         // ("" clears back to neutral idle) that the character stays in.
+        // holdS (seconds) sets how long the motion plays; falls back to the Hold
+        // field, then to the server default.
         const payload = { text };
         if (pose !== undefined) payload.pose = pose;
+        const h = holdS !== undefined ? holdS : holdInput();
+        if (h) payload.hold_s = h;
         await api("/action", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -883,11 +906,16 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         if (!text) return;
         if (mode === "chat") addMsg("user", text);
         const route = mode === "do" ? "/action" : `/${mode}`;
+        const body = { text };
+        if (mode === "do") {
+          const h = holdInput();
+          if (h) body.hold_s = h;
+        }
         try {
           await api(route, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }),
+            body: JSON.stringify(body),
           });
         } catch (error) {
           addMsg("error", error.message);

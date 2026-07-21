@@ -63,7 +63,7 @@ def generate():
         with torch.no_grad():
             output = model.generate(
                 **ids,
-                max_new_tokens=160,
+                max_new_tokens=200,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
