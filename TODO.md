@@ -142,16 +142,6 @@ moves from prompts in realtime.
   action + pose, pose persisted. Stable 14.9fps, 72.3GB flat, no errors, ranks in
   sync. STILL VISUAL-VERIFY VIA TUNNEL: confirm she looks seated, no identity
   drift over long holds, stative phrasing doesn't re-trigger the sit-down motion.
-- [x] Tunable per-action hold (2026-07-21, pod-verified) — hold was a single global
-  `--action_hold`; slower motions (stand up, turn) need longer than a wave. Now
-  per-directive: `/action {hold|hold_s}`, a UI "Hold (s)" field + per-button holds
-  (Sit 5s, Stand/Turn 6s), and Qwen emits `hold_seconds`. Robustness: the 1.5B Qwen
-  often omits pose/hold_seconds, so a keyword fallback (`_infer_posture`) derives a
-  sustained pose + longer hold from the action text (stand/sit/lie/turn/kneel/…).
-  Verified: hold_s=40 kept the transition active across 15+ chunks then expired with
-  state persisting; chat "stand up" → fallback injected hold_s=6 + pose persisted.
-  Note: Qwen 1.5B sometimes misgenders the character ("he/his") in say/pose text —
-  persona-prompt quality issue, separate from this feature.
 - [~] Add camera perception: local camera preview + permission UX deployed;
   follow-up is vision/emotion context for the conversation manager, never direct
   coupling to the SoulX generator.

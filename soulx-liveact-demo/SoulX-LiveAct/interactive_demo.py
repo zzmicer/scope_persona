@@ -6,13 +6,11 @@ identity/scene) + sustained state (held posture) + a transient transition.
 Transitions are held a few chunks then dropped, but posture changes update the
 sustained state so the character STAYS in the new pose (sit -> keeps sitting).
 
-  - /chat    -> LLM decides {say, action, pose, hold_seconds}; speech -> kokoro TTS
-               (lip-synced); action = transient motion, pose = new sustained state
-               (or null), hold_seconds = how long to play the motion.
+  - /chat    -> LLM decides {say, action, pose}; speech -> kokoro TTS (lip-synced);
+               action = transient motion, pose = new sustained state (or null).
   - /say     -> speak exactly this text.
   - /action  -> perform a motion now; {pose} or {persist:true} makes it stick,
-               {hold|hold_s} tunes how long the motion plays (slower motions like
-               standing/turning need more), empty body clears back to neutral idle.
+               empty body clears back to neutral idle.
 Video+audio are muxed into a live HLS stream at /stream/live/live.m3u8.
 
 Run (2 GPUs):
@@ -106,49 +104,6 @@ def _clean_field(v):
     return None if v.lower() in ("", "null", "none") else v
 
 
-# Fallback posture inference: the small LLM often omits pose/hold_seconds, which
-# would make posture changes act like non-persistent gestures with a short hold.
-# When the action text mentions one of these, derive a sustained pose (or None for
-# a slow non-posture motion) and a longer hold. Keys are specific enough to avoid
-# false positives in short third-person motion descriptions.
-_POSTURE_HINTS = [
-    ("sit down", "She is sitting down, relaxed.", 5),
-    ("sits", "She is sitting down, relaxed.", 5),
-    ("sitting", "She is sitting down, relaxed.", 5),
-    ("seated", "She is sitting down, relaxed.", 5),
-    ("stand up", "She is standing, relaxed.", 6),
-    ("stands", "She is standing, relaxed.", 6),
-    ("standing", "She is standing, relaxed.", 6),
-    ("lie down", "She is lying down, relaxed.", 6),
-    ("lies down", "She is lying down, relaxed.", 6),
-    ("lying", "She is lying down, relaxed.", 6),
-    ("kneel", "She is kneeling.", 5),
-    ("crouch", "She is crouching.", 5),
-    ("turn around", "She is turned away from the camera.", 6),
-    ("turns around", "She is turned away from the camera.", 6),
-    ("turned away", "She is turned away from the camera.", 6),
-    ("leans back", "She is leaning back, relaxed.", 4),
-    ("leaning", "She is leaning back, relaxed.", 4),
-    ("arms crossed", "She has her arms crossed.", 4),
-    ("crosses her arms", "She has her arms crossed.", 4),
-    ("walk", None, 6),
-    ("dance", None, 6),
-    ("spin", None, 5),
-]
-
-
-def _infer_posture(action_text):
-    """Derive (pose, hold_seconds) from an action description; (None, None) if no
-    hint matches. Used only as a fallback when the LLM omitted those fields."""
-    if not action_text:
-        return None, None
-    a = action_text.lower()
-    for kw, pose, hold in _POSTURE_HINTS:
-        if kw in a:
-            return pose, hold
-    return None, None
-
-
 # ----------------------------------------------------------------------------
 # rank0 session state (fed by Flask routes, consumed at chunk boundaries)
 # ----------------------------------------------------------------------------
@@ -157,12 +112,10 @@ class SessionState:
         self.lock = threading.Lock()
         self.speech_q = queue.Queue()  # np.float32 arrays @16k queued for playback
         # structured directive picked up at the next chunk boundary:
-        #   {"transition": str|None, "rest": str|None, "hold": int|None}
-        # transition = transient motion held for `hold` chunks (default action_hold)
-        #   then dropped.
+        #   {"transition": str|None, "rest": str|None}
+        # transition = transient motion held for action_hold chunks then dropped.
         # rest = new sustained state; None leaves state unchanged (gesture),
         #        "" clears it back to neutral idle.
-        # hold = chunks to hold the transition; None uses the --action_hold default.
         self.pending_directive = None
         self.stop_flag = False
         self.start_params = queue.Queue()  # session start requests
@@ -272,10 +225,7 @@ class Brain:
             "(sit down, stand up, lie down, turn around, lean back, kneel, cross arms), a SHORT "
             "third-person description of the RESULTING held pose you stay in afterwards, "
             "e.g. 'She is sitting on the floor, relaxed.' — otherwise null for momentary "
-            'gestures (wave, nod, wink, laugh) that should not persist>", '
-            '"hold_seconds": <how many seconds the motion should keep playing before it '
-            "settles — about 2 for a quick gesture (wave, nod), 5 to 7 for a slower motion "
-            "(stand up, sit down, turn around, walk); null to use the default>}. "
+            'gestures (wave, nod, wink, laugh) that should not persist>"}. '
             "Keep everything friendly and wholesome."
         )
 
@@ -318,7 +268,7 @@ class Brain:
             else:
                 self.ensure()
                 if self.model is None:
-                    return f"You said: {message}", None, None, None
+                    return f"You said: {message}", None, None
                 text = self.tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True
                 )
@@ -335,20 +285,17 @@ class Brain:
                 raw = self.tok.decode(
                     out[0][ids["input_ids"].shape[1] :], skip_special_tokens=True
                 )
-            say, action, pose, hold_s = raw.strip(), None, None, None
+            say, action, pose = raw.strip(), None, None
             try:
                 s = raw[raw.index("{") : raw.rindex("}") + 1]
                 obj = json.loads(s)
                 say = obj.get("say") or ""
                 action = _clean_field(obj.get("action"))
                 pose = _clean_field(obj.get("pose"))
-                hs = obj.get("hold_seconds")
-                if isinstance(hs, (int, float)) and hs > 0:
-                    hold_s = float(hs)
             except Exception:
                 pass
             self.history.append({"role": "assistant", "content": say})
-            return say, action, pose, hold_s
+            return say, action, pose
 
 
 # ----------------------------------------------------------------------------
@@ -526,15 +473,6 @@ class LiveEngine:
         print(f"warmup done in {time.perf_counter() - t0:.1f}s", flush=True)
 
     # --- helpers -------------------------------------------------------------
-    def holds_from_seconds(self, seconds):
-        """Seconds of desired transition -> whole chunks to hold it (>=1).
-
-        Each advanced chunk emits adv_frames frames, i.e. adv_frames/fps seconds
-        of video (~2s at fps=16), so this maps a wall-clock hold onto chunk count.
-        """
-        per_chunk = self.adv_frames / self.fps
-        return max(1, round(float(seconds) / per_chunk))
-
     def _reset_kv(self):
         for i in self.kv_cache:
             for l in self.kv_cache[i]:
@@ -926,12 +864,7 @@ class LiveEngine:
                     trans = (d.get("transition") or "").strip()
                     if trans:
                         transition_prompt = trans
-                        hold = d.get("hold")
-                        transition_ttl = (
-                            hold
-                            if isinstance(hold, int) and hold > 0
-                            else self.args.action_hold
-                        )
+                        transition_ttl = self.args.action_hold
                     else:
                         transition_prompt = None
                         transition_ttl = 0
@@ -1205,17 +1138,12 @@ def action():
     text = (body.get("text") or "").strip()
     pose = body.get("pose")  # explicit resting state; None -> gesture, "" -> clear
     persist = bool(body.get("persist"))
-    # hold: how long to keep the transition motion, in chunks or seconds
-    hold = body.get("hold")
-    if hold is None and body.get("hold_s") is not None:
-        hold = engine.holds_from_seconds(body["hold_s"])
-    hold = int(hold) if isinstance(hold, (int, float)) and hold > 0 else None
     if not text and pose is None and not persist:
         # explicit idle: drop any transition and clear the sustained state
-        directive = {"transition": None, "rest": "", "hold": None}
+        directive = {"transition": None, "rest": ""}
     else:
         rest = pose if pose is not None else (text if persist else None)
-        directive = {"transition": text or None, "rest": rest, "hold": hold}
+        directive = {"transition": text or None, "rest": rest}
     with STATE.lock:
         STATE.pending_directive = directive
     STATE.log("action", text or "(idle)")
@@ -1229,34 +1157,14 @@ def chat():
         return jsonify({"status": "error", "message": "empty"}), 400
     STATE.log("user", msg)
     try:
-        say_text, action_text, pose_text, hold_s = brain.reply(msg)
+        say_text, action_text, pose_text = brain.reply(msg)
     except Exception as e:
         STATE.log("error", f"LLM failed: {e}")
         return jsonify({"status": "error", "message": f"LLM failed: {e}"}), 500
-    # fallback: the small LLM often omits pose/hold_seconds — infer them from the
-    # action text so posture changes still persist and get a longer hold.
-    if action_text and (pose_text is None or hold_s is None):
-        inf_pose, inf_hold = _infer_posture(action_text)
-        if pose_text is None:
-            pose_text = inf_pose
-        if hold_s is None and inf_hold is not None:
-            hold_s = inf_hold
     # action = transient motion; pose = sustained state to keep afterwards (None -> gesture)
     if action_text or pose_text:
-        # hold: Qwen's estimate if given; else a longer default for posture changes,
-        # otherwise None (engine falls back to --action_hold for quick gestures).
-        if hold_s is not None:
-            hold = engine.holds_from_seconds(hold_s)
-        elif pose_text:
-            hold = engine.holds_from_seconds(5)
-        else:
-            hold = None
         with STATE.lock:
-            STATE.pending_directive = {
-                "transition": action_text,
-                "rest": pose_text,
-                "hold": hold,
-            }
+            STATE.pending_directive = {"transition": action_text, "rest": pose_text}
         STATE.log("action", action_text or f"(pose: {pose_text})")
     if say_text:
         try:
@@ -1267,13 +1175,7 @@ def chat():
             STATE.log("error", f"TTS failed: {e}")
         STATE.log("chano", say_text)
     return jsonify(
-        {
-            "status": "ok",
-            "say": say_text,
-            "action": action_text,
-            "pose": pose_text,
-            "hold_s": hold_s,
-        }
+        {"status": "ok", "say": say_text, "action": action_text, "pose": pose_text}
     )
 
 
@@ -1356,9 +1258,7 @@ if __name__ == "__main__":
         "--action_hold",
         type=int,
         default=4,
-        help="DEFAULT chunks to hold a transition motion when the caller/LLM gives no "
-        "explicit hold; per-action overrides come via /action {hold|hold_s} or the "
-        "LLM's hold_seconds (~2s/chunk of video)",
+        help="chunks to hold an action before reverting to idle prompt",
     )
     parser.add_argument(
         "--no_fp8_gemm",
