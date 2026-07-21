@@ -127,17 +127,21 @@ moves from prompts in realtime.
   browser SpeechRecognition mic → the existing chat/action interpreter, live
   captions, plus retained Chat/Say/Do modes and shortcuts. Follow-up: replace
   browser-dependent one-shot recognition with provider-neutral streaming ASR.
-- [~] Persistent action states (Wan-Streamer v0.3 "world + event stream") —
-  branch `soulx-persistent-state`. CODE DONE, pod-verify pending. Was: any action
-  held ~4 chunks then hard-reverted to a pose-locked idle prompt (she'd sit then
-  stand back up). Now the T5 context is composed as world (persistent, pose-neutral
-  identity/scene) + sustained state (sticky held posture) + transient transition
-  (motion held `action_hold` chunks then dropped). Posture changes update the
-  sustained state so she STAYS in the new pose; gestures (wave/nod) don't persist.
-  Qwen now emits `{say, action, pose}` (pose = resulting held state or null);
-  `/action` takes `{pose}`/`{persist}`; empty body clears to neutral idle. UI adds
-  Sit/Stand/Turn persistent buttons. Pod TODO: verify sit-and-stay + no identity
-  drift over long holds; tune whether stative phrasing avoids motion re-triggering.
+- [x] Persistent action states (Wan-Streamer v0.3 "world + event stream") —
+  branch `soulx-persistent-state`. POD-VERIFIED 2026-07-21 on 2xH200. Was: any
+  action held ~4 chunks then hard-reverted to a pose-locked idle prompt (she'd sit
+  then stand back up). Now the T5 context is composed as world (persistent,
+  pose-neutral identity/scene) + sustained state (sticky held posture) + transient
+  transition (motion held `action_hold` chunks then dropped). Posture changes
+  update the sustained state so she STAYS in the new pose; gestures (wave/nod)
+  don't. Qwen emits `{say, action, pose}` (pose = resulting held state or null);
+  `/action` takes `{pose}`/`{persist}`; empty body clears to neutral idle; UI adds
+  Sit/Stand/Turn buttons. Log verify (per-chunk `state=/trans=`): SIT -> state
+  sticks 30+ chunks after trans expired; WAVE -> state stays sitting (gesture
+  didn't disturb it); IDLE -> cleared; /chat "sit down" -> Qwen returned distinct
+  action + pose, pose persisted. Stable 14.9fps, 72.3GB flat, no errors, ranks in
+  sync. STILL VISUAL-VERIFY VIA TUNNEL: confirm she looks seated, no identity
+  drift over long holds, stative phrasing doesn't re-trigger the sit-down motion.
 - [~] Add camera perception: local camera preview + permission UX deployed;
   follow-up is vision/emotion context for the conversation manager, never direct
   coupling to the SoulX generator.
