@@ -651,6 +651,21 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           <button onclick="doAction('She nods thoughtfully and smiles!')">
             Nod
           </button>
+          <button
+            onclick="doAction('She sits down gracefully.', 'She is sitting down, relaxed.')"
+          >
+            🪑 Sit
+          </button>
+          <button
+            onclick="doAction('She stands up.', 'She is standing, relaxed.')"
+          >
+            🧍 Stand
+          </button>
+          <button
+            onclick="doAction('She turns around slowly.', 'She is seen from behind, turned away.')"
+          >
+            🔄 Turn
+          </button>
           <button onclick="doAction('')">Idle</button>
         </div>
         <div class="composer">
@@ -852,11 +867,15 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         document.getElementById("setup").classList.remove("hidden");
         document.getElementById("call-button").textContent = "Start live call";
       }
-      async function doAction(text) {
+      async function doAction(text, pose) {
+        // pose undefined -> momentary gesture; pose string -> sustained state
+        // ("" clears back to neutral idle) that the character stays in.
+        const payload = { text };
+        if (pose !== undefined) payload.pose = pose;
         await api("/action", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify(payload),
         });
       }
       async function sendText(text, mode = "chat") {

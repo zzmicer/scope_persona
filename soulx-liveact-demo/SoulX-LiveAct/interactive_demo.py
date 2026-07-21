@@ -1,10 +1,16 @@
 """Interactive persona demo for SoulX-LiveAct.
 
-A continuous live session driven by chat:
-  - /chat    -> LLM decides {say, action}; speech goes through kokoro TTS into the
-               audio buffer (lip-synced), action swaps the T5 prompt context mid-stream.
+A continuous live session driven by chat, modeled on Wan-Streamer v0.3's
+"world + event stream": the T5 context is composed as world (persistent
+identity/scene) + sustained state (held posture) + a transient transition.
+Transitions are held a few chunks then dropped, but posture changes update the
+sustained state so the character STAYS in the new pose (sit -> keeps sitting).
+
+  - /chat    -> LLM decides {say, action, pose}; speech -> kokoro TTS (lip-synced);
+               action = transient motion, pose = new sustained state (or null).
   - /say     -> speak exactly this text.
-  - /action  -> perform this motion prompt now (held for a few chunks, then reverts).
+  - /action  -> perform a motion now; {pose} or {persist:true} makes it stick,
+               empty body clears back to neutral idle.
 Video+audio are muxed into a live HLS stream at /stream/live/live.m3u8.
 
 Run (2 GPUs):
@@ -77,12 +83,25 @@ os.makedirs(HLS_ROOT, exist_ok=True)
 
 SR = 16000  # everything audio inside the session is 16k mono float32
 
-IDLE_PROMPT = (
-    "A beautiful blonde anime girl looks at the camera with a gentle smile, "
-    "breathing softly, subtle natural idle motion."
+# Wan-Streamer v0.3 "world + event stream": the world prompt is the PERSISTENT,
+# pose-neutral identity/scene. It must NOT lock a posture (e.g. "looks at the
+# camera"), or reverting to it would pull the character back out of any sustained
+# pose (sitting, turned around, ...). Held posture lives in the sticky state
+# prompt + the rolling KV cache, not here.
+WORLD_PROMPT = (
+    "A beautiful blonde anime girl with an expressive, friendly face, "
+    "in a cozy warm room with soft natural lighting, gentle ambient motion."
 )
 DEFAULT_PERSONA = "Cheerful, warm, playful, curious, and wholesome."
 KOKORO_VOICES = {"af_heart", "af_bella", "af_nicole", "am_adam"}
+
+
+def _clean_field(v):
+    """Normalize an LLM JSON string field -> stripped str or None."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return None if v.lower() in ("", "null", "none") else v
 
 
 # ----------------------------------------------------------------------------
@@ -92,7 +111,12 @@ class SessionState:
     def __init__(self):
         self.lock = threading.Lock()
         self.speech_q = queue.Queue()  # np.float32 arrays @16k queued for playback
-        self.pending_action = None  # str | None, picked up at next chunk boundary
+        # structured directive picked up at the next chunk boundary:
+        #   {"transition": str|None, "rest": str|None}
+        # transition = transient motion held for action_hold chunks then dropped.
+        # rest = new sustained state; None leaves state unchanged (gesture),
+        #        "" clears it back to neutral idle.
+        self.pending_directive = None
         self.stop_flag = False
         self.start_params = queue.Queue()  # session start requests
         self.active = False
@@ -194,9 +218,15 @@ class Brain:
             f"Your personality is: {STATE.persona_prompt} "
             "Chat naturally with the user, in English, using 1-2 short sentences. "
             "You can also perform physical motions on camera. "
-            'Reply ONLY with JSON: {"say": "<what you say>", "action": "<short third-person '
-            "visual description of your motion, e.g. 'She waves her hand at the camera cheerfully!' "
-            'or null if no special motion>"}. Keep everything friendly and wholesome.'
+            'Reply ONLY with JSON: {"say": "<what you say>", '
+            '"action": "<short third-person visual description of the MOTION you make now, '
+            "e.g. 'She waves her hand at the camera cheerfully!' or null if no special motion>\", "
+            '"pose": "<if that motion changes your sustained body posture or position '
+            "(sit down, stand up, lie down, turn around, lean back, kneel, cross arms), a SHORT "
+            "third-person description of the RESULTING held pose you stay in afterwards, "
+            "e.g. 'She is sitting on the floor, relaxed.' — otherwise null for momentary "
+            'gestures (wave, nod, wink, laugh) that should not persist>"}. '
+            "Keep everything friendly and wholesome."
         )
 
     def reset_history(self):
@@ -238,7 +268,7 @@ class Brain:
             else:
                 self.ensure()
                 if self.model is None:
-                    return f"You said: {message}", None
+                    return f"You said: {message}", None, None
                 text = self.tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True
                 )
@@ -246,7 +276,7 @@ class Brain:
                 with torch.no_grad():
                     out = self.model.generate(
                         **ids,
-                        max_new_tokens=160,
+                        max_new_tokens=200,
                         do_sample=True,
                         temperature=0.7,
                         top_p=0.9,
@@ -255,18 +285,17 @@ class Brain:
                 raw = self.tok.decode(
                     out[0][ids["input_ids"].shape[1] :], skip_special_tokens=True
                 )
-            say, action = raw.strip(), None
+            say, action, pose = raw.strip(), None, None
             try:
                 s = raw[raw.index("{") : raw.rindex("}") + 1]
                 obj = json.loads(s)
                 say = obj.get("say") or ""
-                action = obj.get("action") or None
-                if isinstance(action, str) and action.lower() in ("null", "none", ""):
-                    action = None
+                action = _clean_field(obj.get("action"))
+                pose = _clean_field(obj.get("pose"))
             except Exception:
                 pass
             self.history.append({"role": "assistant", "content": say})
-            return say, action
+            return say, action, pose
 
 
 # ----------------------------------------------------------------------------
@@ -510,7 +539,7 @@ class LiveEngine:
                 )
             msk = get_msk(self.frame_num_init, cond, self.vae_stride, self.device)
             y = torch.concat([msk, y], dim=1)
-            ctx = self._encode_text(IDLE_PROMPT)
+            ctx = self._encode_text(WORLD_PROMPT)
             dummy_win = np.zeros(
                 int(SR * (self.frame_num_init + 2) / self.fps), dtype=np.float32
             )
@@ -567,7 +596,7 @@ class LiveEngine:
     def run_session(self, params):
         """Runs on ALL ranks. rank0 additionally drives io/HLS."""
         img_path = params["img_path"]
-        main_prompt = params.get("main_prompt") or IDLE_PROMPT
+        main_prompt = params.get("main_prompt") or WORLD_PROMPT
 
         self._reset_kv()
         image = Image.open(img_path).convert("RGB")
@@ -609,8 +638,24 @@ class LiveEngine:
         y = torch.concat([msk, y], dim=1)
         y_cut = y[:, :, : self.frame_num_init // 4 + 1, ...]
 
-        idle_ctx = self._encode_text(main_prompt)
-        cur_ctx, cur_action, action_ttl = idle_ctx, None, 0
+        # world + event decomposition: world = persistent identity/scene, state =
+        # sustained held posture (sticky), transition = transient motion (held then
+        # dropped). The composed prompt is re-encoded only when it actually changes.
+        world_prompt = main_prompt
+        state_prompt = ""  # sustained posture/activity
+        transition_prompt = None  # transient motion verb
+        transition_ttl = 0
+
+        def compose_prompt():
+            parts = [world_prompt]
+            if state_prompt:
+                parts.append(state_prompt)
+            if transition_prompt:
+                parts.append(transition_prompt)
+            return " ".join(parts)
+
+        cur_prompt_str = compose_prompt()
+        cur_ctx = self._encode_text(cur_prompt_str)
 
         # rank0 io: HLS ffmpeg (video stdin + audio fifo), writer threads
         hls_proc, vq, aq = None, None, None
@@ -779,11 +824,11 @@ class LiveEngine:
                 # ---- chunk-boundary control sync ----
                 if self.rank == 0:
                     stop = STATE.stop_flag
-                    action = None
+                    directive = None
                     with STATE.lock:
-                        if STATE.pending_action is not None:
-                            action = STATE.pending_action
-                            STATE.pending_action = None
+                        if STATE.pending_directive is not None:
+                            directive = STATE.pending_directive
+                            STATE.pending_directive = None
                     # window in frames: [start_f, end_f+2)
                     if iteration == 0:
                         start_f, end_f = 0, self.frame_num_init
@@ -801,7 +846,7 @@ class LiveEngine:
                             self.first_frames + (iteration - 1) * self.adv_frames
                         ) * self.spf
                         heard = slice_abs(a0, a0 + self.adv_frames * self.spf)
-                    payload = {"stop": stop, "action": action, "win": win}
+                    payload = {"stop": stop, "directive": directive, "win": win}
                 else:
                     payload = None
                 if self.use_dist:
@@ -810,13 +855,25 @@ class LiveEngine:
                     payload = box[0]
                 if payload["stop"]:
                     break
-                if payload["action"] is not None:
-                    txt = payload["action"].strip()
-                    if txt:
-                        cur_ctx = self._encode_text(txt)
-                        cur_action, action_ttl = txt, self.args.action_hold
+                if payload["directive"] is not None:
+                    d = payload["directive"]
+                    rest = d.get("rest")
+                    # rest None -> gesture (leave sustained state); str sets it, "" clears
+                    if rest is not None:
+                        state_prompt = rest.strip()
+                    trans = (d.get("transition") or "").strip()
+                    if trans:
+                        transition_prompt = trans
+                        transition_ttl = self.args.action_hold
                     else:
-                        cur_ctx, cur_action, action_ttl = idle_ctx, None, 0
+                        transition_prompt = None
+                        transition_ttl = 0
+
+                # re-encode only when the composed world+state+transition changes
+                tgt = compose_prompt()
+                if tgt != cur_prompt_str:
+                    cur_ctx = self._encode_text(tgt)
+                    cur_prompt_str = tgt
 
                 audio_embs = self._embed_window(payload["win"])
 
@@ -888,7 +945,7 @@ class LiveEngine:
                         print(
                             f"chunk {iteration}: {n_frames}f in {dt_s:.2f}s "
                             f"({n_frames / dt_s:.1f} fps) mem={mem_gb:.1f}GB "
-                            f"action={cur_action}",
+                            f"state={state_prompt or 'idle'!r} trans={transition_prompt!r}",
                             flush=True,
                         )
 
@@ -902,11 +959,14 @@ class LiveEngine:
                     if lag > 0:
                         time.sleep(lag)
 
-                # revert action after hold expires
-                if cur_action is not None:
-                    action_ttl -= 1
-                    if action_ttl <= 0:
-                        cur_ctx, cur_action = idle_ctx, None
+                # transition expires -> drop the transient motion; the sustained state
+                # prompt + rolling KV cache keep the new pose, so she stays (e.g.)
+                # seated instead of snapping back to idle. Re-encode happens at the top
+                # of the next chunk via compose_prompt().
+                if transition_prompt is not None:
+                    transition_ttl -= 1
+                    if transition_ttl <= 0:
+                        transition_prompt = None
                 iteration += 1
         finally:
             if self.rank == 0:
@@ -1010,7 +1070,7 @@ def session_start():
                 uploaded.verify()
         except Exception:
             return jsonify({"status": "error", "message": "invalid image"}), 400
-    main_prompt = (request.form.get("main_prompt") or "").strip() or IDLE_PROMPT
+    main_prompt = (request.form.get("main_prompt") or "").strip() or WORLD_PROMPT
     configure_persona(request.form)
     STATE.stop_flag = False
     with STATE.speech_q.mutex:
@@ -1074,10 +1134,19 @@ def say():
 
 @app.route("/action", methods=["POST"])
 def action():
-    text = (request.get_json(force=True).get("text") or "").strip()
+    body = request.get_json(force=True)
+    text = (body.get("text") or "").strip()
+    pose = body.get("pose")  # explicit resting state; None -> gesture, "" -> clear
+    persist = bool(body.get("persist"))
+    if not text and pose is None and not persist:
+        # explicit idle: drop any transition and clear the sustained state
+        directive = {"transition": None, "rest": ""}
+    else:
+        rest = pose if pose is not None else (text if persist else None)
+        directive = {"transition": text or None, "rest": rest}
     with STATE.lock:
-        STATE.pending_action = text  # empty string -> revert to idle
-    STATE.log("action", text or "(revert to idle)")
+        STATE.pending_directive = directive
+    STATE.log("action", text or "(idle)")
     return jsonify({"status": "ok"})
 
 
@@ -1088,14 +1157,15 @@ def chat():
         return jsonify({"status": "error", "message": "empty"}), 400
     STATE.log("user", msg)
     try:
-        say_text, action_text = brain.reply(msg)
+        say_text, action_text, pose_text = brain.reply(msg)
     except Exception as e:
         STATE.log("error", f"LLM failed: {e}")
         return jsonify({"status": "error", "message": f"LLM failed: {e}"}), 500
-    if action_text:
+    # action = transient motion; pose = sustained state to keep afterwards (None -> gesture)
+    if action_text or pose_text:
         with STATE.lock:
-            STATE.pending_action = action_text
-        STATE.log("action", action_text)
+            STATE.pending_directive = {"transition": action_text, "rest": pose_text}
+        STATE.log("action", action_text or f"(pose: {pose_text})")
     if say_text:
         try:
             wav = tts.synth(say_text, voice=STATE.voice)
@@ -1104,7 +1174,9 @@ def chat():
         except Exception as e:
             STATE.log("error", f"TTS failed: {e}")
         STATE.log("chano", say_text)
-    return jsonify({"status": "ok", "say": say_text, "action": action_text})
+    return jsonify(
+        {"status": "ok", "say": say_text, "action": action_text, "pose": pose_text}
+    )
 
 
 @app.route("/status")
@@ -1207,7 +1279,9 @@ if __name__ == "__main__":
         brain = Brain(args.aux_device, args.aux_url)
         threading.Thread(target=control_loop_rank0, daemon=True).start()
         if args.autostart:
-            STATE.start_params.put({"img_path": args.image, "main_prompt": IDLE_PROMPT})
+            STATE.start_params.put(
+                {"img_path": args.image, "main_prompt": WORLD_PROMPT}
+            )
         print(
             f"\n LiveAct interactive demo on http://0.0.0.0:{args.port}\n", flush=True
         )

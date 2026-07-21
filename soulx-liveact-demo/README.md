@@ -18,11 +18,17 @@ persona; the preview deliberately labels that limitation.
 
 - `SoulX-LiveAct/` — upstream repo **with our modifications**:
   - `interactive_demo.py` (ours) — continuous live session server. Flask +
-    flask-sock. Routes: `/chat` (Qwen2.5-1.5B → `{say, action}`), `/say`
+    flask-sock. The T5 context follows Wan-Streamer v0.3's **world + event
+    stream**: `world` (persistent, pose-neutral identity/scene) + sustained
+    `state` (sticky held posture) + a transient `transition` (motion held
+    `--action_hold` chunks then dropped). Posture changes update the sustained
+    state so the character STAYS in the new pose (sit → keeps sitting) instead
+    of snapping to idle; gestures don't persist. Routes: `/chat` (Qwen2.5-1.5B →
+    `{say, action, pose}`; `pose` = resulting held state or null), `/say`
     (kokoro TTS → rolling 16 kHz audio buffer; silence = idle), `/action`
-    (T5 prompt-context swap at the next chunk boundary, held `--action_hold`
-    chunks, then reverts to idle), `/status`, `/ws` (realtime feed),
-    plus a parallel HLS pipeline (ffmpeg) for recording.
+    (`{text, pose?, persist?}`; a `pose`/`persist` sticks, empty body clears to
+    neutral idle), `/status`, `/ws` (realtime feed), plus a parallel HLS
+    pipeline (ffmpeg) for recording.
   - `persona_aux.py` (ours) — isolated Qwen/Kokoro Flask service on physical
     GPU 0. The main distributed process calls it over loopback HTTP so auxiliary
     inference cannot consume generator VRAM or change its CUDA/NCCL context.
