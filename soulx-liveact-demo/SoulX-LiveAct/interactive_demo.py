@@ -1122,9 +1122,19 @@ def session_start():
         _prune_uploads(os.path.dirname(img_path), keep=5)
     main_prompt = (request.form.get("main_prompt") or "").strip() or WORLD_PROMPT
     configure_persona(request.form)
+    brain.reset_history()
+    # Restart ONLY when the video inputs actually change, i.e. a new reference
+    # image. A start with no upload on a live session changes nothing on screen,
+    # and tearing the session down would drop the KV cache and freeze the stream
+    # for seconds. The client cannot be trusted to know: its `active` flag is
+    # false until the first /status poll, so every page load raced into this.
+    if STATE.active and not f:
+        STATE.log("system", "persona updated (session kept)")
+        return jsonify(
+            {"status": "ok", "restarting": False, "persona": persona_payload()}
+        )
     with STATE.speech_q.mutex:
         STATE.speech_q.queue.clear()
-    brain.reset_history()
     # The reference image is encoded once at session start and then lives in the
     # rolling KV cache, so a new one means a NEW session. Rather than making the
     # client stop/poll/start, queue the params and ask any running session to
