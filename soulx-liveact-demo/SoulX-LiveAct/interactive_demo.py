@@ -119,6 +119,26 @@ def _parse_size(size):
     return w, h
 
 
+# vLLM's W8A8 wrapper replaces EVERY nn.Linear it is handed. In a diffusion
+# transformer the small conditioning layers carry almost no FLOPs but are very
+# sensitive to quantization error, and wrapping them is the likely source of the
+# noise that got FP8 switched off on this pod:
+#   time_projection  -> the AdaLN modulation that scales every block's residual
+#   time/text_embedding, img_emb (CLIP identity), audio_proj (lipsync)
+#   head             -> the final velocity prediction
+# scope="blocks" keeps FP8 on the attention/FFN matmuls, which hold essentially
+# all the compute, and leaves the above in bf16. scope="all" is the old
+# behaviour, kept so the two can be compared.
+_FP8_BLOCK_PARTS = {"self_attn", "cross_attn", "ffn"}
+
+
+def _fp8_block_matmuls(name, module):
+    # names look like "blocks.12.self_attn.q" / "blocks.12.ffn.0"; match on the
+    # path component so "audio_cross_attn" (lipsync) is not caught by substring
+    parts = name.split(".")
+    return len(parts) > 2 and parts[0] == "blocks" and parts[2] in _FP8_BLOCK_PARTS
+
+
 def _prune_uploads(dirpath, keep=5):
     """Keep only the newest `keep` uploaded references (names are unique)."""
     try:
@@ -384,7 +404,15 @@ class LiveEngine:
             args.ckpt_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
         ).to(dtype=torch.bfloat16)
         if not args.no_fp8_gemm:
-            enable_fp8_gemm(self.wan, options=FP8GemmOptions())
+            mf = None if args.fp8_scope == "all" else _fp8_block_matmuls
+            enable_fp8_gemm(self.wan, options=FP8GemmOptions(), module_filter=mf)
+            wrapped = sum(
+                1 for m in self.wan.modules() if type(m).__name__ == "FP8Linear"
+            )
+            print(
+                f"fp8 gemm: scope={args.fp8_scope}, {wrapped} linears wrapped",
+                flush=True,
+            )
         self.wan = self.wan.to(self.device)
         self.wan.freqs = self.wan.freqs.to(self.device)
         self.wan.eval()
@@ -1338,7 +1366,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no_fp8_gemm",
         action="store_true",
-        help="disable vllm FP8 GEMM (produces noise on this pod)",
+        help="disable vllm FP8 GEMM entirely",
+    )
+    parser.add_argument(
+        "--fp8_scope",
+        choices=["blocks", "all"],
+        default="blocks",
+        help="which linears FP8 covers: 'blocks' = attention/FFN matmuls only "
+        "(leaves modulation/embeddings/head in bf16), 'all' = every linear",
     )
     parser.add_argument(
         "--no_compile", action="store_true", help="disable torch.compile"

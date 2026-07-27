@@ -19,6 +19,17 @@ STREAM_SIZE="${STREAM_SIZE:-720*416}"
 STREAM_FPS="${STREAM_FPS:-16}"
 STREAM_PORT="${STREAM_PORT:-8090}"
 STREAM_IMAGE="${STREAM_IMAGE:-/workspace/soulx_setup/chano39-Anime-Original-anime-9101906.png}"
+# STREAM_FP8: off (default) | blocks | all. FP8 W8A8 was disabled here because it
+# produced noise -- but it was being applied to EVERY linear, including the
+# modulation/embedding/head layers that carry no FLOPs and hate quantization.
+# "blocks" covers only the attention/FFN matmuls. Verify output before trusting.
+STREAM_FP8="${STREAM_FP8:-off}"
+case "$STREAM_FP8" in
+  off|0|"") FP8_ARGS=(--no_fp8_gemm) ;;
+  blocks|1) FP8_ARGS=(--fp8_scope blocks) ;;
+  all)      FP8_ARGS=(--fp8_scope all) ;;
+  *) echo "STREAM_FP8 must be off|blocks|all (got $STREAM_FP8)" >&2; exit 1 ;;
+esac
 source /workspace/soulx/env.sh
 cd /workspace/soulx/SoulX-LiveAct
 # Qwen/Kokoro run as a separate process on physical GPU 0. Never expose that
@@ -34,5 +45,5 @@ torchrun --nproc_per_node=2 --master_port=29617 \
   --size "$STREAM_SIZE" --fps "$STREAM_FPS" --port "$STREAM_PORT" \
   --image "$STREAM_IMAGE" \
   --aux_device cpu --aux_url http://127.0.0.1:8091 \
-  --no_fp8_gemm --no_compile \
+  "${FP8_ARGS[@]}" --no_compile \
   --autostart
