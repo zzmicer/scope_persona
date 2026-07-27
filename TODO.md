@@ -180,9 +180,27 @@ moves from prompts in realtime.
 - [ ] Optional hosted-reference adapter: evaluate Vidu API behind the same
   session/provider boundary (Aliyun RTC + proxied control WS); handle NOT_READY
   retries, heartbeat, billing state, stale events, and the 600s renewal boundary.
-- [ ] Perf: try plain torch.compile (safe subset) to close 15→20fps. Re-enable
-  SageAttention/FP8 only behind isolated numerical tests; both are known-bad on
-  the current torch 2.8/cu128/H200 stack.
+- [x] Perf: FP8 W8A8 WORKS (2026-07-27) — the old "FP8 produces noise" finding was
+  wrong about the cause. `enable_fp8_gemm` was called without its `module_filter`,
+  so EVERY nn.Linear got wrapped, including `time_projection` (the AdaLN
+  modulation scaling every block's residual), `head`, `img_emb` (identity),
+  `audio_proj` (lipsync) — no FLOPs, maximum quantization sensitivity. New
+  `--fp8_scope blocks` wraps only the 480 `blocks.N.{self_attn,cross_attn,ffn}`
+  matmuls: 416*720 went 15.0→16.1 fps and 72.3→56.2GB with clean output (no
+  noise/NaN, identity preserved). `STREAM_FP8=off|blocks|all` in run_interactive.sh
+  (default off). SageAttention still untested/blocked.
+- [ ] Perf: the stream is capped at `--fps` by an explicit wall-clock pacer
+  (`interactive_demo.py` "pace to wall clock", keeps ~1.6s lead) — faster
+  generation does NOT raise stream fps, it buys SLACK in the 2.0s chunk budget.
+  That slack is what stops micro-freezes. Measured per-chunk generation:
+  bf16 416*720 = 2.13s (OVER the 2.0s budget → continuous starvation),
+  FP8 416*720 = 1.99s (+0.5%, still stutters on any long chunk),
+  FP8 320*576 = 1.16s (+42%, comfortable, visibly softer image).
+  NOTE `--fps` must divide 16000 (asserted): ladder is 8/10/16/20/25, no step
+  between 16 and 10. Open: measure 352*608 (836 tokens, untested — the sweep
+  timed out); consider 320*576 @ fps 20 (1.6s budget, +27% slack, smoother
+  motion); raise client `JITTER` (0.35s) to absorb the 2s burst cadence; and
+  torch.compile is still untried.
 - [x] Dedicated LingBot web studio: focused start-image → world flow, explicit
   model/WebRTC/warm-up states, full-size video stage, Beauty event controls,
   custom natural-language actions, and WASD/mouse camera input. Replaces the
