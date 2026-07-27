@@ -140,8 +140,28 @@ moves from prompts in realtime.
   sticks 30+ chunks after trans expired; WAVE -> state stays sitting (gesture
   didn't disturb it); IDLE -> cleared; /chat "sit down" -> Qwen returned distinct
   action + pose, pose persisted. Stable 14.9fps, 72.3GB flat, no errors, ranks in
-  sync. STILL VISUAL-VERIFY VIA TUNNEL: confirm she looks seated, no identity
-  drift over long holds, stative phrasing doesn't re-trigger the sit-down motion.
+  sync. VISUAL CHECK DONE 2026-07-27 (frames pulled off /ws) — SPLIT RESULT:
+  transient transitions DO render (an "arms high above her head" directive visibly
+  swings an arm into frame), but the sustained POSTURE does not: after
+  `pose="She is sitting up..."` stuck in state for 30+ chunks she is still lying
+  in the reference-image pose. Identity itself is stable (no drift). So the state
+  machine is correct and gestures work; gross re-posing is overpowered by the
+  reference-image conditioning, which is applied at constant strength every chunk
+  and pulls each chunk back to the reference pose (the VACE identity-vs-motion
+  tension already noted in memory). Next: decay/re-anchor the reference strength,
+  or drive posture through something other than the T5 prompt.
+- [x] Vertical/portrait video (2026-07-27, pod-verified 416*720 @ 15.0fps, 72.3GB
+  — identical to landscape, since SP shards the FRAME axis and only
+  frame_len=(H/16)*(W/16)=1170 reaches the model; `480*832` would be 1.33x tokens).
+  `--size` now validated by `_parse_size` (multiples of 16) instead of failing deep
+  in the transformer; chat.html canvas placeholder templated (it already resized
+  from the ws `meta` frame). TWO GOTCHAS: (1) the reference image is centre-cropped
+  to the stream aspect, so the stock 16:9 chano39 loses her face in portrait — use
+  the pre-framed `/workspace/soulx_setup/chano39-portrait.png`; (2) `conda activate`
+  exports binutils `SIZE=<host>-size` and silently clobbered a `SIZE=` override, so
+  run_interactive.sh overrides are now `STREAM_SIZE`/`STREAM_FPS`/`STREAM_PORT`/
+  `STREAM_IMAGE`. Launch: `STREAM_SIZE='416*720' STREAM_IMAGE=...portrait.png
+  ./run_interactive.sh`.
 - [~] Add camera perception: local camera preview + permission UX deployed;
   follow-up is vision/emotion context for the conversation manager, never direct
   coupling to the SoulX generator.

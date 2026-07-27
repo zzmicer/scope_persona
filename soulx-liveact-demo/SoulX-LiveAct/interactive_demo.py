@@ -96,6 +96,29 @@ DEFAULT_PERSONA = "Cheerful, warm, playful, curious, and wholesome."
 KOKORO_VOICES = {"af_heart", "af_bella", "af_nicole", "am_adam"}
 
 
+# Latent grid = (H // 8) x (W // 8) further patchified by 2, so both dimensions
+# must be multiples of 16; anything else fails much later with an opaque reshape
+# error deep inside the transformer. Orientation itself is free: the model, the
+# KV cache and the SP sharding (which splits the FRAME axis, not space) only see
+# frame_len = (H/16)*(W/16), so 416*720 costs exactly what 720*416 costs.
+SIZE_ALIGN = 16
+
+
+def _parse_size(size):
+    """'W*H' -> (width, height), validated. Portrait and landscape both allowed."""
+    try:
+        w, h = (int(x) for x in size.split("*"))
+    except ValueError:
+        raise SystemExit(f"--size must look like WIDTH*HEIGHT (got {size!r})")
+    bad = [n for n, v in (("width", w), ("height", h)) if v <= 0 or v % SIZE_ALIGN]
+    if bad:
+        raise SystemExit(
+            f"--size {size}: {' and '.join(bad)} must be a positive multiple of "
+            f"{SIZE_ALIGN} (e.g. 720*416 landscape, 416*720 portrait, 480*832 tall)"
+        )
+    return w, h
+
+
 def _clean_field(v):
     """Normalize an LLM JSON string field -> stripped str or None."""
     if not isinstance(v, str):
@@ -308,7 +331,7 @@ class LiveEngine:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.device = self.local_rank
-        self.width, self.height = [int(x) for x in args.size.split("*")]
+        self.width, self.height = _parse_size(args.size)
         self.fps = args.fps
         self.use_dist = self.world_size > 1
 
@@ -1046,7 +1069,10 @@ def control_loop_other():
 @app.route("/")
 def index():
     return render_template(
-        "chat.html", stream_resolution=engine.args.size.replace("*", "x")
+        "chat.html",
+        stream_resolution=f"{engine.width}x{engine.height}",
+        stream_w=engine.width,
+        stream_h=engine.height,
     )
 
 

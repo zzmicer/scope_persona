@@ -600,7 +600,13 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
     </section>
 
     <main class="stage">
-      <canvas id="canvas" width="720" height="416"></canvas>
+      <!-- placeholder until the ws "meta" frame reports the real stream size;
+           keep it in sync with --size so a portrait stream doesn't flash wide -->
+      <canvas
+        id="canvas"
+        width="{{ stream_w }}"
+        height="{{ stream_h }}"
+      ></canvas>
       <div class="topbar">
         <div class="identity">
           <img
