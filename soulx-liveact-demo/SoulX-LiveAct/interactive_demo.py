@@ -109,7 +109,7 @@ def _parse_size(size):
     try:
         w, h = (int(x) for x in size.split("*"))
     except ValueError:
-        raise SystemExit(f"--size must look like WIDTH*HEIGHT (got {size!r})")
+        raise SystemExit(f"--size must look like WIDTH*HEIGHT (got {size!r})") from None
     bad = [n for n, v in (("width", w), ("height", h)) if v <= 0 or v % SIZE_ALIGN]
     if bad:
         raise SystemExit(
@@ -117,6 +117,20 @@ def _parse_size(size):
             f"{SIZE_ALIGN} (e.g. 720*416 landscape, 416*720 portrait, 480*832 tall)"
         )
     return w, h
+
+
+def _prune_uploads(dirpath, keep=5):
+    """Keep only the newest `keep` uploaded references (names are unique)."""
+    try:
+        files = sorted(
+            (os.path.join(dirpath, n) for n in os.listdir(dirpath)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for stale in files[keep:]:
+            os.remove(stale)
+    except OSError:
+        pass  # best effort; a full uploads dir must never break a session start
 
 
 def _clean_field(v):
@@ -808,6 +822,11 @@ class LiveEngine:
 
             threading.Thread(target=vworker, daemon=True).start()
             threading.Thread(target=aworker, daemon=True).start()
+            # Clear any stop requested BEFORE this session existed: a restart
+            # (/session/start while active) sets stop_flag to end the previous
+            # session, and that request must not also kill this one at its first
+            # chunk boundary if the previous session had already exited.
+            STATE.stop_flag = False
             STATE.active = True
             STATE.chunk_count = 0
             STATE.log("system", "session started")
@@ -1083,27 +1102,47 @@ def default_character():
 
 @app.route("/session/start", methods=["POST"])
 def session_start():
-    if STATE.active:
-        return jsonify({"status": "error", "message": "session already active"}), 429
     img_path = engine.args.image
     f = request.files.get("img_file")
     if f:
-        img_path = os.path.join(BASE_DIR, "uploads", "session_input.png")
+        # unique name per upload: the previous reference may still be mmap'd by
+        # the session we are about to replace, and overwriting it in place also
+        # lets a stale browser cache serve the old picture back
+        img_path = os.path.join(
+            BASE_DIR, "uploads", f"session_input_{time.time_ns()}.png"
+        )
         os.makedirs(os.path.dirname(img_path), exist_ok=True)
         f.save(img_path)
         try:
             with Image.open(img_path) as uploaded:
                 uploaded.verify()
         except Exception:
+            os.remove(img_path)
             return jsonify({"status": "error", "message": "invalid image"}), 400
+        _prune_uploads(os.path.dirname(img_path), keep=5)
     main_prompt = (request.form.get("main_prompt") or "").strip() or WORLD_PROMPT
     configure_persona(request.form)
-    STATE.stop_flag = False
     with STATE.speech_q.mutex:
         STATE.speech_q.queue.clear()
     brain.reset_history()
-    STATE.start_params.put({"img_path": img_path, "main_prompt": main_prompt})
-    return jsonify({"status": "ok", "persona": persona_payload()})
+    # The reference image is encoded once at session start and then lives in the
+    # rolling KV cache, so a new one means a NEW session. Rather than making the
+    # client stop/poll/start, queue the params and ask any running session to
+    # stop: control_loop_rank0 is blocked inside run_session and only pops
+    # start_params once that returns, so the swap happens in order.
+    restarting = STATE.active
+    with STATE.lock:
+        while True:  # drop superseded requests so we start exactly one session
+            try:
+                STATE.start_params.get_nowait()
+            except queue.Empty:
+                break
+        STATE.start_params.put({"img_path": img_path, "main_prompt": main_prompt})
+        STATE.stop_flag = restarting
+    STATE.log("system", "restarting with a new character" if restarting else "starting")
+    return jsonify(
+        {"status": "ok", "restarting": restarting, "persona": persona_payload()}
+    )
 
 
 @app.route("/session/stop", methods=["POST"])

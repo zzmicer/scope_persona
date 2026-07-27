@@ -844,11 +844,22 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         enableAudio();
         const button = document.getElementById("call-button"),
           form = document.getElementById("setup-form");
+        const data = new FormData(form);
+        const picked = data.get("img_file");
+        const newImage = picked instanceof File && picked.size > 0;
         button.disabled = true;
-        button.textContent = active ? "Joining call…" : "Starting character…";
+        button.textContent = newImage
+          ? "Waking the new character…"
+          : active
+            ? "Joining call…"
+            : "Starting character…";
         try {
-          const data = new FormData(form);
-          if (active)
+          // The reference image is encoded once at session start and then lives
+          // in the KV cache, so a new one needs a new session -- posting it to
+          // /persona (a live name/voice/personality update) silently dropped it
+          // and left the old character on screen. Name/voice changes with no new
+          // image still take the cheap path and never interrupt the stream.
+          if (active && !newImage)
             await api("/persona", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -858,7 +869,13 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           document.getElementById("live-name").textContent =
             data.get("name") || "Chano";
           document.getElementById("setup").classList.add("hidden");
-          toast(active ? "Joined the live session" : "Character is waking up…");
+          toast(
+            newImage
+              ? "Swapping in the new character…"
+              : active
+                ? "Joined the live session"
+                : "Character is waking up…",
+          );
         } catch (error) {
           toast(error.message);
         } finally {
