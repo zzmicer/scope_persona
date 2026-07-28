@@ -14,6 +14,44 @@ video, live captions, browser speech recognition, quick actions, chat, and an
 optional local camera preview. Camera pixels are not yet interpreted by the
 persona; the preview deliberately labels that limitation.
 
+## Optional 2x latent upscaling (UltraFlash) — EXPERIMENTAL, to be reverted
+
+`run_interactive_sr.sh` streams 1440x832 instead of 720x416 by routing each
+chunk latent through [UltraFlash](https://github.com/xin1u/UltraFlash)'s SR
+cascade before decode. Both models live in the Wan2.1 VAE latent space (16ch,
+stride 4/8/8), so the handoff needs no pixel round-trip.
+
+Measured on the 4xH200 pod: **1.67s per 32-frame chunk (19.2fps, 1.20x
+realtime)** vs 1.99s (1.00x) without SR — it is *faster* despite 4x the pixels,
+because the sidecar's tiny decoder (101ms) replaces SoulX's own Wan VAE decode
+(451ms) and runs on a different GPU.
+
+**The visible artifacts in the stream come from the super-resolution stage, not
+from the generator.** The SR DiT was trained with AIGC-oriented degradation on
+photoreal Wan output, so on flat cel-shaded anime it hallucinates pore/hair-grade
+high-frequency texture where there is no real structure to recover — most
+obviously a repeating cross-hatch weave on ambiguous regions (the hand under the
+chin, the hair/cheek boundary). Identity, expression and colour are preserved;
+it is the invented micro-texture that reads as wrong. Turning SR off (drop
+`--sr_url`) removes them entirely.
+
+This whole feature is experimental and expected to be reverted.
+
+- `run_interactive_sr.sh` — launcher. GPU0 aux · GPU1 SR sidecar · GPU2,3 SoulX.
+  Note this is a **4-GPU** layout: the generator is 2 GPUs as before, aux was
+  already on GPU0, and the SR sidecar adds GPU1. It could share a generator GPU
+  (~20GB) at the cost of contending with it.
+- `ultraflash/sr_service.py` — SR sidecar (upsampler + sparse SR DiT + decoder).
+  Separate process on purpose: a 2nd CUDA context inside a torchrun rank
+  destabilizes NCCL, same reason `persona_aux` is split out.
+- `ultraflash/ultra_dec_v3.py` — the released `ultra-decoder-v3` weights do NOT
+  load into UltraFlash's own decoder classes; this reconstructs the matching
+  module list from the checkpoint's key/shape signature. 1755ms -> 101ms.
+- `ultraflash/add_sr.py`, `add_sr_async.py` — idempotent patches to
+  `interactive_demo.py` (backups `.bak2`/`.bak3`). Inert without `--sr_url`.
+- `ultraflash/sr_probe.py`, `dec_bench.py` — offline harnesses used to measure
+  the above before touching the live demo.
+
 ## Layout
 
 - `SoulX-LiveAct/` — upstream repo **with our modifications**:

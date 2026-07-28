@@ -30,6 +30,7 @@ import subprocess
 import shutil
 import json
 import gc
+import concurrent.futures as _cf
 import queue
 import urllib.request
 
@@ -101,7 +102,46 @@ KOKORO_VOICES = {"af_heart", "af_bella", "af_nicole", "am_adam"}
 # error deep inside the transformer. Orientation itself is free: the model, the
 # KV cache and the SP sharding (which splits the FRAME axis, not space) only see
 # frame_len = (H/16)*(W/16), so 416*720 costs exactly what 720*416 costs.
+# one worker only: the sidecar serializes on its own lock, and two chunks in
+# flight would reorder through its streaming caches
+_sr_pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sr")
+
 SIZE_ALIGN = 16
+
+
+def _sr_request(base, latent, ctx, rank, timeout=60):
+    """POST one chunk latent to the SR sidecar, return HR uint8 [T,H,W,C]."""
+    import io as _io
+
+    import numpy as _np
+    import requests as _rq
+
+    if rank != 0:
+        return None
+    buf = _io.BytesIO()
+    torch.save(
+        {
+            "latent": latent.detach().to(torch.bfloat16).cpu(),
+            "ctx": [c.detach().to(torch.bfloat16).cpu() for c in ctx],
+        },
+        buf,
+    )
+    r = _rq.post(f"{base}/sr", data=buf.getvalue(), timeout=timeout)
+    r.raise_for_status()
+    hdr, _, payload = r.content.partition(b"\n")
+    t, h, w, c = (int(x) for x in hdr.decode().split(","))
+    return _np.frombuffer(payload, dtype=_np.uint8).reshape(t, h, w, c)
+
+
+def _sr_reset(base):
+    try:
+        import requests as _rq
+
+        _rq.post(f"{base}/reset", timeout=30)
+    except Exception as e:
+        print(f"[sr] reset failed: {e}", flush=True)
+_DUMP_DIR = os.environ.get("SOULX_DUMP_LATENTS", "")
+_DUMP_N = int(os.environ.get("SOULX_DUMP_N", "12"))
 
 
 def _parse_size(size):
@@ -366,6 +406,12 @@ class LiveEngine:
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.device = self.local_rank
         self.width, self.height = _parse_size(args.size)
+        # SR changes only the OUTPUT size; the generator keeps running at self.width
+        # x self.height, so frame_len / KV-cache sizing below must not use these.
+        self.sr_url = getattr(args, "sr_url", None)
+        self.sr_scale = int(getattr(args, "sr_scale", 2)) if self.sr_url else 1
+        self.out_width = self.width * self.sr_scale
+        self.out_height = self.height * self.sr_scale
         self.fps = args.fps
         self.use_dist = self.world_size > 1
 
@@ -748,7 +794,7 @@ class LiveEngine:
                 "-pix_fmt",
                 "rgb24",
                 "-s",
-                f"{self.width}x{self.height}",
+                f"{self.out_width}x{self.out_height}",
                 "-r",
                 str(self.fps),
                 "-i",
@@ -885,6 +931,11 @@ class LiveEngine:
             return out
 
         pre_latent = None
+        sr_u8 = None
+        sr_job = None
+        sr_inflight = []
+        if self.sr_url and self.rank == 0:
+            _sr_reset(self.sr_url)
         iteration = 0
         wall_start = None
         frames_emitted = 0
@@ -983,7 +1034,20 @@ class LiveEngine:
                         )[0]
                         dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
                         latent = latent + (-noise) * dt[0]
-                    if iteration == 0:
+                    if self.sr_url:
+                        # Sidecar owns upsampler + SR DiT + tiny decoder and keeps
+                        # its own streaming caches, so nothing is decoded here.
+                        vids = None
+                        sr_u8 = None
+                        sr_job = (
+                            (
+                                latent.detach().to(torch.bfloat16).cpu(),
+                                [c.detach().to(torch.bfloat16).cpu() for c in cur_ctx],
+                            )
+                            if self.rank == 0
+                            else None
+                        )
+                    elif iteration == 0:
                         vids = self.vae.decode(latent)
                     else:
                         vids = self.vae.decode(
@@ -991,15 +1055,52 @@ class LiveEngine:
                         )[:, :, 9:]
                     pre_latent = latent
 
-                if self.rank == 0:
-                    u8 = (
-                        ((vids.squeeze(0).permute(1, 2, 3, 0) + 1.0) * 127.5)
-                        .clamp(0, 255)
-                        .to(torch.uint8)
-                        .contiguous()
-                        .cpu()
+                # SOULX_DUMP_LATENTS: tap the chunk latent + its T5 context on the
+                # way to the VAE. This is where a latent-space SR stage would hook in.
+                if _DUMP_DIR and self.rank == 0 and iteration < _DUMP_N:
+                    import os as _os
+
+                    _os.makedirs(_DUMP_DIR, exist_ok=True)
+                    torch.save(
+                        {
+                            "latent": latent.detach().to(torch.bfloat16).cpu(),
+                            "ctx": [c.detach().to(torch.bfloat16).cpu() for c in cur_ctx],
+                            "iteration": iteration,
+                            "size": (self.width, self.height),
+                            "fps": self.fps,
+                            "prompt": cur_prompt_str,
+                        },
+                        f"{_DUMP_DIR}/chunk_{iteration:04d}.pt",
                     )
-                    vq.put((u8.numpy(), frames_emitted))
+                    print(f"[dump] chunk {iteration} -> {_DUMP_DIR}", flush=True)
+
+                n_emit = 0
+                if self.rank == 0 and self.sr_url:
+                    # submit chunk N, emit chunk N-1 -> SR overlaps the next denoise
+                    sr_inflight.append(
+                        (_sr_pool.submit(_sr_request, self.sr_url,
+                                         sr_job[0], sr_job[1], 0), heard)
+                    )
+                    if len(sr_inflight) >= 2:
+                        fut0, heard = sr_inflight.pop(0)
+                        sr_u8 = fut0.result()
+                    else:
+                        sr_u8 = None
+
+                if self.rank == 0 and (sr_u8 is not None or not self.sr_url):
+                    if sr_u8 is not None:
+                        arr = sr_u8
+                    else:
+                        arr = (
+                            ((vids.squeeze(0).permute(1, 2, 3, 0) + 1.0) * 127.5)
+                            .clamp(0, 255)
+                            .to(torch.uint8)
+                            .contiguous()
+                            .cpu()
+                            .numpy()
+                        )
+                    n_emit = arr.shape[0]
+                    vq.put((arr, frames_emitted))
                     aq.put(
                         (
                             (np.clip(heard, -1, 1) * 32767).astype(np.int16).tobytes(),
@@ -1010,7 +1111,7 @@ class LiveEngine:
                     STATE.chunk_count = iteration + 1
                     if iteration % 10 == 0:
                         dt_s = time.perf_counter() - t0
-                        n_frames = vids.shape[2]
+                        n_frames = arr.shape[0]
                         mem_gb = torch.cuda.memory_allocated(self.device) / 1e9
                         print(
                             f"chunk {iteration}: {n_frames}f in {dt_s:.2f}s "
@@ -1023,7 +1124,7 @@ class LiveEngine:
                 if self.rank == 0:
                     if wall_start is None:
                         wall_start = time.perf_counter()
-                    frames_emitted += vids.shape[2]
+                    frames_emitted += n_emit
                     target = wall_start + frames_emitted / self.fps - 1.6
                     lag = target - time.perf_counter()
                     if lag > 0:
@@ -1317,8 +1418,8 @@ def ws_feed(ws):
                     "kind": "meta",
                     "fps": engine.fps,
                     "sr": SR,
-                    "w": engine.width,
-                    "h": engine.height,
+                    "w": engine.out_width,
+                    "h": engine.out_height,
                 }
             )
         )
@@ -1357,6 +1458,9 @@ if __name__ == "__main__":
     parser.add_argument("--size", type=str, default="720*416")
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--fp8_kv_cache", action="store_true", default=False)
+    parser.add_argument("--sr_url", type=str, default=None,
+                        help="UltraFlash SR sidecar base URL; omit to stream at native res")
+    parser.add_argument("--sr_scale", type=int, default=2)
     parser.add_argument(
         "--action_hold",
         type=int,
