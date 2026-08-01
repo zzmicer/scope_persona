@@ -462,7 +462,22 @@ class LiveEngine:
         self.wan = self.wan.to(self.device)
         self.wan.freqs = self.wan.freqs.to(self.device)
         self.wan.eval()
-        if not args.no_compile:
+        if args.compile_blocks:
+            # Pruna's open-source Wan recipe compiles the transformer ModuleList
+            # one block at a time. This is more robust to graph breaks than
+            # compiling the stateful streaming WanModel as one graph.
+            for i, block in enumerate(self.wan.blocks):
+                self.wan.blocks[i] = torch.compile(
+                    block,
+                    mode=args.compile_mode,
+                    backend="inductor",
+                    dynamic=False,
+                )
+            print(
+                f"torch.compile: 40 blocks, mode={args.compile_mode}",
+                flush=True,
+            )
+        elif not args.no_compile:
             self.wan = torch.compile(
                 self.wan,
                 mode="max-autotune-no-cudagraphs",
@@ -1542,6 +1557,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no_compile", action="store_true", help="disable torch.compile"
+    )
+    parser.add_argument(
+        "--compile_blocks",
+        action="store_true",
+        help="compile each Wan transformer block independently (Pruna Wan recipe)",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        choices=["default", "reduce-overhead", "max-autotune-no-cudagraphs"],
+        default="max-autotune-no-cudagraphs",
     )
     parser.add_argument(
         "--autostart", action="store_true", help="start session immediately"

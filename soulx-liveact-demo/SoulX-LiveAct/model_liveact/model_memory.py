@@ -26,6 +26,33 @@ try:
 except:
     USE_SAGEATTN = False
 
+# SOULX_ATTN=fa3 opts into FlashAttention-3 for the streaming self-attention.
+# Default stays sdpa: that is the path every other measurement was taken on.
+# Deliberately xformers' bundled FA3 -- a second flash_attn_3 extension in the
+# same process aborts on duplicate torch-library registration.
+USE_FA3 = False
+_fmha = None
+_fa3_op = None
+if os.environ.get("SOULX_ATTN", "sdpa").lower() == "fa3":
+    try:
+        from xformers.ops import fmha as _fmha_mod
+
+        _op = _fmha_mod.flash3.FwOp
+        if not _op.is_available():
+            raise RuntimeError("xformers flash3 reports unavailable on this build")
+        _fmha, _fa3_op = _fmha_mod, _op
+        USE_FA3 = True
+        print(f"[attn] FlashAttention-3 enabled for self-attention ({_op.NAME})",
+              flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[attn] SOULX_ATTN=fa3 unavailable ({type(_e).__name__}: {_e}); "
+              f"falling back to SDPA", flush=True)
+
+
+def _fa3_attn(q, k, v):
+    """(B, N, H, D) in and out -- the NHD layout this call site already uses."""
+    return _fmha.memory_efficient_attention_forward(q, k, v, op=_fa3_op)
+
 __all__ = ['WanModel']
 
 
@@ -296,7 +323,13 @@ class WanSelfAttention(nn.Module):
         roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         roped_key = causal_rope_apply(k_cache, grid_sizes, freqs, start_frame=0).type_as(v)
 
-        if USE_SAGEATTN:
+        if USE_FA3:
+            x = _fa3_attn(
+                roped_query,
+                roped_key[:, :end_idx, ...],
+                v_cache[:, :end_idx, ...],
+            ).type_as(x)
+        elif USE_SAGEATTN:
             x = sageattn(
                 roped_query,
                 roped_key[:, :end_idx, ...],

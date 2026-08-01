@@ -201,6 +201,133 @@ moves from prompts in realtime.
   timed out); consider 320*576 @ fps 20 (1.6s budget, +27% slack, smoother
   motion); raise client `JITTER` (0.35s) to absorb the 2s burst cadence; and
   torch.compile is still untried.
+- [~] Perf: fit the demo on ONE H200 (2026-08-01). 4 GPUs is too much for a demo.
+  Drop the SR stage but KEEP its tiny decoder — the SR build was faster than plain
+  SoulX (1.62s vs 2.00s at 4x the pixels) only because the sidecar's decoder
+  replaced SoulX's own 452ms Wan VAE decode. Measured baselines on this pod:
+  1xH200 720×416 = 3.61s/chunk (0.55x realtime, 76.3GB); 2xH200 = 2.00s; 2xH200
+  320×576 = 1.16s. Time scales ~linearly with pixel count (0.62x px → 0.58x time).
+  - [x] Step 1 GATE: v3 tiny decoder verified at NATIVE res on real dumped SoulX
+    latents (52×90) — MAE 6.41/255 vs the full Wan VAE, no colour cast, no
+    structural break; 31.0ms vs 452.3ms = 14.6x, **saves 421ms/chunk**.
+    `/workspace/uflash/dec_native_cmp.py`, image `cmp/v3_native_vs_wan.jpg`.
+  - [x] Step 2: `--fast_decode` inlined into interactive_demo.py (no sidecar, no
+    HTTP). One-line swap of `self.vae.decode` — v3's `frames_to_trim=3` gives
+    `n_lat*4-3` frames, IDENTICAL to the Wan VAE, so the existing windowed decode
+    and the 21-then-32 frame counts A/V sync depends on are unchanged.
+    Patch `/workspace/uflash/add_fastdec.py`, backup `interactive_demo.py.bak4`.
+  - [x] Step 3: `run_single_fast.sh` — no torchrun/NCCL, so persona_aux CO-LOCATES
+    on the generator GPU (the "second CUDA context destabilizes NCCL" rule does
+    not apply at world_size==1). t5 deliberately stays on GPU: 11GB fits in 143GB
+    and `--t5_cpu` would stall the chunk loop on every action transition.
+    VERIFIED: 720×416 = 3.01s/chunk flat over 50 chunks, 76.4GB.
+    CORRECTION (2026-08-01): fast_decode saves 0.60s, more than the 421ms the
+    isolated decode benchmark predicted. I first blamed a contended baseline —
+    that was WRONG. A clean `FAST_DECODE=0` run on an idle GPU measured 3.64s,
+    confirming the original 3.61s baseline. The swap really is worth ~0.6s at
+    720×416 and ~0.41s at 592×336, i.e. MORE than the decode call itself costs;
+    the surplus is unexplained (allocator/memory-pressure effects suspected).
+  - [x] Step 4: resolution sweep on 1×H200 (2026-08-01) — **REALTIME REACHED**.
+    Break-even is ~215k px; time falls slightly FASTER than pixel count.
+    | size    | px     | s/chunk | realtime | mem    |
+    | 720×416 | 299520 | 3.01    | 0.66x    | 76.4GB |
+    | 640×368 | 235520 | 2.18    | 0.92x    | 67.8GB |
+    | 592×336 | 198912 | 1.78    | 1.12x    | 62.8GB |  <- best quality w/ slack
+    | 320×576 | 184320 | 1.61    | 1.24x    | 60.8GB |  <- portrait, most slack
+    | 560×320 | 179200 | 1.57    | 1.27x    | 60.2GB |
+    Logs `/workspace/soulx/sweep/*.log`, driver `sweep_res.sh`.
+  - [x] Step 5: Pruna-style `torch.compile` of the 40-block `ModuleList`, tested
+    at 592×336 on the same idle H200: 1.76s control → 1.42–1.43s steady state
+    (**1.24x / ~19% latency reduction**), stable through 100 chunks. Warmup is
+    expensive (469s) and first emitted chunk triggers another compile (6.59s),
+    but the persistent service amortizes it. Visual gate passed: clean frame,
+    identity preserved, and a wave directive rendered. Lipsync gate still needed
+    before enabling in the production launcher.
+  - [x] 20s action demos recorded at all 5 resolutions (2026-08-01), identical
+    scripted content (4 actions + 2 TTS lines) fired on FRAME INDEX so the clips
+    are directly comparable. `/workspace/soulx/demos/persona_*.mp4`; recorder
+    `/workspace/uflash/record_demo.py` drives /action + /say over HTTP while
+    draining /ws (mtype 0 = JPEG, mtype 1 = PCM16); driver `make_demos.sh`.
+    Recorded realtime: 720×416 0.70x, 640×368 0.92x, 592×336 1.03x,
+    560×320 1.06x, 320×576 0.98x. The last three are **PACER-CAPPED at ~1.0x**,
+    NOT slower than the 1.12-1.27x benchmark — the wall-clock pacer caps output
+    at `--fps`, so surplus speed shows up as slack, never as higher fps. This
+    also means a recorded clip can never demonstrate >1.0x; read headroom off
+    the sweep, not off a recording.
+    320×576 portrait does NOT permanently crop the face as feared: only the
+    opening frames are off-centre, then the character recomposes centred.
+  - [x] Wan-VAE A/B clips (2026-08-01): `persona_{720x416,592x336}_wanvae.mp4`,
+    FAST_DECODE=0. **Reverting to the Wan VAE costs live streaming**: 592×336
+    goes 1.78s→2.19s (1.12x→0.91x, below realtime); 720×416 goes 3.01s→3.64s.
+    CAVEAT: these clips compare CONFIGURATIONS, not decoders — each run is an
+    independent generation, so the poses diverge and no decoder conclusion can
+    be drawn from them. The decoder A/B is still only the still-frame test
+    (same latents, MAE 6.41/255). A true TEMPORAL A/B is cheap and not yet done:
+    decode the 14 consecutive chunks in `/workspace/uflash/dump/` through both
+    decoders (no GPU generation needed) to check inter-frame flicker and seams
+    at the 32-frame chunk boundaries where the windowed decode stitches.
+  - [x] Decoder shootout vs `lightx2v/Autoencoders` (2026-08-01) — **DROP the
+    reconstructed v3**. Measured on real dumped 52×90 latents, MAE vs full Wan VAE:
+    | decoder                 | ms    | vs wan | MAE/255 | size  |
+    | wan (reference)         | 452.1 | 1.0x   | -       | 507MB |
+    | lightvaew2_1 (pruned 3D)| 132.9 | 3.4x   | 3.34    | 32MB  |
+    | **taew2_1**             | 31.9  | 14.2x  | **2.77**| 23MB  |
+    | lighttaew2_1            | 32.0  | 14.1x  | 3.76    | 45MB  |
+    | v3 (ours, RECONSTRUCTED)| 31.4  | 14.4x  | 6.41    | 25MB  |
+    **taew2_1 beats our v3 by 2.3x on error at identical speed**, is officially
+    released, is the smallest, and loads through the ALREADY-INSTALLED
+    `lightx2v...wan.vae_tiny.WanVAE_tiny` — so the reconstructed-checkpoint
+    liability (rebuilt layer list, `block`→`up` rename, suppressed `v*2-1`) goes
+    away entirely. v3 IS a TAEHV-family sibling of these (`hf/tae.py` has the same
+    MemBlock/TGrow/`frames_to_trim=2**sum(...)-1`), just from UltraFlash.
+    GOTCHA: the two TAEs use OPPOSITE latent normalization —
+    `taew2_1` needs `need_scaled=False` (True → MAE 24.48) while
+    `lighttaew2_1` needs `need_scaled=True` (False → MAE 21.56). Getting this
+    backwards looks like a bad model, not a bad flag.
+    `lightvaew2_1` is the fidelity option: causal Conv3D (so genuinely temporal,
+    unlike the Conv2D TAEs) at 3.4x, worth testing where chunk-boundary/flicker
+    behaviour matters. Ckpts in `/workspace/uflash/ckpt_lx2v/`,
+    harness `/workspace/uflash/dec_shootout.py`.
+  - [ ] **USER-REPORTED: output is slightly more jerky ("дерганый") with the tiny
+    VAE and/or FA3** (2026-08-01). Not yet isolated — both changes are on the
+    critical path together. Three candidate causes, in my order of suspicion:
+    1. **PACING, not either change.** The config being watched when this was
+       reported is 416×720 at **1.02x realtime = 0.04s slack per 2.0s chunk**,
+       measured IDLE. Chat/TTS/prompt re-encoding add work the benchmark omits,
+       and the wall-clock pacer starving is exactly what produces micro-freezes.
+       Every earlier config viewed had 0.2-0.6s of slack.
+    2. **The decoder.** taew2_1 (like v3 and lighttaew2_1) is a **Conv2D** TAE —
+       it decodes frames independently and models NO time, so inter-frame jitter
+       is architecturally possible and per-frame MAE cannot see it. This is the
+       temporal question flagged and never closed.
+    3. **FA3** — least likely: numerically equivalent to SDPA (max|delta| 5e-4),
+       and it made things FASTER, which should mean smoother, not jerkier.
+    CHEAP DISAMBIGUATION, do (a) first — it is one env var and no recompile
+    beyond the usual:
+    (a) same decoder + FA3 at **368*640 (1.45s, 1.38x, 0.55s slack)**. If the
+        jerkiness disappears → cause 1, and the fix is to stop shipping 1.02x
+        configs, not to change the decoder.
+    (b) if it persists: `SOULX_ATTN=sdpa` at the same size → isolates FA3.
+    (c) if it still persists: `FAST_DECODE=0` (Wan VAE) → isolates the decoder;
+        if that fixes it, switch to **lightvaew2_1** (causal Conv3D, 133ms,
+        MAE 3.34) which is the only candidate that actually models time.
+    NOTE the recorded clips are frame-driven captures, so they will NOT reproduce
+    pacing jerkiness — cause 1 can only be judged on the live stream.
+  - [~] Pruna optimization spike: block compilation is a confirmed win above.
+    FA3 is BLOCKED on the current Torch 2.8 stack: Pruna publishes CUDA 12.8
+    kernels for Torch 2.10/2.11 or stable-ABI 2.9+, and a locally built minimal
+    Torch-2.8/SM90 BF16 hdim-128 extension failed its import/execution gate. Do
+    not upgrade Torch in-place because that risks vLLM FP8 and the working ABI.
+    Revisit FA3 in an isolated Torch>=2.9 environment; Pruna's open-source FORA
+    remains Flux-only and Wan Taylor/auto caching remains Pro-only.
+  - [-] 2×5090 REJECTED: per-rank weights are ~50GB (DiT 35 + umt5 11 + CLIP 4.5)
+    vs 32GB VRAM, needing t5-offload + CLIP evict + FP8 *storage* (today's FP8 is
+    compute-time only). And the payoff is poor: ~210 vs ~495 TFLOPS bf16, 1.79 vs
+    4.8 TB/s, and NO NVLink — the 2xH200 scaling was near-linear (1.81x) only
+    because SP collectives ride NVLink; over PCIe expect 1.3-1.5x. Net ≈ 1xH200
+    after weeks of sm_120 dep work. 1xH200/1xH100 is the better demo box.
+  - NOTE: this pod's GPUs are SHARED with other containers (PIDs not in our
+    namespace held GPUs 0/2/3, one pegged at 100%). Only GPU1 was free.
 - [x] Dedicated LingBot web studio: focused start-image → world flow, explicit
   model/WebRTC/warm-up states, full-size video stage, Beauty event controls,
   custom natural-language actions, and WASD/mouse camera input. Replaces the
