@@ -109,6 +109,26 @@ scope-soulx fetch                           # weights + tiny decoders, once
 scope-soulx run --res 416x720 --vae taew2_1 # server on 0.0.0.0:8090
 ```
 
+### How long an action lasts
+
+A `transition` (a gesture) is held for `--action_hold` chunks and then dropped,
+after which the sustained `state` prompt takes back over. **One chunk is 32
+frames = 2s at 16fps**, so the default 8 is roughly 16 seconds.
+
+```bash
+scope-soulx run --action_hold 12                     # ~24s, at launch
+curl -X POST :8090/action_hold -d '{"chunks":12}'    # live, no restart
+curl -X POST :8090/action -d '{"text":"she stretches slowly","hold":20}'
+```
+
+`/action_hold` sets the running default and takes effect on the next action;
+an action already in flight keeps the TTL it was given. The `hold` field on
+`/action` overrides it for that gesture only — a slow stretch and a quick wave
+want different lifetimes, so the caller can say rather than everything sharing
+one number. Both are capped at 120 chunks (~4min); past that you want a
+sustained `pose`/`persist` state, not a transition, since the sustained state
+is what the KV cache carries forward.
+
 ### Appearance changes
 
 Set `FAL_KEY` only in the server environment, then type a chat command such as

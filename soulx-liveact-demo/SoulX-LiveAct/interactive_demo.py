@@ -248,6 +248,11 @@ class SessionState:
         # rest = new sustained state; None leaves state unchanged (gesture),
         #        "" clears it back to neutral idle.
         self.pending_directive = None
+        # how many chunks a transient motion survives before it is dropped and
+        # the sustained state takes back over. Seeded from --action_hold at
+        # startup and mutable at runtime via POST /action_hold, because the
+        # right value is a feel judgement and a restart costs a ~3min warmup.
+        self.action_hold = 8
         # new LoRA strength, applied at the next chunk boundary (never mid-
         # forward: the merge rewrites bf16 masters and re-quantizes fp8).
         self.pending_lora_strength = None
@@ -1133,7 +1138,9 @@ class LiveEngine:
                     trans = (d.get("transition") or "").strip()
                     if trans:
                         transition_prompt = trans
-                        transition_ttl = self.args.action_hold
+                        # per-action override, else the live default
+                        hold = d.get("hold")
+                        transition_ttl = int(hold) if hold else STATE.action_hold
                     else:
                         transition_prompt = None
                         transition_ttl = 0
@@ -1506,10 +1513,20 @@ def action():
     else:
         rest = pose if pose is not None else (text if persist else None)
         directive = {"transition": text or None, "rest": rest}
+        # optional per-action hold, in chunks (1 chunk = 32 frames = 2s @16fps).
+        # Omitted -> STATE.action_hold. A gesture that should linger (a slow
+        # stretch) and one that should not (a quick wave) want different values,
+        # so the caller can say, rather than everything sharing one default.
+        try:
+            hold = int(body.get("hold") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "hold must be an int"}), 400
+        if hold > 0:
+            directive["hold"] = min(hold, 120)  # ~4min ceiling; it is a gesture
     with STATE.lock:
         STATE.pending_directive = directive
     STATE.log("action", text or "(idle)")
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "hold": directive.get("hold", STATE.action_hold)})
 
 
 @app.route("/chat", methods=["POST"])
@@ -1596,6 +1613,26 @@ def chat():
     )
 
 
+@app.route("/action_hold", methods=["POST"])
+def action_hold():
+    """Set how long a transient action survives, in chunks (2s each).
+
+    Takes effect on the NEXT action; one already running keeps the TTL it was
+    given. Runtime-settable on purpose: how long a gesture should linger is a
+    feel judgement that wants a few tries, and a restart costs a ~3min warmup.
+    """
+    try:
+        chunks = int(request.get_json(force=True).get("chunks"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "chunks must be an int"}), 400
+    if not 1 <= chunks <= 120:
+        return jsonify({"status": "error", "message": "chunks must be 1..120"}), 400
+    with STATE.lock:
+        STATE.action_hold = chunks
+    STATE.log("system", f"action hold -> {chunks} chunks (~{chunks * 2}s)")
+    return jsonify({"status": "ok", "chunks": chunks, "seconds": chunks * 2})
+
+
 @app.route("/lora", methods=["POST"])
 def lora_strength():
     """Change the merged LoRA strength without a restart.
@@ -1643,6 +1680,7 @@ def status():
             "error": STATE.last_error,
             "events": ev,
             "persona": persona_payload(),
+            "action_hold": STATE.action_hold,
             "appearance": {
                 "busy": STATE.appearance_busy,
                 "configured": appearance_editor.configured,
@@ -1749,8 +1787,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--action_hold",
         type=int,
-        default=4,
-        help="chunks to hold an action before reverting to idle prompt",
+        default=8,
+        help="chunks a transient action is held before the sustained state "
+        "takes back over. One chunk is 32 frames = 2s at 16fps, so the default "
+        "8 is ~16s. Change it live with POST /action_hold, or per-gesture with "
+        "the 'hold' field on POST /action.",
     )
     parser.add_argument(
         "--fp8",
@@ -1812,6 +1853,7 @@ if __name__ == "__main__":
         "--autostart", action="store_true", help="start session immediately"
     )
     args = parser.parse_args()
+    STATE.action_hold = args.action_hold
 
     # Separate FIFOs/segments for simultaneous debug or A/B processes. Sharing
     # hls_output/live made one port open another port's FIFO and deadlocked a
