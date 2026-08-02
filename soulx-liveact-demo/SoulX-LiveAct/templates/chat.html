@@ -711,7 +711,7 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           <button onclick="doAction('')">Idle</button>
         </div>
         <div class="composer">
-          <select id="mode">
+          <select id="mode" onchange="syncPlaceholder()">
             <option value="chat">Chat</option>
             <option value="say">Say</option>
             <option value="do">Do</option></select
@@ -959,16 +959,30 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           body: JSON.stringify(payload),
         });
       }
+      function syncPlaceholder() {
+        document.getElementById("text").placeholder =
+          document.getElementById("mode").value === "do"
+            ? "she sits down | she is sitting, relaxed"
+            : "Say something… or /change her outfit";
+      }
       async function sendText(text, mode = "chat") {
         text = text.trim();
         if (!text) return;
         if (mode === "chat") addMsg("user", text);
         const route = mode === "do" ? "/action" : `/${mode}`;
+        let payload = { text };
+        if (mode === "do" && text.includes("|")) {
+          // "she sits down | she is sitting, relaxed" — motion before the pipe,
+          // the state it leaves her in after. Without a pipe it stays a
+          // momentary gesture, which is why typed actions never used to stick.
+          const [motion, ...rest] = text.split("|");
+          payload = { text: motion.trim(), pose: rest.join("|").trim() };
+        }
         try {
           await api(route, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }),
+            body: JSON.stringify(payload),
           });
         } catch (error) {
           addMsg("error", error.message);
@@ -1052,10 +1066,14 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           const state = await api("/status");
           active = state.active;
           document.getElementById("status-dot").classList.toggle("on", active);
+          // the sticky pose rides along on the status line — it is the one bit
+          // of session state you otherwise had to read the chunk logs to see.
+          const pose = state.pose?.state?.trim();
           document.getElementById("status-copy").textContent = active
             ? state.appearance?.busy
               ? "Creating new appearance…"
-              : `Live · ${state.chunks} chunks`
+              : `Live · ${state.chunks} chunks` +
+                (pose ? ` · ${pose.slice(0, 40)}` : "")
             : "Ready to call";
           document.getElementById("call-button").textContent = active
             ? "Join live call"

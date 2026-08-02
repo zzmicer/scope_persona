@@ -253,6 +253,13 @@ class SessionState:
         # startup and mutable at runtime via POST /action_hold, because the
         # right value is a feel judgement and a restart costs a ~3min warmup.
         self.action_hold = 8
+        # what the generator is actually holding right now, mirrored out of the
+        # chunk loop for /status. Read-only from the Flask side: the loop owns
+        # these, and until now the only way to see the sticky state was to grep
+        # the chunk logs.
+        self.state_prompt = ""
+        self.transition_prompt = None
+        self.transition_ttl = 0
         # new LoRA strength, applied at the next chunk boundary (never mid-
         # forward: the merge rewrites bf16 masters and re-quantizes fp8).
         self.pending_lora_strength = None
@@ -1151,6 +1158,14 @@ class LiveEngine:
                     cur_ctx = self._encode_text(tgt)
                     cur_prompt_str = tgt
 
+                # publish for /status. Done here rather than at the directive
+                # site because this runs every chunk, so it also picks up a
+                # transition that expired at the end of the previous one.
+                if self.rank == 0:
+                    STATE.state_prompt = state_prompt
+                    STATE.transition_prompt = transition_prompt
+                    STATE.transition_ttl = max(transition_ttl, 0)
+
                 audio_embs = self._embed_window(payload["win"])
 
                 f = 0 if iteration == 0 else 1
@@ -1305,6 +1320,9 @@ class LiveEngine:
                         hls_proc.kill()
                 STATE.active = False
                 STATE.stop_flag = False
+                STATE.state_prompt = ""
+                STATE.transition_prompt = None
+                STATE.transition_ttl = 0
                 STATE.log("system", "session stopped")
             torch.cuda.empty_cache()
             gc.collect()
@@ -1681,6 +1699,11 @@ def status():
             "events": ev,
             "persona": persona_payload(),
             "action_hold": STATE.action_hold,
+            "pose": {
+                "state": STATE.state_prompt,
+                "transition": STATE.transition_prompt,
+                "transition_left": STATE.transition_ttl,
+            },
             "appearance": {
                 "busy": STATE.appearance_busy,
                 "configured": appearance_editor.configured,

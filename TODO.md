@@ -193,6 +193,35 @@ moves from prompts in realtime.
   and pulls each chunk back to the reference pose (the VACE identity-vs-motion
   tension already noted in memory). Next: decay/re-anchor the reference strength,
   or drive posture through something other than the T5 prompt.
+- [x] The Do box can set a sustained state (2026-08-02). The "typed actions don't
+  persist" complaint was never the hold duration: the composer sent `{text}` only,
+  so the `pose` slot was idle on every chunk and every typed action was a gesture —
+  only the Sit/Stand/Turn preset buttons ever passed a pose. `chat.html` now splits
+  the Do input on `|` (`she sits down | she is sitting, relaxed`) into
+  `{text, pose}`; no pipe keeps the old gesture behaviour, and the placeholder
+  shows the form when Do is selected.
+- [x] Sticky state visible without grepping chunk logs (2026-08-02). `/status`
+  gained `pose: {state, transition, transition_left}`, mirrored out of the chunk
+  loop at the compose site (so an expired transition shows up too) and cleared on
+  session stop; the UI status line reads `Live · N chunks · <state>`.
+- [x] Kohya LoRA support (2026-08-02, verified 1xH200). `SoulX-LiveAct/lora.py`
+  merges `lora_unet_*` into the DiT (merge, never adapter — an adapter side-path
+  would add un-quantized, un-compiled matmuls); merge point sits between the bf16
+  cast and `enable_fp8_gemm`, order forced load -> merge -> fp8 -> cuda -> compile.
+  `--lora NAME --lora-strength F`, plus `POST /lora {"strength":F}` to retune live
+  (~25s). Inference cost is ZERO: 1.70s/chunk, 18.8fps, 69.9GB with and without.
+  Both NSFW-API LoRAs key-match 100%.
+- [ ] Reference-image test for wardrobe control. LoRA strength is exhausted as a
+  lever: SoulX is I2V and the reference-image path (`img_emb`, `cross_attn.k_img/
+  v_img`) has no LoRA counterpart in either T2V LoRA, so the reference image owns
+  wardrobe. e15 @1.0 desaturates; 0.5-0.7 is the usable band. Next variable to
+  change is `/change`, not strength.
+- [ ] Controlled LoRA sweep with a restart per arm. `lora_ab.py --restart-each` is
+  deployed but its run died. Every sweep so far ran in one continuous session, so
+  pose/framing drift is NOT attributable to the LoRA — only "coherent vs degraded"
+  is a safe claim from the existing data.
+- [ ] Make `scope-soulx stop` port-scoped. It is currently a blanket pkill, so it
+  cannot be used to retire one run while another is live.
 - [x] Vertical/portrait video (2026-07-27, pod-verified 416*720 @ 15.0fps, 72.3GB
   — identical to landscape, since SP shards the FRAME axis and only
   frame_len=(H/16)*(W/16)=1170 reaches the model; `480*832` would be 1.33x tokens).
