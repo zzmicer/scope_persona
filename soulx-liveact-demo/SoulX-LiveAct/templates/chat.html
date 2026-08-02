@@ -709,9 +709,6 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             🔄 Turn
           </button>
           <button onclick="doAction('')">Idle</button>
-          <button onclick="keepPose()" title="Make the pose she is in right now her new resting pose">
-            📌 Pin this pose
-          </button>
         </div>
         <div class="composer">
           <select id="mode" onchange="syncPlaceholder()">
@@ -741,6 +738,14 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           onclick="toggleCamera()"
         >
           ◉<span class="control-label">Camera</span>
+        </button>
+        <button
+          class="round"
+          id="pin-button"
+          title="Make the pose she is in right now her resting pose"
+          onclick="keepPose()"
+        >
+          📌<span class="control-label">Pin pose</span>
         </button>
         <button class="round end" title="End call" onclick="endCall()">
           ⌕<span class="control-label">End</span>
