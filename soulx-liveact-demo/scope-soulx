@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# One entry point for the SoulX-LiveAct persona demo.
+#
+# Replaces run_stock.sh / run_interactive.sh / run_interactive_sr.sh /
+# run_single_fast.sh / deploy_demo.sh / sweep_res.sh, which had drifted into six
+# copies of the same env-var soup with different hardcoded defaults.
+#
+#   scope-soulx run --res 416x720 --vae taew2_1     start the demo
+#   scope-soulx doctor                              what will this box do?
+#   scope-soulx fetch                                download weights + decoders
+#   scope-soulx bench --sizes 416x720,368x640       s/chunk per resolution
+#   scope-soulx stop | logs [-f]
+#
+# GPU topology is DECIDED, not configured: `--gpus auto` keeps the model on one
+# card when it fits (no NCCL, aux co-locates) and splits sequence-parallel when
+# it does not. FP8 and FlashAttention-3 gate on compute capability, so the same
+# command runs on H200, RTX PRO 6000 and RTX 6000 Ada without edits.
+set -uo pipefail
+
+SOULX_ROOT="${SOULX_ROOT:-/workspace/soulx}"
+export SOULX_ROOT
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="${SOULX_SRC:-$HERE/SoulX-LiveAct}"
+PY="${SOULX_PYTHON:-python}"
+LOGDIR="${SOULX_LOGDIR:-$SOULX_ROOT/logs}"
+
+# The conda *installation* lives on a container's root disk and does not survive
+# a recreate; the env itself is on the network volume. Sourcing an env.sh is
+# therefore optional -- inside the Docker image there is nothing to source.
+if [[ -n "${SOULX_ENV_SH:-}" && -f "${SOULX_ENV_SH}" ]]; then
+  # shellcheck disable=SC1090
+  set +u; source "$SOULX_ENV_SH"; set -u
+fi
+
+die() { echo "scope-soulx: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+scope-soulx -- SoulX-LiveAct interactive persona demo
+
+  scope-soulx run [options]        start the demo (detached by default)
+  scope-soulx doctor               what will this box do? paths, GPUs, plan
+  scope-soulx fetch                download weights + tiny decoders
+  scope-soulx bench --sizes ...    s/chunk per resolution
+  scope-soulx stop | logs [-f]
+
+GPU topology is decided, not configured: --gpus auto keeps the model on one card
+when it fits (no NCCL, aux co-locates) and splits sequence-parallel when it does
+not. FP8 and FlashAttention-3 gate on compute capability, so the same command
+runs on H200, RTX PRO 6000 and RTX 6000 Ada without edits.
+
+run options
+  --preset fast|quality|reference   shorthand for --res/--vae (default: fast)
+  --res    416x720|368x640|WxH      generator resolution, multiples of 16
+  --vae    wan|taew2_1|lighttaew2_1|lightvaew2_1|v3
+                                    wan = full Wan2.1 VAE (452ms, reference)
+                                    taew2_1 = tiny decoder (32ms, default)
+  --gpus   auto|1|2|0,1             default auto
+  --fp8    blocks|off|all           default blocks; auto-off below sm_89
+  --attn   auto|sdpa|fa3            default auto; fa3 is Hopper-only
+  --compile blocks|off|full         default blocks
+  --port N (8090)  --fps N (16)  --image PATH  --seed N
+  --foreground                      run in this shell instead of detaching
+  --dry-run                         print the plan and the commands, run nothing
+  --log-file PATH                   default $SOULX_ROOT/logs/demo.log
+
+presets
+  fast       368x640 + taew2_1   headroom for chat/TTS on top of the stream
+  quality    416x720 + taew2_1   the vertical quality config
+  reference  416x720 + wan       full Wan VAE, NOT realtime -- for A/B only
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# plan: ask soulx_runtime what this machine should do
+# ---------------------------------------------------------------------------
+probe_plan() {  # $1=gpus $2=fp8 $3=attn $4=size
+  local out
+  out="$(cd "$SRC" && "$PY" soulx_runtime.py --plan \
+        --gpus "$1" --fp8 "$2" --attn "$3" --size "$4" 2>&1)" || {
+    echo "$out" >&2
+    die "could not probe the GPU plan (is torch importable? try: scope-soulx doctor)"
+  }
+  echo "$out" | grep -v '^#' > /tmp/soulx_plan.env
+  echo "$out" | grep '^#' >&2 || true
+  # shellcheck disable=SC1091
+  source /tmp/soulx_plan.env
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  cd "$SRC" && exec "$PY" soulx_runtime.py --doctor "$@"
+}
+
+cmd_fetch() {
+  local want_weights=1 want_decoders=1
+  for a in "$@"; do
+    case "$a" in
+      --weights)  want_decoders=0 ;;
+      --decoders) want_weights=0 ;;
+      *) die "fetch: unknown option $a" ;;
+    esac
+  done
+  command -v hf >/dev/null || die "the huggingface CLI (hf) is not installed"
+  export HF_HOME="${HF_HOME:-$SOULX_ROOT/.hf}"
+
+  if [[ $want_weights == 1 ]]; then
+    mkdir -p "$SOULX_ROOT/weights"
+    hf download Soul-AILab/LiveAct --local-dir "$SOULX_ROOT/weights/LiveAct" \
+      --exclude "assets/*"
+    hf download TencentGameMate/chinese-wav2vec2-base \
+      --local-dir "$SOULX_ROOT/weights/chinese-wav2vec2-base"
+  fi
+  if [[ $want_decoders == 1 ]]; then
+    # The tiny decoders are 23-45MB each and live in one lightx2v repo.
+    mkdir -p "$SOULX_ROOT/decoders"
+    hf download lightx2v/Autoencoders --local-dir "$SOULX_ROOT/decoders" \
+      --include "*taew2_1*" --include "*lightvaew2_1*" \
+      || echo "scope-soulx: tiny decoders not fetched; --vae wan still works" >&2
+  fi
+  echo "scope-soulx: fetch done -> $SOULX_ROOT"
+}
+
+cmd_stop() {
+  pkill -f "[i]nteractive_demo.py" 2>/dev/null
+  pkill -f "[p]ersona_aux.py"      2>/dev/null
+  pkill -f "[t]orchrun"            2>/dev/null
+  echo "scope-soulx: stopped (CUDA takes ~15s to free)"
+}
+
+cmd_logs() {
+  mkdir -p "$LOGDIR"
+  if [[ "${1:-}" == "-f" ]]; then tail -f "$LOGDIR/demo.log"; else tail -n 80 "$LOGDIR/demo.log"; fi
+}
+
+cmd_run() {
+  local preset=fast res="" vae="" gpus=auto fp8=blocks attn=auto compile=blocks
+  local port=8090 fps=16 image="" seed=42 foreground=0 dry=0
+  local logfile="$LOGDIR/demo.log"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --preset)     preset="$2"; shift 2 ;;
+      --res|--size) res="$2";    shift 2 ;;
+      --vae)        vae="$2";    shift 2 ;;
+      --gpus)       gpus="$2";   shift 2 ;;
+      --fp8)        fp8="$2";    shift 2 ;;
+      --attn)       attn="$2";   shift 2 ;;
+      --compile)    compile="$2";shift 2 ;;
+      --port)       port="$2";   shift 2 ;;
+      --fps)        fps="$2";    shift 2 ;;
+      --image)      image="$2";  shift 2 ;;
+      --seed)       seed="$2";   shift 2 ;;
+      --log-file)   logfile="$2"; shift 2 ;;
+      --foreground) foreground=1; shift ;;
+      --dry-run)    dry=1; shift ;;
+      -h|--help)    usage; return 0 ;;
+      *) die "run: unknown option $1 (try --help)" ;;
+    esac
+  done
+
+  case "$preset" in
+    fast)      : "${res:=368x640}"; : "${vae:=taew2_1}" ;;
+    quality)   : "${res:=416x720}"; : "${vae:=taew2_1}" ;;
+    reference) : "${res:=416x720}"; : "${vae:=wan}" ;;
+    *) die "unknown preset '$preset' (fast|quality|reference)" ;;
+  esac
+
+  probe_plan "$gpus" "$fp8" "$attn" "$res"
+  mkdir -p "$LOGDIR" "$(dirname "$logfile")"
+
+  local gen_args=(
+    --size "$SOULX_SIZE" --fps "$fps" --port "$port" --seed "$seed"
+    --vae "$vae" --fp8 "$SOULX_FP8" --attn "$SOULX_ATTN" --compile "$compile"
+    --aux_device cpu --aux_url "http://127.0.0.1:$((port + 1))"
+    --autostart
+  )
+  [[ -n "$image" ]] && gen_args+=(--image "$image")
+
+  echo "scope-soulx: $SOULX_SIZE | vae=$vae | $SOULX_PARALLEL on GPU $SOULX_GEN_GPUS"
+  echo "scope-soulx: attn=$SOULX_ATTN fp8=$SOULX_FP8 compile=$compile -> :$port"
+  [[ "$compile" != off ]] && echo "scope-soulx: compile warmup is minutes; read timings from chunk 20+"
+
+  # SageAttention 2.2.0 produces noise/NaN on this pipeline; the shim makes the
+  # import fail so model_memory falls back to a backend that is known correct.
+  local env_prefix=(
+    env
+    "PYTHONPATH=$HERE/nosage:${PYTHONPATH:-}"
+    "USE_CHANNELS_LAST_3D=1"
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+    "CUDA_VISIBLE_DEVICES=$SOULX_GEN_GPUS"
+  )
+
+  local launch
+  if [[ "$SOULX_PARALLEL" == "sp" ]]; then
+    launch=("${env_prefix[@]}" torchrun --nproc_per_node="$SOULX_WORLD_SIZE" \
+            --master_port="$((port + 21000))" interactive_demo.py "${gen_args[@]}")
+  else
+    launch=("${env_prefix[@]}" "$PY" interactive_demo.py "${gen_args[@]}")
+  fi
+
+  if [[ $dry == 1 ]]; then
+    echo "scope-soulx: would run, in $SRC:"
+    echo "  CUDA_VISIBLE_DEVICES=$SOULX_AUX_GPU $PY persona_aux.py --port $((port + 1)) --preload"
+    printf '  %s\n' "${launch[*]}"
+    echo "scope-soulx: log -> $logfile"
+    return 0
+  fi
+
+  # persona_aux (Qwen + Kokoro TTS) is a separate process on purpose: inside a
+  # torchrun rank a second CUDA context destabilises NCCL. The planner gives it
+  # its own card whenever one is idle.
+  cd "$SRC" || die "no source dir at $SRC"
+  CUDA_VISIBLE_DEVICES="$SOULX_AUX_GPU" "$PY" persona_aux.py \
+    --port "$((port + 1))" --preload >> "$LOGDIR/persona_aux.log" 2>&1 &
+  local aux_pid=$!
+  trap 'kill "$aux_pid" 2>/dev/null || true' EXIT INT TERM
+
+  if [[ $foreground == 1 ]]; then
+    "${launch[@]}" 2>&1 | tee "$logfile"
+  else
+    setsid nohup "${launch[@]}" > "$logfile" 2>&1 < /dev/null &
+    trap - EXIT
+    echo "scope-soulx: detached; scope-soulx logs -f"
+  fi
+}
+
+cmd_bench() {
+  local sizes="416x720,368x640,336x592" vae=taew2_1 chunks=30 port=8190
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sizes)  sizes="$2";  shift 2 ;;
+      --vae)    vae="$2";    shift 2 ;;
+      --chunks) chunks="$2"; shift 2 ;;
+      *) die "bench: unknown option $1" ;;
+    esac
+  done
+  mkdir -p "$LOGDIR/bench"
+  echo "scope-soulx: benching $sizes with --vae $vae; each is a fresh process"
+  echo "scope-soulx: a chunk is 32 frames = 2.0s of video, so 2.0s/chunk is 1.0x"
+
+  local IFS=,
+  for size in $sizes; do
+    unset IFS
+    local log="$LOGDIR/bench/${size}_${vae}.log"
+    cmd_stop >/dev/null; sleep 20   # let CUDA free and sockets clear
+    echo "=== $size -> $log"
+    cmd_run --res "$size" --vae "$vae" --port "$port" --log-file "$log" >/dev/null
+    for _ in $(seq 1 90); do
+      grep -qE "^chunk 0*$chunks:" "$log" 2>/dev/null && break
+      if grep -qE "Traceback|out of memory|Address already in use" "$log" 2>/dev/null; then
+        grep -mE1 "Traceback|out of memory|Address already in use" "$log"; break
+      fi
+      sleep 10
+    done
+    grep -E "^chunk (10|20|$chunks):" "$log" | sed 's/^/  /'
+    port=$((port + 2))
+  done
+  cmd_stop >/dev/null
+
+  echo
+  printf "%-12s %9s %9s %s\n" size px s/chunk realtime
+  IFS=,
+  for size in $sizes; do
+    unset IFS
+    local log="$LOGDIR/bench/${size}_${vae}.log"
+    local line; line=$(grep -E "^chunk 0*$chunks:" "$log" 2>/dev/null | tail -1)
+    local w=${size%%x*} h=${size##*x}
+    if [[ -z "$line" ]]; then printf "%-12s %9s %9s\n" "$size" $((w*h)) "no data"; continue; fi
+    local s; s=$(sed -E 's/.* in ([0-9.]+)s .*/\1/' <<<"$line")
+    printf "%-12s %9s %9s %8sx\n" "$size" $((w*h)) "$s" "$("$PY" -c "print(f'{2.0/$s:.2f}')")"
+  done
+}
+
+case "${1:-}" in
+  run)    shift; cmd_run "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  fetch)  shift; cmd_fetch "$@" ;;
+  bench)  shift; cmd_bench "$@" ;;
+  stop)   shift; cmd_stop ;;
+  logs)   shift; cmd_logs "$@" ;;
+  ""|-h|--help) usage ;;
+  *) die "unknown command '$1' (try --help)" ;;
+esac

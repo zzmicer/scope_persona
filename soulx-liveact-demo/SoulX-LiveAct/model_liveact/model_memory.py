@@ -26,10 +26,14 @@ try:
 except:
     USE_SAGEATTN = False
 
-# SOULX_ATTN=fa3 opts into FlashAttention-3 for the streaming self-attention.
-# Default stays sdpa: that is the path every other measurement was taken on.
-# Deliberately xformers' bundled FA3 -- a second flash_attn_3 extension in the
-# same process aborts on duplicate torch-library registration.
+# Self-attention backend, resolved by soulx_runtime.attention_backend() and
+# passed in through SOULX_ATTN because this decision has to be made at import
+# time. FA3 is HOPPER-ONLY -- on Ada/Blackwell the runtime resolves to sdpa, so
+# this block simply never fires there.
+#
+# Deliberately xformers' bundled FA3, never a separately built flash_attn_3
+# wheel: two flash_attn_3 extensions in one process abort at import, because
+# both register the same torch library namespace.
 USE_FA3 = False
 _fmha = None
 _fa3_op = None

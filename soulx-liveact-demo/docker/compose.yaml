@@ -1,0 +1,38 @@
+# docker compose -f docker/compose.yaml up
+#
+# Assumes the pod's network volume is mounted at /workspace/soulx on the host and
+# already holds weights/ + decoders/ (see `scope-soulx fetch`). Nothing model-
+# sized lives in the image.
+services:
+  soulx:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: soulx-demo:latest
+    # The demo, persona_aux and the HLS muxer are one process group; stopping the
+    # container should not orphan them.
+    init: true
+    ports:
+      - "${SOULX_PORT:-8090}:8090"
+    volumes:
+      - ${SOULX_VOLUME:-/workspace/soulx}:/workspace/soulx
+    environment:
+      # Resolution and decoder are the two dials the demo is tuned on. Override
+      # per run: SOULX_RES=416x720 SOULX_VAE=wan docker compose up
+      SOULX_RES: ${SOULX_RES:-368x640}
+      SOULX_VAE: ${SOULX_VAE:-taew2_1}
+      SOULX_GPUS: ${SOULX_GPUS:-auto}
+    command:
+      ["run", "--res", "${SOULX_RES:-368x640}", "--vae", "${SOULX_VAE:-taew2_1}",
+       "--gpus", "${SOULX_GPUS:-auto}", "--foreground"]
+    # Shared memory: the default 64MB is not enough for torch dataloader/NCCL
+    # pinned buffers once the model is split across two ranks.
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

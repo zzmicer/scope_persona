@@ -328,6 +328,44 @@ moves from prompts in realtime.
     after weeks of sm_120 dep work. 1xH200/1xH100 is the better demo box.
   - NOTE: this pod's GPUs are SHARED with other containers (PIDs not in our
     namespace held GPUs 0/2/3, one pegged at 100%). Only GPU1 was free.
+- [x] Portability refactor (2026-08-02) — the demo ran only on the box it was
+  built on. Removed: `pruna_bench.py` (a 1567-line fork of `interactive_demo.py`
+  that differed by 30 lines of block-compile, now merged as `--compile blocks`);
+  the `ultraflash/add_*.py` source-rewriting patchers (fast_decode, tiny_decoder,
+  FA3, SR — all folded into the tracked source, so there is nothing to re-apply
+  on a new pod); and six divergent `run_*.sh`/`deploy_demo.sh`/`setup_*.sh`
+  launchers, replaced by one `scope-soulx` (`run`/`doctor`/`fetch`/`bench`/
+  `stop`/`logs`). New `SoulX-LiveAct/soulx_runtime.py` owns the three things that
+  were hardcoded: paths (`SOULX_ROOT`), the decoder registry, and a planner that
+  picks single-GPU vs sequence-parallel from actual VRAM and gates FP8 (sm_89+)
+  and FA3 (sm_90 ONLY) on compute capability. Flags now: `--res` / `--vae` /
+  `--gpus` / `--fp8` / `--attn` / `--compile`.
+- [ ] **Verify on 2× RTX PRO 6000 Blackwell (sm_120, 96GB)** — nothing below has
+  run on Blackwell; this is the gate on the whole refactor. In order:
+  1. `scope-soulx doctor` — expect: single-GPU plan (96GB > ~82GB), aux on GPU1,
+     `attn=sdpa` (FA3 is Hopper-only), `fp8=blocks`, and the `torch._scaled_mm`
+     self-test passing.
+  2. `scope-soulx run --preset fast` (368×640 + taew2_1), then `--preset quality`
+     (416×720). Read s/chunk from chunk 20+, not chunk 0 (compile warmup).
+  3. A/B the two dials the refactor exposes: `--vae wan` vs `taew2_1`, and the
+     two vertical resolutions. `scope-soulx bench --sizes 416x720,368x640`.
+  4. **Watch for silent FP8 corruption**: vLLM's `Fp8LinearOp` may dispatch a
+     cutlass kernel that is untested on sm_120. If the stream renders noise,
+     `--fp8 off` isolates it in one flag. This pipeline has shipped
+     plausible-looking corruption twice; check identity drift across chunks, not
+     just per-frame sanity.
+  5. Expect the H200 s/chunk table NOT to transfer: no FA3, different SM
+     count/clocks. Re-measure before quoting any realtime multiple.
+  Note this does NOT contradict the 2×5090 rejection below — that was 32GB cards
+  needing t5-offload + FP8 *storage*. At 96GB the model fits one card whole.
+- [ ] NVFP4 is now live as an option (sm_120 has it; Hopper did not) and
+  `SoulX-LiveAct/fp4_gemm.py` already carries an unused `FP4Linear`. Same scoping
+  rule as FP8: block matmuls only. See `docs/soulx-optimization-brief.md` §7 and
+  the fouroversix notes in `docs/longlive2-runpod-bringup.md` Session 2.
+- [ ] Docker image is written but UNBUILT (`docker/Dockerfile`, cu128 + torch 2.8,
+  no conda, SageAttention deliberately omitted). First build will surface pin
+  conflicts — most likely `vllm==0.11.0` vs the torch pin, and LightX2V's
+  `setup_vae.py`.
 - [x] Dedicated LingBot web studio: focused start-image → world flow, explicit
   model/WebRTC/warm-up states, full-size video stage, Beauty event controls,
   custom natural-language actions, and WASD/mouse camera input. Replaces the

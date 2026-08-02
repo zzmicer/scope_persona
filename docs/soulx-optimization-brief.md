@@ -6,14 +6,21 @@ as an estimate.
 
 ## The one thing to internalize first
 
-**The constraint is LATENCY, not memory.** On the target box (1×H200, 143GB) the
-demo occupies 76.4GB. There is 67GB spare. Optimizations that trade compute for
-memory are worthless here; optimizations that cut wall-clock per chunk are the
-entire job.
+**The constraint is LATENCY, not memory.** The demo occupies 76.4GB, measured at
+720×416 with FP8 on the block matmuls. On the box it was profiled on (1×H200,
+143GB) that left 67GB spare. Optimizations that trade compute for memory are
+worthless here; optimizations that cut wall-clock per chunk are the entire job.
 
 This inverts the usual "model optimization" instinct. Do not spend effort on
 weight quantization for footprint, offloading, or paging unless the target moves
-to a consumer card (see §6).
+to a card that cannot hold 76GB (see §6).
+
+**Target as of 2026-08-02: 2× RTX PRO 6000 Blackwell (sm_120, 96GB each.)** One
+card still holds the model, so the latency-not-memory framing survives the move —
+but two things below change: FA3 (§1) is Hopper-only and therefore unavailable,
+and NVFP4 (§7) becomes live. Every s/chunk number in this document was measured
+on H200 and must be re-measured on the target
+(`scope-soulx bench --sizes 416x720,368x640`).
 
 ## Budget
 
@@ -116,13 +123,22 @@ Skip for the 1×H200 target. Relevant only if the goal becomes a 32GB card:
 
 That is ~16GB of the 76GB for almost no duty cycle.
 
-### 7. Quantization beyond current FP8 — low priority on H200
+### 7. Quantization beyond current FP8 — PROMOTED: the target moved to Blackwell
 
-Already at FP8 W8A8 on the block matmuls. NVFP4 is **Blackwell-only**, so it does
-nothing on Hopper; INT4 weight-only would cut footprint but not latency (no fast
-W4A8 path on sm90). Promote this **only** if the target moves to Blackwell — in
-which case there is hard-won NVFP4/fouroversix knowledge in
-`docs/longlive2-runpod-bringup.md` Session 2.
+Already at FP8 W8A8 on the block matmuls. INT4 weight-only would cut footprint
+but not latency (no fast W4A8 path).
+
+As of 2026-08-02 the deployment target is **2× RTX PRO 6000 Blackwell (sm_120)**,
+which makes **NVFP4 live** — it was Blackwell-only and therefore dead on Hopper.
+There is hard-won NVFP4/fouroversix knowledge in
+`docs/longlive2-runpod-bringup.md` Session 2, and this repo already carries an
+unused `SoulX-LiveAct/fp4_gemm.py` with an `FP4Linear`. The same scoping rule
+applies as for FP8: **block matmuls only**.
+
+Note the corollary — **FlashAttention-3 is gone on this target** (Hopper-only),
+so §1's measured 2.1–2.3× attention win does not carry over. `soulx_runtime`
+resolves the backend to SDPA there automatically. Re-benchmark attention on
+sm_120 before assuming anything about §1.
 
 ## Validation — non-negotiable
 
@@ -150,13 +166,15 @@ Required gates for any change:
 Useful reference material already on the pod:
 
 - `/workspace/uflash/dump/chunk_*.pt` — real dumped SoulX latents + T5 context
-- `/workspace/uflash/dec_native_cmp.py` — the MAE-vs-reference comparison pattern
-- `/workspace/soulx/run_single_fast.sh` — 1-GPU harness, `STREAM_SIZE` etc.
+- `ultraflash/dec_native_cmp.py` — the MAE-vs-reference comparison pattern
+- `scope-soulx run --res ... --vae ... --fp8 ... --compile ...` — the harness;
+  every knob in this document is a flag on it, and `scope-soulx doctor` reports
+  what the card actually supports
 
 ## Explicitly out of scope
 
-- **VAE decode** — solved at 31ms.
-- **Memory reduction on H200** — 76 of 143GB.
+- **VAE decode** — solved at 32ms (`--vae taew2_1`).
+- **Memory reduction** — 76GB fits the target's 96GB card with room for the aux.
 - **persona_aux** (Qwen2.5-1.5B + Kokoro, ~4GB) — negligible, off the chunk path.
 - **wav2vec2-base** (1.5GB) — small per-chunk cost.
 
@@ -164,7 +182,9 @@ Useful reference material already on the pod:
 
 - Pod GPUs are **shared with other containers** — PIDs outside our namespace hold
   GPUs 0/2/3, one pegged at 100%. Benchmark on a verified-idle GPU or numbers lie.
-- `env.sh` no longer needs conda (the installer lived on the wiped root overlay);
-  it sets PATH + sources `activate.d` directly. `env.sh.conda-bak` is the original.
-- The conda env `/workspace/soulx/env` and all weights are on the **network
-  volume** and survive container recreation.
+- The environment is now a **Docker image** (`docker/Dockerfile`, CUDA 12.8 /
+  torch 2.8 cu128, no conda and no SageAttention build). On a bare pod,
+  `SOULX_ENV_SH` points `scope-soulx` at whatever activation script exists.
+- Weights live on the **network volume** at `$SOULX_ROOT` and survive container
+  recreation; so does the inductor cache, which is why compile warmup is paid
+  once per resolution rather than once per container.

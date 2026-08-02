@@ -16,10 +16,12 @@ persona; the preview deliberately labels that limitation.
 
 ## Optional 2x latent upscaling (UltraFlash) — EXPERIMENTAL, to be reverted
 
-`run_interactive_sr.sh` streams 1440x832 instead of 720x416 by routing each
-chunk latent through [UltraFlash](https://github.com/xin1u/UltraFlash)'s SR
-cascade before decode. Both models live in the Wan2.1 VAE latent space (16ch,
-stride 4/8/8), so the handoff needs no pixel round-trip.
+Passing `--sr_url` to `interactive_demo.py` streams 1440x832 instead of 720x416
+by routing each chunk latent through
+[UltraFlash](https://github.com/xin1u/UltraFlash)'s SR cascade before decode.
+Both models live in the Wan2.1 VAE latent space (16ch, stride 4/8/8), so the
+handoff needs no pixel round-trip. `scope-soulx` does not expose it: the sidecar
+needs a 4-GPU layout and the feature is expected to be reverted.
 
 Measured on the 4xH200 pod: **1.67s per 32-frame chunk (19.2fps, 1.20x
 realtime)** vs 1.99s (1.00x) without SR — it is *faster* despite 4x the pixels,
@@ -37,20 +39,19 @@ it is the invented micro-texture that reads as wrong. Turning SR off (drop
 
 This whole feature is experimental and expected to be reverted.
 
-- `run_interactive_sr.sh` — launcher. GPU0 aux · GPU1 SR sidecar · GPU2,3 SoulX.
-  Note this is a **4-GPU** layout: the generator is 2 GPUs as before, aux was
-  already on GPU0, and the SR sidecar adds GPU1. It could share a generator GPU
-  (~20GB) at the cost of contending with it.
+- The layout it was measured on was **4 GPUs**: GPU0 aux · GPU1 SR sidecar ·
+  GPU2,3 SoulX. The sidecar could share a generator GPU (~20GB) at the cost of
+  contending with it.
 - `ultraflash/sr_service.py` — SR sidecar (upsampler + sparse SR DiT + decoder).
   Separate process on purpose: a 2nd CUDA context inside a torchrun rank
   destabilizes NCCL, same reason `persona_aux` is split out.
 - `ultraflash/ultra_dec_v3.py` — the released `ultra-decoder-v3` weights do NOT
   load into UltraFlash's own decoder classes; this reconstructs the matching
   module list from the checkpoint's key/shape signature. 1755ms -> 101ms.
-- `ultraflash/add_sr.py`, `add_sr_async.py` — idempotent patches to
-  `interactive_demo.py` (backups `.bak2`/`.bak3`). Inert without `--sr_url`.
-- `ultraflash/sr_probe.py`, `dec_bench.py` — offline harnesses used to measure
-  the above before touching the live demo.
+- `ultraflash/sr_probe.py`, `dec_bench.py`, `dec_shootout.py` — offline
+  harnesses used to measure the above before touching the live demo. These
+  still hardcode the pod's `/workspace/uflash` dump layout; they are analysis
+  scaffolding, not part of the deploy path.
 
 ## Layout
 
@@ -82,33 +83,40 @@ This whole feature is experimental and expected to be reverted.
 - `nosage/sageattention.py` — import shim; putting `nosage/` first on
   `PYTHONPATH` makes `import sageattention` fail so every fallback path uses
   SDPA/flash-attn instead of the broken sage kernels.
-- `setup_download.sh` — HF weight download (51 GB LiveAct + wav2vec2) to
-  `/workspace/soulx/weights`.
-- `setup_env.sh` — conda env build on `/workspace/soulx/env` (root disk is
-  full on the pod; everything must live on /workspace). Installs torch 2.8
-  cu128 stack, vllm 0.11, SageAttention v2.2 (built but unused — see above),
-  LightX2V VAE, nvcc 12.8 via conda (system nvcc is 12.4).
-- `post_env.sh` — TTS/LLM extras: `misaki[en]`, espeakng-loader, prefetches
-  hexgrad/Kokoro-82M + Qwen/Qwen2.5-1.5B-Instruct.
-- `env.sh` — env activation sourced by launchers. Notable:
-  `XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` (xformers caps flash-attn at 2.8.2,
-  we run 2.8.3), caches redirected to /workspace.
-- `run_interactive.sh` — the demo launcher (SoulX GPUs 2,3 + persona GPU 0 ·
-  port 8090 · 720×416 · fps 16 · `--no_fp8_gemm --no_compile --autostart`).
-- `run_stock.sh` — upstream GUI demo launcher (for comparison).
-- `chano39-Anime-Original-anime-9101906.png` — the reference character image
-  (pod path: `/workspace/soulx_setup/`).
+  - `soulx_runtime.py` (ours) — the one place that knows where files live and
+    what the GPU can do: `SOULX_ROOT` path resolution, the decoder registry,
+    and the planner that decides single-GPU vs sequence-parallel and gates
+    FP8/FA3 on compute capability.
+- `scope-soulx` — the launcher (`run` / `doctor` / `fetch` / `bench` / `stop` /
+  `logs`). Replaces the six divergent `run_*.sh` scripts.
+- `docker/` — `Dockerfile` + `compose.yaml`. CUDA 12.8 / torch 2.8 cu128 so the
+  image runs on Hopper, Ada and Blackwell unchanged. Weights stay on a mounted
+  volume; SageAttention is deliberately not installed.
+- `nosage/sageattention.py` — import shim (see above).
+- `chano39-Anime-Original-anime-9101906.png` — the reference character image,
+  copied into `$SOULX_ROOT/assets` on first container start.
 
-## Run (on the pod)
+## Run
 
 ```bash
-bash run_interactive.sh          # server on 0.0.0.0:8090, session autostarts
+scope-soulx doctor                          # GPUs, paths, and the chosen plan
+scope-soulx fetch                           # weights + tiny decoders, once
+scope-soulx run --res 416x720 --vae taew2_1 # server on 0.0.0.0:8090
 ```
 
-From the Mac (port 8090 is NOT exposed via RunPod's HTTP proxy):
+Or in Docker, which is the supported deploy path:
 
 ```bash
-ssh -N -L 8090:localhost:8090 -p 13539 -i ~/.ssh/id_runpod_new root@213.181.104.236
+docker build -t soulx-demo -f docker/Dockerfile .
+docker run --gpus all -p 8090:8090 -v /workspace/soulx:/workspace/soulx \
+  soulx-demo run --res 416x720 --vae taew2_1 --foreground
+```
+
+From the Mac (port 8090 is NOT exposed via RunPod's HTTP proxy — and its
+`ssh.runpod.io` proxy cannot forward ports, so use the pod's direct IP):
+
+```bash
+ssh -N -L 8090:localhost:8090 -p <RUNPOD_TCP_PORT_22> root@<pod-ip>
 # open http://localhost:8090 ; click "🔊 Enable audio" once
 ```
 
@@ -116,9 +124,10 @@ ssh -N -L 8090:localhost:8090 -p 13539 -i ~/.ssh/id_runpod_new root@213.181.104.
 
 - **fps must divide 16000** (audio sample rate): 16, 20, 25. We run 16 so the
   ~15 fps generation speed keeps up with playback (at 20 the stream drifts).
-- **No FP8 GEMM, no SageAttention** on this stack — both render noise. Flash
-  attention 2.8.3 + SDPA are the working combination. `torch.compile` is off
-  (`--no_compile`); plain-mode compile is the untested next perf step.
+- **FP8 must stay scoped to the block matmuls.** `--fp8 all` wraps the
+  modulation/embedding/head linears too — no FLOPs, maximum quantization
+  sensitivity — and renders noise. `--fp8 blocks` (480 matmuls) is correct and
+  is the default. **SageAttention** renders noise on this stack at any scope.
 - **Latent RNG must be rank-synchronized**: earlier rank0-only Kokoro/LLM work
   consumed the global CUDA RNG; per-chunk latents therefore
   come from a dedicated seeded `torch.Generator` (identical on both ranks) —

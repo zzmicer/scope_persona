@@ -1,0 +1,16 @@
+# The build context is soulx-liveact-demo/; keep it small and reproducible.
+**/__pycache__/
+**/*.pyc
+**/*.bak*
+.DS_Store
+docker/
+hls_output/
+logs/
+sweep/
+demos/
+# Weights, dumps and generated media never belong in the image.
+**/*.pth
+**/*.pt
+**/*.safetensors
+**/*.mp4
+**/dump*/

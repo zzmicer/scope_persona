@@ -13,13 +13,19 @@ sustained state so the character STAYS in the new pose (sit -> keeps sitting).
                empty body clears back to neutral idle.
 Video+audio are muxed into a live HLS stream at /stream/live/live.m3u8.
 
-Run (2 GPUs):
-  USE_CHANNELS_LAST_3D=1 CUDA_VISIBLE_DEVICES=2,3 \
-  torchrun --nproc_per_node=2 --master_port=29617 interactive_demo.py \
-    --ckpt_dir /workspace/soulx/weights/LiveAct \
-    --wav2vec_dir /workspace/soulx/weights/chinese-wav2vec2-base \
-    --size 720*416 --fps 20 --port 8090 \
-    --image /workspace/soulx_setup/chano39-Anime-Original-anime-9101906.png
+Prefer the launcher, which picks the GPU topology and gates FP8/FA3 on the
+architecture instead of assuming an H200:
+
+  scope-soulx run --res 416x720 --vae taew2_1
+
+Directly, if you are debugging one knob (paths come from SOULX_ROOT, see
+soulx_runtime.Paths):
+
+  python interactive_demo.py --size 416x720 --vae wan --compile off --autostart
+
+Under sequence parallelism it is one process per rank:
+
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 interactive_demo.py ...
 """
 
 import os
@@ -68,6 +74,8 @@ from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 from transformers import Wav2Vec2FeatureExtractor
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 
+import soulx_runtime
+
 gc.collect()
 torch.cuda.empty_cache()
 torch.backends.cudnn.benchmark = True
@@ -106,8 +114,6 @@ KOKORO_VOICES = {"af_heart", "af_bella", "af_nicole", "am_adam"}
 # flight would reorder through its streaming caches
 _sr_pool = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sr")
 
-SIZE_ALIGN = 16
-
 
 def _sr_request(base, latent, ctx, rank, timeout=60):
     """POST one chunk latent to the SR sidecar, return HR uint8 [T,H,W,C]."""
@@ -145,18 +151,18 @@ _DUMP_N = int(os.environ.get("SOULX_DUMP_N", "12"))
 
 
 def _parse_size(size):
-    """'W*H' -> (width, height), validated. Portrait and landscape both allowed."""
+    """'416x720' / '416*720' / a preset name -> (width, height), validated.
+
+    Portrait and landscape both allowed, and portrait costs the same: latency
+    tracks pixel count, not orientation.
+    """
     try:
-        w, h = (int(x) for x in size.split("*"))
-    except ValueError:
-        raise SystemExit(f"--size must look like WIDTH*HEIGHT (got {size!r})") from None
-    bad = [n for n, v in (("width", w), ("height", h)) if v <= 0 or v % SIZE_ALIGN]
-    if bad:
+        return soulx_runtime.parse_resolution(size)
+    except ValueError as exc:
         raise SystemExit(
-            f"--size {size}: {' and '.join(bad)} must be a positive multiple of "
-            f"{SIZE_ALIGN} (e.g. 720*416 landscape, 416*720 portrait, 480*832 tall)"
-        )
-    return w, h
+            f"--size {size!r}: {exc}\n"
+            f"  presets: {', '.join(soulx_runtime.RESOLUTIONS)}"
+        ) from None
 
 
 # vLLM's W8A8 wrapper replaces EVERY nn.Linear it is handed. In a diffusion
@@ -442,6 +448,30 @@ class LiveEngine:
                 ulysses_degree=self.world_size,
             )
 
+        # Resolve what this card can actually do BEFORE importing the model: the
+        # attention backend is chosen at model_memory import time, and FP8 on a
+        # card without FP8 tensor cores fails deep inside the first matmul rather
+        # than at startup. The launcher plans GPU topology; this only gates the
+        # per-architecture features, so a bare `python interactive_demo.py` is
+        # still safe on any box.
+        os.environ["SOULX_ATTN"] = soulx_runtime.attention_backend(args.attn)
+        if args.fp8 != "off" and not soulx_runtime.fp8_supported():
+            print(
+                f"[plan] fp8={args.fp8} requested but this GPU has no FP8 tensor "
+                f"cores (needs sm_89+); falling back to bf16",
+                flush=True,
+            )
+            args.fp8 = "off"
+        if self.rank == 0:
+            for gpu in soulx_runtime.gpus():
+                print(f"[gpu] {gpu}", flush=True)
+            print(
+                f"[plan] size={self.width}x{self.height} vae={args.vae} "
+                f"attn={os.environ['SOULX_ATTN']} fp8={args.fp8} "
+                f"compile={args.compile} world_size={self.world_size}",
+                flush=True,
+            )
+
         if self.use_dist:
             from model_liveact.model_memory_sp import WanModel
         else:
@@ -449,23 +479,35 @@ class LiveEngine:
         self.wan = WanModel.from_pretrained(
             args.ckpt_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
         ).to(dtype=torch.bfloat16)
-        if not args.no_fp8_gemm:
-            mf = None if args.fp8_scope == "all" else _fp8_block_matmuls
+        if args.fp8 != "off":
+            mf = None if args.fp8 == "all" else _fp8_block_matmuls
             enable_fp8_gemm(self.wan, options=FP8GemmOptions(), module_filter=mf)
             wrapped = sum(
                 1 for m in self.wan.modules() if type(m).__name__ == "FP8Linear"
             )
             print(
-                f"fp8 gemm: scope={args.fp8_scope}, {wrapped} linears wrapped",
+                f"fp8 gemm: scope={args.fp8}, {wrapped} linears wrapped",
                 flush=True,
             )
         self.wan = self.wan.to(self.device)
         self.wan.freqs = self.wan.freqs.to(self.device)
         self.wan.eval()
-        if not args.no_compile:
+        if args.compile == "blocks":
+            # Pruna's open-source Wan recipe: compile the transformer ModuleList
+            # one block at a time. More robust to graph breaks than compiling the
+            # stateful streaming WanModel as one graph, and worth 17-20%.
+            for i, block in enumerate(self.wan.blocks):
+                self.wan.blocks[i] = torch.compile(
+                    block, mode=args.compile_mode, backend="inductor", dynamic=False
+                )
+            print(
+                f"torch.compile: {len(self.wan.blocks)} blocks, mode={args.compile_mode}",
+                flush=True,
+            )
+        elif args.compile == "full":
             self.wan = torch.compile(
                 self.wan,
-                mode="max-autotune-no-cudagraphs",
+                mode=args.compile_mode,
                 backend="inductor",
                 dynamic=False,
             )
@@ -564,60 +606,21 @@ class LiveEngine:
             self.wan.blocks[n].self_attn.init_kvidx(self.frame_len, self.world_size)
 
         self.vae.model.eval()
-        if not args.no_compile:
+        # Only the full Wan VAE's decode is worth compiling; the tiny decoders
+        # are ~32ms and replace this call site outright.
+        if args.compile != "off" and args.vae == "wan":
             self.vae.decode = torch.compile(self.vae.decode)
 
-        # Swap in the tiny decoder AFTER any torch.compile of the real one.
-        # self.vae.encode is untouched -- the reference image still goes through
-        # the full Wan VAE, only the per-chunk decode is replaced.
-        if getattr(args, "fast_decode", False):
-            import sys as _sys
-
-            _sys.path.insert(0, "/workspace/uflash")
-            _sys.path.insert(0, "/workspace/uflash/UltraFlash/inference")
-
-            _which = getattr(args, "tiny_decoder", "taew2_1")
-            _lx = "/workspace/uflash/ckpt_lx2v"
-            _dev = f"cuda:{self.device}"
-
-            if _which == "v3":
-                # Reconstructed from the checkpoint's shape signature; kept only
-                # for comparison. MAE 6.41 vs taew2_1's 2.77.
-                from ultra_dec_v3 import UltraDecoderV3 as _V3
-
-                _d = (_V3(args.fast_decode_ckpt).to(_dev, torch.float16)
-                      .eval().requires_grad_(False))
-
-                def _fast_decode(latent, _m=_d):
-                    return _m.decode_latents(latent.unsqueeze(0))
-
-            else:
-                # need_scaled is per-checkpoint, NOT a preference -- see module docs.
-                _NEEDS_SCALE = {"taew2_1": False, "lighttaew2_1": True}
-                if _which not in _NEEDS_SCALE:
-                    raise ValueError(
-                        f"--tiny_decoder must be one of "
-                        f"{['v3'] + list(_NEEDS_SCALE)} (got {_which})"
-                    )
-                from lightx2v.models.video_encoders.hf.wan.vae_tiny import (
-                    WanVAE_tiny as _Tiny,
-                )
-
-                _d = _Tiny(
-                    vae_path=f"{_lx}/{_which}.pth",
-                    dtype=torch.bfloat16,
-                    device=_dev,
-                    need_scaled=_NEEDS_SCALE[_which],
-                ).to(_dev).eval()
-
-                def _fast_decode(latent, _m=_d):
-                    # (C,T,h,w) -> (1,3,T*4-3,h*8,w*8), as WanVAE.decode returns
-                    return _m.decode(latent)
-
-            self.fast_dec = _d
-            self.vae.decode = _fast_decode
-            if self.rank == 0:
-                print(f"[fastdec] tiny decoder active: {_which}", flush=True)
+        # Swap the decoder AFTER any torch.compile of the real one. self.vae.encode
+        # is untouched either way -- the reference image still goes through the
+        # full Wan VAE, only the per-chunk decode is replaced.
+        decode_fn = soulx_runtime.build_decode_fn(args.vae, self.device)
+        if decode_fn is not None:
+            self.fast_dec = decode_fn
+            self.vae.decode = decode_fn
+        if self.rank == 0:
+            spec = soulx_runtime.DECODERS[args.vae]
+            print(f"[decoder] {spec.label} -- {spec.note}", flush=True)
 
         # per-chunk geometry
         self.frame_num_init = (sum(self.blksz_lst) - 1) * 4 + 1  # 53
@@ -1486,11 +1489,21 @@ def ws_feed(ws):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_dir", type=str, required=True)
-    parser.add_argument("--wav2vec_dir", type=str, required=True)
+    _paths = soulx_runtime.paths()
+    parser = argparse.ArgumentParser(
+        description="SoulX-LiveAct interactive persona demo",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="decoders available to --vae:\n" + soulx_runtime.decoder_help(),
+    )
+    # Paths default off SOULX_ROOT (see soulx_runtime.Paths) so the same command
+    # line works on any box; pass them explicitly only to override the layout.
+    parser.add_argument("--ckpt_dir", type=str, default=_paths.ckpt_dir)
+    parser.add_argument("--wav2vec_dir", type=str, default=_paths.wav2vec_dir)
     parser.add_argument(
-        "--image", type=str, required=True, help="default reference image"
+        "--image",
+        type=str,
+        default=_paths.default_image,
+        help="default reference image",
     )
     parser.add_argument("--t5_cpu", action="store_true")
     parser.add_argument("--port", type=int, default=8090)
@@ -1507,18 +1520,24 @@ if __name__ == "__main__":
         help="optional separate Qwen/Kokoro service URL",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--size", type=str, default="720*416")
-    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument(
+        "--size",
+        type=str,
+        default="368x640",
+        help=f"WIDTHxHEIGHT or a preset name ({', '.join(soulx_runtime.RESOLUTIONS)}); "
+        f"both dimensions multiples of 16",
+    )
+    parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--fp8_kv_cache", action="store_true", default=False)
-    parser.add_argument("--fast_decode", action="store_true",
-                        help="decode with the v3 tiny decoder instead of the Wan2.1 VAE "
-                             "(~31ms vs ~452ms at 720x416, MAE 6.4/255)")
-    parser.add_argument("--tiny_decoder", type=str, default="taew2_1",
-                        choices=["taew2_1", "lighttaew2_1", "v3"],
-                        help="which tiny decoder --fast_decode uses "
-                             "(taew2_1: official, MAE 2.77; v3: reconstructed, 6.41)")
-    parser.add_argument("--fast_decode_ckpt", type=str,
-                        default="/workspace/uflash/ckpt/v1.1-ultra-decoder-v3-ema_decoder.pth")
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default="taew2_1",
+        choices=list(soulx_runtime.DECODERS),
+        help="decoder for the per-chunk latents: 'wan' is the full Wan2.1 VAE "
+        "(452ms, the quality reference), the rest are tiny decoders. "
+        "vae.encode always stays the Wan VAE.",
+    )
     parser.add_argument("--sr_url", type=str, default=None,
                         help="UltraFlash SR sidecar base URL; omit to stream at native res")
     parser.add_argument("--sr_scale", type=int, default=2)
@@ -1529,24 +1548,45 @@ if __name__ == "__main__":
         help="chunks to hold an action before reverting to idle prompt",
     )
     parser.add_argument(
-        "--no_fp8_gemm",
-        action="store_true",
-        help="disable vllm FP8 GEMM entirely",
-    )
-    parser.add_argument(
-        "--fp8_scope",
-        choices=["blocks", "all"],
+        "--fp8",
+        choices=["off", "blocks", "all"],
         default="blocks",
-        help="which linears FP8 covers: 'blocks' = attention/FFN matmuls only "
-        "(leaves modulation/embeddings/head in bf16), 'all' = every linear",
+        help="which linears the vLLM W8A8 GEMM covers: 'blocks' = attention/FFN "
+        "matmuls only (leaves modulation/embeddings/head in bf16), 'all' = every "
+        "linear and KNOWN TO PRODUCE NOISE, 'off' = bf16. Auto-disabled below sm_89.",
     )
     parser.add_argument(
-        "--no_compile", action="store_true", help="disable torch.compile"
+        "--attn",
+        choices=["auto", "sdpa", "fa3"],
+        default="auto",
+        help="self-attention backend; 'auto' picks FA3 on Hopper and SDPA elsewhere",
+    )
+    parser.add_argument(
+        "--compile",
+        choices=["off", "blocks", "full"],
+        default="blocks",
+        help="torch.compile strategy: 'blocks' compiles each transformer block "
+        "independently (Pruna Wan recipe, 17-20%%, survives graph breaks), "
+        "'full' compiles the whole streaming model, 'off' disables it. "
+        "Warmup is minutes and is re-paid on every resolution change.",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        choices=["default", "reduce-overhead", "max-autotune-no-cudagraphs"],
+        default="max-autotune-no-cudagraphs",
     )
     parser.add_argument(
         "--autostart", action="store_true", help="start session immediately"
     )
     args = parser.parse_args()
+
+    if not args.image:
+        raise SystemExit(
+            f"no reference image: pass --image, or put one in {_paths.assets}"
+        )
+    missing = _paths.missing()
+    if missing and not os.path.exists(args.ckpt_dir):
+        raise SystemExit("missing model files:\n  " + "\n  ".join(missing))
 
     engine = LiveEngine(args)
     if engine.rank == 0:
