@@ -715,11 +715,10 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             <option value="chat">Chat</option>
             <option value="say">Say</option>
             <option value="do">Do</option></select
-          ><input id="text" placeholder="Say something…" /><button
-            onclick="send()"
-          >
-            ➤
-          </button>
+          ><input
+            id="text"
+            placeholder="Say something… or /change her outfit"
+          /><button onclick="send()">➤</button>
         </div>
       </aside>
 
@@ -772,7 +771,8 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
       let recognition,
         listening = false,
         cameraStream = null,
-        active = false;
+        active = false,
+        characterImageUrl = "";
       const JITTER = 0.35;
 
       function toast(text) {
@@ -1053,7 +1053,9 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           active = state.active;
           document.getElementById("status-dot").classList.toggle("on", active);
           document.getElementById("status-copy").textContent = active
-            ? `Live · ${state.chunks} chunks`
+            ? state.appearance?.busy
+              ? "Creating new appearance…"
+              : `Live · ${state.chunks} chunks`
             : "Ready to call";
           document.getElementById("call-button").textContent = active
             ? "Join live call"
@@ -1061,6 +1063,15 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           if (state.persona) {
             document.getElementById("live-name").textContent =
               state.persona.name;
+          }
+          if (
+            state.appearance?.image_url &&
+            state.appearance.image_url !== characterImageUrl
+          ) {
+            characterImageUrl = state.appearance.image_url;
+            document.getElementById("live-avatar").src = characterImageUrl;
+            document.getElementById("character-preview").src =
+              characterImageUrl;
           }
           for (const event of state.events)
             if (event.t > lastEventTime) {

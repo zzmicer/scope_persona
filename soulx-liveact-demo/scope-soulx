@@ -24,6 +24,17 @@ SRC="${SOULX_SRC:-$HERE/SoulX-LiveAct}"
 PY="${SOULX_PYTHON:-python}"
 LOGDIR="${SOULX_LOGDIR:-$SOULX_ROOT/logs}"
 
+# Optional server-only credentials. Prefer root's private config directory: some
+# network volumes ignore chmod and make every file mode 0666. A deployment may
+# explicitly point SOULX_SECRETS_FILE at a platform-managed secret instead.
+SECRETS_FILE="${SOULX_SECRETS_FILE:-/root/.config/soulx/secrets.env}"
+if [[ -f "$SECRETS_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$SECRETS_FILE"
+  set +a
+fi
+
 # The conda *installation* lives on a container's root disk and does not survive
 # a recreate; the env itself is on the network volume. Sourcing an env.sh is
 # therefore optional -- inside the Docker image there is nothing to source.
@@ -57,8 +68,14 @@ run options
                                     taew2_1 = tiny decoder (32ms, default)
   --gpus   auto|1|2|0,1             default auto
   --fp8    blocks|off|all           default blocks; auto-off below sm_89
-  --attn   auto|sdpa|fa3            default auto; fa3 is Hopper-only
+  --attn   auto|sdpa|fa3|sage       default auto; fa3 is Hopper-only
+  --sage-scope self|all|self+cross  which attentions sage covers (default self)
   --compile blocks|off|full         default blocks
+  --lora PATH|NAME                  merge a kohya LoRA into the DiT at load;
+                                    a bare NAME resolves in $SOULX_ROOT/lora
+  --lora-strength F                 default 1.0. The DiT is distilled to 4
+                                    steps, so many-step LoRAs want less. Sweep
+                                    live: curl -X POST :PORT/lora -d '{"strength":0.6}'
   --port N (8090)  --fps N (16)  --image PATH  --seed N
   --foreground                      run in this shell instead of detaching
   --dry-run                         print the plan and the commands, run nothing
@@ -137,7 +154,8 @@ cmd_logs() {
 
 cmd_run() {
   local preset=fast res="" vae="" gpus=auto fp8=blocks attn=auto compile=blocks
-  local port=8090 fps=16 image="" seed=42 foreground=0 dry=0
+  local port=8090 fps=16 image="" seed=42 foreground=0 dry=0 sage_scope=self
+  local lora="" lora_strength=1.0
   local logfile="$LOGDIR/demo.log"
 
   while [[ $# -gt 0 ]]; do
@@ -148,7 +166,10 @@ cmd_run() {
       --gpus)       gpus="$2";   shift 2 ;;
       --fp8)        fp8="$2";    shift 2 ;;
       --attn)       attn="$2";   shift 2 ;;
+      --sage-scope) sage_scope="$2"; shift 2 ;;
       --compile)    compile="$2";shift 2 ;;
+      --lora)       lora="$2";   shift 2 ;;
+      --lora-strength) lora_strength="$2"; shift 2 ;;
       --port)       port="$2";   shift 2 ;;
       --fps)        fps="$2";    shift 2 ;;
       --image)      image="$2";  shift 2 ;;
@@ -174,20 +195,36 @@ cmd_run() {
   local gen_args=(
     --size "$SOULX_SIZE" --fps "$fps" --port "$port" --seed "$seed"
     --vae "$vae" --fp8 "$SOULX_FP8" --attn "$SOULX_ATTN" --compile "$compile"
+    --sage_scope "$sage_scope"
     --aux_device cpu --aux_url "http://127.0.0.1:$((port + 1))"
     --autostart
   )
   [[ -n "$image" ]] && gen_args+=(--image "$image")
+  if [[ -n "$lora" ]]; then
+    # accept a bare name in $SOULX_ROOT/lora as well as a path
+    [[ -f "$lora" ]] || lora="$SOULX_ROOT/lora/$lora"
+    [[ -f "$lora" ]] || die "run: no such LoRA: $lora"
+    gen_args+=(--lora "$lora" --lora_strength "$lora_strength")
+    echo "scope-soulx: lora=$(basename "$lora") strength=$lora_strength (POST /lora to change)"
+  fi
 
   echo "scope-soulx: $SOULX_SIZE | vae=$vae | $SOULX_PARALLEL on GPU $SOULX_GEN_GPUS"
   echo "scope-soulx: attn=$SOULX_ATTN fp8=$SOULX_FP8 compile=$compile -> :$port"
+  if [[ -n "${FAL_KEY:-}" ]]; then
+    echo "scope-soulx: appearance edits enabled (${SOULX_APPEARANCE_MODEL:-fal-ai/nano-banana/edit})"
+  else
+    echo "scope-soulx: appearance edits disabled (set FAL_KEY server-side)"
+  fi
   [[ "$compile" != off ]] && echo "scope-soulx: compile warmup is minutes; read timings from chunk 20+"
 
-  # SageAttention 2.2.0 produces noise/NaN on this pipeline; the shim makes the
-  # import fail so model_memory falls back to a backend that is known correct.
+  # No more nosage shim on PYTHONPATH. Sage used to be gated on a bare
+  # `try: import sageattention`, so merely having the package installed turned
+  # it on for every attention in the model and the stream filled with noise;
+  # breaking the import was the only off switch. It is now explicit
+  # (SOULX_ATTN=sage) and the kernel is verified against SDPA before use, so the
+  # package can sit installed and unused like any other optional dependency.
   local env_prefix=(
     env
-    "PYTHONPATH=$HERE/nosage:${PYTHONPATH:-}"
     "USE_CHANNELS_LAST_3D=1"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
     "CUDA_VISIBLE_DEVICES=$SOULX_GEN_GPUS"

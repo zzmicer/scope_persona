@@ -211,6 +211,18 @@ moves from prompts in realtime.
 - [~] Add character creation flow: deployed name, personality, reference-image
   upload/validation, and four Kokoro voice choices; chano39 remains the default
   fixture. Follow-ups: template gallery and content-safety validation.
+- [~] Add conversational appearance changes: `/change <instruction>` edits the
+  current reference image through a server-side external image provider, then
+  restarts the causal SoulX session with the new reference while keeping the
+  loaded model and persona configuration. Code/dependency/credential are staged
+  on the pod; real fal wedding-dress edit visually verified; 9/9 unit tests.
+  Final `/chat` -> session-restart verification awaits the next demo launch —
+  current 8092/8094 LoRA runs both predate the patched source and remain active.
+  Default editor switched from FLUX Kontext to Nano Banana
+  (`fal-ai/nano-banana/edit`) on 2026-08-02.
+- [ ] Authenticate the public SoulX control endpoints before treating paid
+  appearance editing as a production service; the prototype currently bounds
+  exposure with a single-flight call, cooldown, and per-process edit cap.
 - [x] Vidu-style live-call shell deployed on the H200 pod (2026-07-20): full-screen
   generated character, create/join screen, presence state, captions, mic/camera/
   end/chat controls, action drawer, mobile layout. Verified persona config,

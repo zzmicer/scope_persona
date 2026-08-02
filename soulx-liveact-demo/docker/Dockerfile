@@ -43,14 +43,16 @@ RUN pip install vllm==0.11.0
 RUN git clone --depth 1 https://github.com/ModelTC/LightX2V /tmp/LightX2V \
     && cd /tmp/LightX2V && python setup_vae.py install && rm -rf /tmp/LightX2V
 
-# Deliberately NOT installed: SageAttention. Its kernels produce noise/NaN on
-# this pipeline, the demo ships a shim that blocks the import anyway, and
-# building it added ~20 minutes to every environment build.
+# Deliberately NOT installed: SageAttention. `--attn sage` is supported and
+# self-verifying, but on the Hopper cards this image targets it is a dead end --
+# SageAttention 2.2.0's sm90 kernel returns garbage (rel err ~45 vs fp32 SDPA,
+# reproduced from a clean sm_90a source build) and its accurate kernels run at
+# 0.75-1.0x SDPA, against 1.9x for the FA3 path already in use. Installing it
+# costs ~4 minutes of build time for nothing. On an sm89/sm120 image, add it.
 
 WORKDIR /opt/soulx
 COPY SoulX-LiveAct/ /opt/soulx/SoulX-LiveAct/
 COPY ultraflash/ /opt/soulx/ultraflash/
-COPY nosage/ /opt/soulx/nosage/
 COPY scope-soulx /opt/soulx/scope-soulx
 COPY docker/entrypoint.sh /opt/soulx/entrypoint.sh
 # Reference images, used to seed a fresh volume's assets/ dir.

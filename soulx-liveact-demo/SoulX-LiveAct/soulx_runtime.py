@@ -197,10 +197,20 @@ def attention_backend(prefer: str | None = None) -> str:
     fa3 explicitly on a non-Hopper card is honoured as far as it can be -- it
     warns and falls back rather than failing the launch, because a wrong
     SOULX_ATTN should not cost a 15-minute model load.
+
+    "sage" is never chosen by auto. Measured on H200 (sm90) with SageAttention
+    2.2.0: the Hopper kernel is numerically broken (rel err ~45 against fp32
+    SDPA, at every shape, dtype and layout, from a clean sm_90a source build),
+    and the kernels that ARE accurate are the Ampere/Ada ones, which run 0.75-
+    1.0x SDPA here -- against FA3 at 1.9x. It stays available because that
+    verdict is per-architecture: on sm89/sm120 sage is the fastest option, and
+    model_liveact.sage_backend verifies the kernel before trusting it either way.
     """
     want = (prefer or os.environ.get("SOULX_ATTN") or "auto").lower()
     if want == "sdpa":
         return "sdpa"
+    if want == "sage":
+        return "sage"
 
     devices = gpus()
     cc = devices[0].cc if devices else (0, 0)

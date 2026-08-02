@@ -15,6 +15,7 @@ imageio-ffmpeg
 scikit-image
 loguru
 gradio>=5.0.0
+fal-client
 numpy
 xfuser==0.4.5
 pyloudnorm

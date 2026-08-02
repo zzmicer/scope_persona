@@ -28,53 +28,58 @@ Under sequence parallelism it is one process per rank:
   CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 interactive_demo.py ...
 """
 
-import os
 import argparse
+import concurrent.futures as _cf
+import gc
+import io
+import json
+import os
+import queue
+import shutil
+import struct
+import subprocess
 import threading
 import time
-import subprocess
-import shutil
-import json
-import gc
-import concurrent.futures as _cf
-import queue
 import urllib.request
-
-import io
-import struct
 from datetime import timedelta
 
+import lora as lora_mod
 import numpy as np
+import soulx_runtime
 import torch
 import torch.distributed as dist
 import torchaudio
 import torchaudio.transforms as T
-from torchvision import transforms
-from PIL import Image
+from appearance import (
+    AppearanceError,
+    AppearanceRateLimit,
+    FalAppearanceEditor,
+    parse_change_command,
+)
 from flask import (
     Flask,
+    jsonify,
+    render_template,
+    request,
     send_file,
     send_from_directory,
-    jsonify,
-    request,
-    render_template,
 )
 from flask_sock import Sock
-
+from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 from lightx2v.models.video_encoders.hf.wan.vae import WanVAE as LightVAE
+from PIL import Image
+from torchvision import transforms
+from transformers import Wav2Vec2FeatureExtractor
 from util_liveact import (
     center_rescale_crop_keep_ratio,
+    get_audio_emb,
     get_embedding,
     get_msk,
-    get_audio_emb,
 )
 from wan.modules.clip import CLIPModel
 from wan.modules.t5 import T5EncoderModel
-from src.audio_analysis.wav2vec2 import Wav2Vec2Model
-from transformers import Wav2Vec2FeatureExtractor
-from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 
-import soulx_runtime
+from src.audio_analysis.wav2vec2 import Wav2Vec2Model
 
 gc.collect()
 torch.cuda.empty_cache()
@@ -91,9 +96,10 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.jinja_env.auto_reload = True
 sock = Sock(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HLS_ROOT = os.path.join(BASE_DIR, "hls_output")
+HLS_ROOT = os.environ.get("SOULX_HLS_ROOT", os.path.join(BASE_DIR, "hls_output"))
 M3U8_NAME = "live.m3u8"
 os.makedirs(HLS_ROOT, exist_ok=True)
+appearance_editor = FalAppearanceEditor(os.path.join(BASE_DIR, "uploads"))
 
 SR = 16000  # everything audio inside the session is 16k mono float32
 
@@ -204,6 +210,23 @@ def _prune_uploads(dirpath, keep=5):
         pass  # best effort; a full uploads dir must never break a session start
 
 
+def _close_media_queue(q):
+    """Request worker shutdown without deadlocking on a full bounded queue."""
+
+    if q is None:
+        return
+    try:
+        q.put_nowait(None)
+    except queue.Full:
+        # Drop one stale media chunk. If the writer itself is blocked, the main
+        # session thread must still be able to kill ffmpeg and restart.
+        try:
+            q.get_nowait()
+            q.put_nowait(None)
+        except (queue.Empty, queue.Full):
+            pass
+
+
 def _clean_field(v):
     """Normalize an LLM JSON string field -> stripped str or None."""
     if not isinstance(v, str):
@@ -225,6 +248,9 @@ class SessionState:
         # rest = new sustained state; None leaves state unchanged (gesture),
         #        "" clears it back to neutral idle.
         self.pending_directive = None
+        # new LoRA strength, applied at the next chunk boundary (never mid-
+        # forward: the merge rewrites bf16 masters and re-quantizes fp8).
+        self.pending_lora_strength = None
         self.stop_flag = False
         self.start_params = queue.Queue()  # session start requests
         self.active = False
@@ -234,6 +260,10 @@ class SessionState:
         self.persona_name = "Chano"
         self.persona_prompt = DEFAULT_PERSONA
         self.voice = "af_heart"
+        self.current_image_path = None
+        self.current_main_prompt = WORLD_PROMPT
+        self.image_revision = 0
+        self.appearance_busy = False
 
     def log(self, kind, text):
         with self.lock:
@@ -460,6 +490,7 @@ class LiveEngine:
         # per-architecture features, so a bare `python interactive_demo.py` is
         # still safe on any box.
         os.environ["SOULX_ATTN"] = soulx_runtime.attention_backend(args.attn)
+        os.environ["SOULX_SAGE_SCOPE"] = args.sage_scope
         if args.fp8 != "off" and not soulx_runtime.fp8_supported():
             print(
                 f"[plan] fp8={args.fp8} requested but this GPU has no FP8 tensor "
@@ -484,9 +515,22 @@ class LiveEngine:
         self.wan = WanModel.from_pretrained(
             args.ckpt_dir, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False
         ).to(dtype=torch.bfloat16)
+        # LoRA goes in here, on CPU, while the targets are still plain
+        # nn.Linear: after enable_fp8_gemm the bf16 weights are quantized (and
+        # by default freed), and after torch.compile a weight edit invalidates
+        # every graph. See lora.py for the merge-vs-adapter reasoning.
+        self.lora = lora_mod.load_and_merge(self.wan, args.lora, args.lora_strength)
         if args.fp8 != "off":
             mf = None if args.fp8 == "all" else _fp8_block_matmuls
-            enable_fp8_gemm(self.wan, options=FP8GemmOptions(), module_filter=mf)
+            # Keeping the bf16 masters on CPU is what lets /lora change the
+            # strength without a restart. ~28GB of host RAM on the wrapped
+            # linears, no VRAM cost -- the weights leave the GPU either way.
+            storage = "cpu_offload" if self.lora is not None else "discard"
+            enable_fp8_gemm(
+                self.wan,
+                options=FP8GemmOptions(fp16_weight_storage=storage),
+                module_filter=mf,
+            )
             wrapped = sum(
                 1 for m in self.wan.modules() if type(m).__name__ == "FP8Linear"
             )
@@ -1038,10 +1082,22 @@ class LiveEngine:
                 if self.rank == 0:
                     stop = STATE.stop_flag
                     directive = None
+                    new_strength = None
                     with STATE.lock:
                         if STATE.pending_directive is not None:
                             directive = STATE.pending_directive
                             STATE.pending_directive = None
+                        if STATE.pending_lora_strength is not None:
+                            new_strength = STATE.pending_lora_strength
+                            STATE.pending_lora_strength = None
+                    if new_strength is not None and self.lora is not None:
+                        t0 = time.time()
+                        self.lora.set_strength(new_strength)
+                        STATE.log(
+                            "lora",
+                            f"strength -> {new_strength} "
+                            f"({time.time() - t0:.1f}s)",
+                        )
                     # window in frames: [start_f, end_f+2)
                     if iteration == 0:
                         start_f, end_f = 0, self.frame_num_init
@@ -1233,11 +1289,8 @@ class LiveEngine:
                 iteration += 1
         finally:
             if self.rank == 0:
-                try:
-                    vq.put(None)
-                    aq.put(None)
-                except Exception:
-                    pass
+                _close_media_queue(vq)
+                _close_media_queue(aq)
                 if hls_proc is not None:
                     try:
                         hls_proc.wait(timeout=10)
@@ -1318,12 +1371,40 @@ def index():
 
 @app.route("/character/default")
 def default_character():
-    return send_file(engine.args.image)
+    with STATE.lock:
+        img_path = STATE.current_image_path or engine.args.image
+    return send_file(img_path)
+
+
+def _queue_session_start(img_path, main_prompt):
+    """Queue one ordered causal-session swap and return whether it is a restart."""
+
+    with STATE.speech_q.mutex:
+        STATE.speech_q.queue.clear()
+    # The reference image is encoded once at session start and then lives in the
+    # rolling KV cache, so a new one means a NEW session. Rather than making the
+    # client stop/poll/start, queue the params and ask any running session to
+    # stop: control_loop_rank0 is blocked inside run_session and only pops
+    # start_params once that returns, so the swap happens in order.
+    restarting = STATE.active
+    with STATE.lock:
+        while True:  # drop superseded requests so we start exactly one session
+            try:
+                STATE.start_params.get_nowait()
+            except queue.Empty:
+                break
+        STATE.current_image_path = img_path
+        STATE.current_main_prompt = main_prompt
+        STATE.image_revision = time.time_ns()
+        STATE.start_params.put({"img_path": img_path, "main_prompt": main_prompt})
+        STATE.stop_flag = restarting
+    return restarting
 
 
 @app.route("/session/start", methods=["POST"])
 def session_start():
-    img_path = engine.args.image
+    with STATE.lock:
+        img_path = STATE.current_image_path or engine.args.image
     f = request.files.get("img_file")
     if f:
         # unique name per upload: the previous reference may still be mmap'd by
@@ -1354,22 +1435,7 @@ def session_start():
         return jsonify(
             {"status": "ok", "restarting": False, "persona": persona_payload()}
         )
-    with STATE.speech_q.mutex:
-        STATE.speech_q.queue.clear()
-    # The reference image is encoded once at session start and then lives in the
-    # rolling KV cache, so a new one means a NEW session. Rather than making the
-    # client stop/poll/start, queue the params and ask any running session to
-    # stop: control_loop_rank0 is blocked inside run_session and only pops
-    # start_params once that returns, so the swap happens in order.
-    restarting = STATE.active
-    with STATE.lock:
-        while True:  # drop superseded requests so we start exactly one session
-            try:
-                STATE.start_params.get_nowait()
-            except queue.Empty:
-                break
-        STATE.start_params.put({"img_path": img_path, "main_prompt": main_prompt})
-        STATE.stop_flag = restarting
+    restarting = _queue_session_start(img_path, main_prompt)
     STATE.log("system", "restarting with a new character" if restarting else "starting")
     return jsonify(
         {"status": "ok", "restarting": restarting, "persona": persona_payload()}
@@ -1452,6 +1518,61 @@ def chat():
     if not msg:
         return jsonify({"status": "error", "message": "empty"}), 400
     STATE.log("user", msg)
+    change_instruction = parse_change_command(msg)
+    if change_instruction is not None:
+        if not change_instruction:
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "usage: /change <describe the new appearance>",
+                    }
+                ),
+                400,
+            )
+        with STATE.lock:
+            if STATE.appearance_busy:
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "message": "another appearance change is still running",
+                        }
+                    ),
+                    409,
+                )
+            STATE.appearance_busy = True
+            source_path = STATE.current_image_path or engine.args.image
+            main_prompt = STATE.current_main_prompt
+        STATE.log("system", "Creating the new appearance…")
+        try:
+            img_path = appearance_editor.edit(source_path, change_instruction)
+            restarting = _queue_session_start(img_path, main_prompt)
+        except AppearanceRateLimit as exc:
+            STATE.log("error", str(exc))
+            return jsonify({"status": "error", "message": str(exc)}), 429
+        except AppearanceError as exc:
+            STATE.log("error", str(exc))
+            return jsonify({"status": "error", "message": str(exc)}), 502
+        finally:
+            with STATE.lock:
+                STATE.appearance_busy = False
+        message = (
+            "New appearance ready; restarting the live character…"
+            if restarting
+            else "New appearance ready; starting the live character…"
+        )
+        STATE.log("system", message)
+        return jsonify(
+            {
+                "status": "ok",
+                "say": "",
+                "action": None,
+                "pose": None,
+                "appearance": True,
+                "restarting": restarting,
+            }
+        )
     try:
         say_text, action_text, pose_text = brain.reply(msg)
     except Exception as e:
@@ -1475,6 +1596,39 @@ def chat():
     )
 
 
+@app.route("/lora", methods=["POST"])
+def lora_strength():
+    """Change the merged LoRA strength without a restart.
+
+    Applied at the next chunk boundary by the generation loop, because the
+    merge rewrites the bf16 master weights and forces an fp8 requantize --
+    doing that under a running forward would tear the weights mid-chunk.
+    A full warmup is ~10 minutes, so this is what makes a strength sweep
+    cost one launch instead of one per point.
+    """
+    if engine.lora is None:
+        return jsonify({"status": "error", "message": "no LoRA loaded"}), 400
+    if engine.use_dist:
+        # Each rank holds its own copy of the weights; a rank-0-only merge
+        # would silently desync them. Would need a broadcast at the barrier.
+        return jsonify(
+            {"status": "error", "message": "strength swap is single-GPU only"}
+        ), 400
+    try:
+        value = float(request.get_json(force=True).get("strength"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "strength must be a number"}), 400
+    with STATE.lock:
+        STATE.pending_lora_strength = value
+    if not STATE.active:
+        # nothing is generating, so nobody will reach the chunk boundary
+        engine.lora.set_strength(value)
+        with STATE.lock:
+            STATE.pending_lora_strength = None
+        return jsonify({"status": "ok", "strength": value, "applied": "now"})
+    return jsonify({"status": "ok", "strength": value, "applied": "next chunk"})
+
+
 @app.route("/status")
 def status():
     with STATE.lock:
@@ -1489,6 +1643,20 @@ def status():
             "error": STATE.last_error,
             "events": ev,
             "persona": persona_payload(),
+            "appearance": {
+                "busy": STATE.appearance_busy,
+                "configured": appearance_editor.configured,
+                "image_url": f"/character/default?v={STATE.image_revision}",
+            },
+            "lora": (
+                None
+                if engine.lora is None
+                else {
+                    "name": engine.lora.name,
+                    "strength": engine.lora.strength,
+                    "modules": engine.lora.n_modules,
+                }
+            ),
         }
     )
 
@@ -1594,9 +1762,21 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--attn",
-        choices=["auto", "sdpa", "fa3"],
+        choices=["auto", "sdpa", "fa3", "sage"],
         default="auto",
-        help="self-attention backend; 'auto' picks FA3 on Hopper and SDPA elsewhere",
+        help="self-attention backend; 'auto' picks FA3 on Hopper and SDPA "
+        "elsewhere. 'sage' is SageAttention (int8 QK / fp8 PV) and is never "
+        "picked by auto: on sm90 its Hopper kernel is numerically broken and "
+        "the accurate ones are slower than SDPA. The kernel is verified against "
+        "SDPA at first use and falls back rather than streaming noise.",
+    )
+    parser.add_argument(
+        "--sage_scope",
+        default="self",
+        help="which attentions sage covers: 'self' (default), 'all', or a "
+        "combination like 'self+cross'. Same reasoning as --fp8: cross-attention "
+        "(257 image + 512 text tokens) and audio cross-attention (~32 tokens) "
+        "carry almost no FLOPs but drive identity and lipsync.",
     )
     parser.add_argument(
         "--compile",
@@ -1613,9 +1793,32 @@ if __name__ == "__main__":
         default="max-autotune-no-cudagraphs",
     )
     parser.add_argument(
+        "--lora",
+        default=os.environ.get("SOULX_LORA", ""),
+        help="path to a kohya-format LoRA (.safetensors, lora_unet_* keys) to "
+        "merge into the DiT at load time. Merged, not run as an adapter, so "
+        "s/chunk and VRAM stay comparable to a no-LoRA run. The strength can "
+        "be changed at runtime via POST /lora without a restart.",
+    )
+    parser.add_argument(
+        "--lora_strength",
+        type=float,
+        default=float(os.environ.get("SOULX_LORA_STRENGTH", "1.0")),
+        help="LoRA merge strength (default 1.0). The DiT is distilled to a "
+        "4-step schedule, so a LoRA trained for many-step inference usually "
+        "wants a value well below 1.0; sweep it via POST /lora.",
+    )
+    parser.add_argument(
         "--autostart", action="store_true", help="start session immediately"
     )
     args = parser.parse_args()
+
+    # Separate FIFOs/segments for simultaneous debug or A/B processes. Sharing
+    # hls_output/live made one port open another port's FIFO and deadlocked a
+    # character restart while its media queues filled.
+    if "SOULX_HLS_ROOT" not in os.environ:
+        HLS_ROOT = os.path.join(BASE_DIR, "hls_output", str(args.port))
+    os.makedirs(HLS_ROOT, exist_ok=True)
 
     if not args.image:
         raise SystemExit(
@@ -1629,11 +1832,11 @@ if __name__ == "__main__":
     if engine.rank == 0:
         tts = TTS(args.aux_device, args.aux_url)
         brain = Brain(args.aux_device, args.aux_url)
+        STATE.current_image_path = args.image
+        STATE.image_revision = time.time_ns()
         threading.Thread(target=control_loop_rank0, daemon=True).start()
         if args.autostart:
-            STATE.start_params.put(
-                {"img_path": args.image, "main_prompt": WORLD_PROMPT}
-            )
+            _queue_session_start(args.image, WORLD_PROMPT)
         print(
             f"\n LiveAct interactive demo on http://0.0.0.0:{args.port}\n", flush=True
         )

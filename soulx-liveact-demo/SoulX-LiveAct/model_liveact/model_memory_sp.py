@@ -19,16 +19,11 @@ from diffusers.loaders import PeftAdapterMixin
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 from .attention import flash_attention, sdpa_attention, flex_attention
+from .sage_backend import (SAGE_AUDIO, SAGE_CROSS, SAGE_SELF, resolved_name,
+                           sage_attn)
 from fp8_gemm import FP8Linear
 import logging
 
-try:
-    from sageattention import sageattn
-
-    USE_SAGEATTN = True
-    logging.info("Using sageattn")
-except:
-    USE_SAGEATTN = False
 from yunchang.kernels import AttnType
 
 __all__ = ['WanModel']
@@ -36,10 +31,28 @@ __all__ = ['WanModel']
 
 _LCA_SINGLETON = None
 
+def _lca_attn_type():
+    """FlashAttention unless a verified sage kernel backs yunchang's sage path.
+
+    yunchang's SAGE_FP8_SM90 calls `sageattn_qk_int8_pv_fp8_cuda_sm90` and
+    nothing else, so asking for it when a DIFFERENT kernel is the one that
+    passed verification would reintroduce the noise this backend exists to
+    avoid. Requesting it unconditionally is also how the original bug shipped.
+    """
+    if not SAGE_SELF:
+        return AttnType.FA
+    if resolved_name() != "sageattn_qk_int8_pv_fp8_cuda_sm90":
+        print("[sage] sequence-parallel self-attention stays on FlashAttention: "
+              "yunchang's sage path needs the sm90 kernel, which is not the one "
+              "that verified here", flush=True)
+        return AttnType.FA
+    return AttnType.SAGE_FP8_SM90
+
+
 def _get_lca():
     global _LCA_SINGLETON
     if _LCA_SINGLETON is None:
-        _LCA_SINGLETON = xFuserLongContextAttention(attn_type=AttnType.FA)
+        _LCA_SINGLETON = xFuserLongContextAttention(attn_type=_lca_attn_type())
     return _LCA_SINGLETON
 
 
@@ -384,9 +397,11 @@ class WanI2VCrossAttention(nn.Module):
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
 
-        if USE_SAGEATTN:
-            img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
-            x = sageattn(q, k, v, tensor_layout='NHD')
+        # See model_memory.py: cross-attention is outside the default sage scope.
+        sage_img = sage_attn(q, k_img, v_img, tensor_layout='NHD') if SAGE_CROSS else None
+        if sage_img is not None:
+            img_x = sage_img
+            x = sage_attn(q, k, v, tensor_layout='NHD')
         else:
             img_x = sdpa_attention(q, k_img, v_img, k_lens=None)
             x = sdpa_attention(q, k, v, k_lens=context_lens)
@@ -463,8 +478,12 @@ class SingleStreamAttention(nn.Module):
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
-        if USE_SAGEATTN:
-            x = sageattn(q, encoder_k, encoder_v, tensor_layout='HND')
+        # Audio cross-attention drives lipsync off a ~32-token window -- the
+        # smallest and most sensitive attention in the model. Sage only touches
+        # it under SOULX_SAGE_SCOPE=all.
+        sage_x = sage_attn(q, encoder_k, encoder_v, tensor_layout='HND') if SAGE_AUDIO else None
+        if sage_x is not None:
+            x = sage_x
         else:
             x = torch.nn.functional.scaled_dot_product_attention(
                 q, encoder_k, encoder_v, attn_mask=None, is_causal=False, dropout_p=0.0)  # [f, 40, N_h*N_w, head_dim]

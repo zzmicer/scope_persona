@@ -14,17 +14,10 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
 
 from .attention import flash_attention, SingleStreamAttention, sdpa_attention, flex_attention
+from .sage_backend import SAGE_CROSS, SAGE_SELF, sage_attn
 from fp8_gemm import FP8Linear
 from fp4_gemm import FP4Linear
 import logging
-
-try:
-    from sageattention import sageattn
-
-    USE_SAGEATTN = True
-    logging.info("Using sageattn")
-except:
-    USE_SAGEATTN = False
 
 # Self-attention backend, resolved by soulx_runtime.attention_backend() and
 # passed in through SOULX_ATTN because this decision has to be made at import
@@ -327,20 +320,24 @@ class WanSelfAttention(nn.Module):
         roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         roped_key = causal_rope_apply(k_cache, grid_sizes, freqs, start_frame=0).type_as(v)
 
+        sage_x = None
+        if SAGE_SELF:
+            sage_x = sage_attn(
+                roped_query,
+                roped_key[:, :end_idx, ...],
+                v_cache[:, :end_idx, ...],
+                tensor_layout="NHD",
+                is_causal=False,
+            )
+
         if USE_FA3:
             x = _fa3_attn(
                 roped_query,
                 roped_key[:, :end_idx, ...],
                 v_cache[:, :end_idx, ...],
             ).type_as(x)
-        elif USE_SAGEATTN:
-            x = sageattn(
-                roped_query,
-                roped_key[:, :end_idx, ...],
-                v_cache[:, :end_idx, ...],
-                tensor_layout="NHD",
-                is_causal=False,
-            ).type_as(x)
+        elif sage_x is not None:
+            x = sage_x.type_as(x)
         else:
             x = sdpa_attention(
                 q=roped_query,
@@ -411,9 +408,14 @@ class WanI2VCrossAttention(nn.Module):
         #     # print('----use cross_kv_cache!!!')
         #     k, v, k_img, v_img = \
         #         cross_kv_cache['k'], cross_kv_cache['v'], cross_kv_cache['k_img'], cross_kv_cache['v_img']
-        if USE_SAGEATTN:
-            img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
-            x = sageattn(q, k, v, tensor_layout='NHD')
+        # Off by default: 257 image tokens and 512 text tokens are tiny next to
+        # the 3-frame query, so quantizing them buys almost no time while
+        # touching identity (k_img) and the prompt context directly. Note the
+        # sage path also drops the `context_lens` mask, as upstream's did.
+        sage_img = sage_attn(q, k_img, v_img, tensor_layout='NHD') if SAGE_CROSS else None
+        if sage_img is not None:
+            img_x = sage_img
+            x = sage_attn(q, k, v, tensor_layout='NHD')
         else:
             # img_x = flash_attention(q, k_img, v_img, k_lens=None)
             img_x = sdpa_attention(q, k_img, v_img, k_lens=None)
@@ -533,7 +535,7 @@ class WanAttentionBlock(nn.Module):
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             start_f = start_idx // frame_seqlen
             x_a = self.audio_cross_attn(self.norm_x(x), encoder_hidden_states=audio_embedding,
-                                        shape=grid_sizes[0], start_f=start_f, USE_SAGEATTN=USE_SAGEATTN)
+                                        shape=grid_sizes[0], start_f=start_f)
             if start_f == 0:
                 x_a[:, :frame_seqlen] = 0
             x = x + x_a

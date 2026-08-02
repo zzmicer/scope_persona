@@ -152,12 +152,20 @@ Two traps that have each cost a run:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /chat` | LLM decides `{say, action, pose}` |
+| `POST /chat` | LLM decides `{say, action, pose}`; `/change <instruction>` edits the current reference and restarts its causal session |
 | `POST /say` | speak exact text (Kokoro TTS, lip-synced) |
 | `POST /action` | perform a motion; `{pose}` or `{persist:true}` makes it stick |
 | `POST /session/{start,stop}` | restart the stream |
 | `GET /status` | `{active, chunks, error, queued_speech_s}` |
 | `WS /ws` | binary stream: `struct("<Bd", mtype, ts) + payload`, mtype 0 = JPEG, 1 = PCM16 |
+
+Conversational appearance changes require `FAL_KEY` in the demo process
+environment. The default endpoint is `fal-ai/nano-banana/edit`; override it
+with `SOULX_APPEARANCE_MODEL`. Keep the key server-side—never expose it through
+the page or pass it as a launcher argument. On the bare-pod layout,
+`scope-soulx` reads an optional mode-600 `/root/.config/soulx/secrets.env` (or
+`SOULX_SECRETS_FILE`); do not store it on a volume that ignores `chmod`. In
+Docker, use the platform's secret/env-file support.
 
 ## Known open items
 
