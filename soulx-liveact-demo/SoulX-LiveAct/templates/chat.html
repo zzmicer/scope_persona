@@ -709,6 +709,9 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             🔄 Turn
           </button>
           <button onclick="doAction('')">Idle</button>
+          <button onclick="keepPose()" title="Make the pose she is in right now her new resting pose">
+            📌 Pin this pose
+          </button>
         </div>
         <div class="composer">
           <select id="mode" onchange="syncPlaceholder()">
@@ -958,6 +961,20 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+      }
+      async function keepPose() {
+        // promote the current frame to the reference image, so the pose stops
+        // being something the prompt has to win back every chunk
+        try {
+          await api("/anchor", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+          toast("Pinning this pose — back in a few seconds");
+        } catch (error) {
+          addMsg("error", error.message);
+        }
       }
       function syncPlaceholder() {
         document.getElementById("text").placeholder =

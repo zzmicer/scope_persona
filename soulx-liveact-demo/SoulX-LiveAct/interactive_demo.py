@@ -260,6 +260,10 @@ class SessionState:
         self.state_prompt = ""
         self.transition_prompt = None
         self.transition_ttl = 0
+        # newest emitted frame, so /anchor can make the pose she is CURRENTLY in
+        # the new reference image. Plain attribute: one writer (the video worker)
+        # and readers only ever want the latest, so a lock would buy nothing.
+        self.last_frame = None
         # new LoRA strength, applied at the next chunk boundary (never mid-
         # forward: the merge rewrites bf16 masters and re-quantizes fp8).
         self.pending_lora_strength = None
@@ -846,32 +850,32 @@ class LiveEngine:
         if dist.is_initialized():
             dist.barrier()
 
-    # --- the live session ----------------------------------------------------
-    def run_session(self, params):
-        """Runs on ALL ranks. rank0 additionally drives io/HLS."""
-        img_path = params["img_path"]
-        main_prompt = params.get("main_prompt") or WORLD_PROMPT
+    def _encode_reference(self, img_path):
+        """CLIP + VAE conditioning for a reference image.
 
-        self._reset_kv()
+        Both outputs are handed to the model fresh on EVERY chunk (arg["y"],
+        arg["clip_fea"]) and are never folded into the KV cache, which is what
+        lets /anchor swap the reference mid-session without restarting.
+
+        `WanVAE_.encode` opens with `clear_cache()`, which resets the DECODER
+        feature map as well as the encoder's. At session start that is harmless
+        (the decoder is cold anyway), but mid-session it would silently wipe the
+        causal cache StreamingDecode is carrying between chunks -- and since
+        StreamingDecode tracks warmth with its own `_first` flag, it would go on
+        decoding as though the cache were still warm. So save the decoder half
+        and put it back.
+        """
+        vae_model = getattr(self.vae, "model", None)
+        saved = None
+        if vae_model is not None and hasattr(vae_model, "_feat_map"):
+            saved = (vae_model._feat_map, vae_model._conv_idx)
+
         image = Image.open(img_path).convert("RGB")
         cond = (
             self.transform(image)
             .unsqueeze(1)
             .unsqueeze(0)
             .to(self.device, torch.bfloat16)
-        )
-        with torch.no_grad():
-            clip_ctx = self.clip.visual(cond)
-        # dedicated RNG: rank0-only ops (kokoro TTS, LLM sampling) consume the global
-        # CUDA RNG and desync latent noise across SP ranks -> half-frame corruption
-        latent_gen = torch.Generator(device=f"cuda:{self.device}")
-        latent_gen.manual_seed(self.args.seed)
-        ref_masks = torch.ones(
-            3,
-            self.height // self.vae_stride[1],
-            self.width // self.vae_stride[2],
-            device=self.device,
-            dtype=torch.bfloat16,
         )
         msk = get_msk(self.frame_num_init, cond, self.vae_stride, self.device)
         pad = torch.zeros(
@@ -884,13 +888,37 @@ class LiveEngine:
             dtype=torch.bfloat16,
         )
         with torch.no_grad():
+            clip_ctx = self.clip.visual(cond)
             y = (
                 self.vae.encode(torch.concat([cond, pad], dim=2))
                 .to(self.device)
                 .unsqueeze(0)
             )
         y = torch.concat([msk, y], dim=1)
-        y_cut = y[:, :, : self.frame_num_init // 4 + 1, ...]
+
+        if saved is not None:
+            vae_model._feat_map, vae_model._conv_idx = saved
+        return clip_ctx, y[:, :, : self.frame_num_init // 4 + 1, ...]
+
+    # --- the live session ----------------------------------------------------
+    def run_session(self, params):
+        """Runs on ALL ranks. rank0 additionally drives io/HLS."""
+        img_path = params["img_path"]
+        main_prompt = params.get("main_prompt") or WORLD_PROMPT
+
+        self._reset_kv()
+        clip_ctx, y_cut = self._encode_reference(img_path)
+        # dedicated RNG: rank0-only ops (kokoro TTS, LLM sampling) consume the global
+        # CUDA RNG and desync latent noise across SP ranks -> half-frame corruption
+        latent_gen = torch.Generator(device=f"cuda:{self.device}")
+        latent_gen.manual_seed(self.args.seed)
+        ref_masks = torch.ones(
+            3,
+            self.height // self.vae_stride[1],
+            self.width // self.vae_stride[2],
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
 
         # world + event decomposition: world = persistent identity/scene, state =
         # sustained held posture (sticky), transition = transient motion (held then
@@ -997,6 +1025,10 @@ class LiveEngine:
                             pass
                         return
                     arr, start_frame = item  # arr: [T,H,W,C] uint8
+                    # keep the newest emitted frame so /anchor can promote it to
+                    # the reference image. Copied, not viewed: arr belongs to the
+                    # generator and is reused.
+                    STATE.last_frame = arr[-1].copy()
                     try:
                         hls_proc.stdin.write(arr.tobytes())
                     except Exception as e:
@@ -1096,7 +1128,11 @@ class LiveEngine:
                     directive = None
                     new_strength = None
                     with STATE.lock:
-                        if STATE.pending_directive is not None:
+                        # leave a directive alone when this session is on its way
+                        # out: we would consume it here and then break before
+                        # applying it, swallowing a pose that /anchor queued for
+                        # the session about to replace us
+                        if not stop and STATE.pending_directive is not None:
                             directive = STATE.pending_directive
                             STATE.pending_directive = None
                         if STATE.pending_lora_strength is not None:
@@ -1127,7 +1163,11 @@ class LiveEngine:
                             self.first_frames + (iteration - 1) * self.adv_frames
                         ) * self.spf
                         heard = slice_abs(a0, a0 + self.adv_frames * self.spf)
-                    payload = {"stop": stop, "directive": directive, "win": win}
+                    payload = {
+                        "stop": stop,
+                        "directive": directive,
+                        "win": win,
+                    }
                 else:
                     payload = None
                 if self.use_dist:
@@ -1649,6 +1689,67 @@ def action_hold():
         STATE.action_hold = chunks
     STATE.log("system", f"action hold -> {chunks} chunks (~{chunks * 2}s)")
     return jsonify({"status": "ok", "chunks": chunks, "seconds": chunks * 2})
+
+
+@app.route("/anchor", methods=["POST"])
+def anchor():
+    """Promote the frame she is in RIGHT NOW to the reference image.
+
+    A pose typed into /action only ever composes onto the T5 prompt, while the
+    reference image is re-imposed every chunk -- so where the two disagree the
+    reference wins and she slides back to it. That is the "it regressed to the
+    idle pic" complaint, and no prompt wording or LoRA strength fixes it,
+    because the I2V reference path (img_emb, cross_attn.k_img/v_img) is not
+    reachable from either.
+
+    Anchoring inverts it: get her into the pose however you like, then make THAT
+    frame the thing being re-imposed. The pose stops being something the prompt
+    has to win every chunk and becomes the resting state.
+
+    This restarts the causal session, and it has to. Rebinding the per-chunk
+    conditioning (y/clip_fea) instead was tried and measured: seamless, 0.35s,
+    no stall or artifacts -- and useless, because she reverted to the old pose
+    within seconds. Pose is carried by the rolling KV cache, not by the
+    conditioning arguments, so the cache is exactly what has to be re-seeded.
+
+    The restart is cheap: ~3-4s with the model resident (1.8s to finish the
+    current chunk, ~0.9s to swap, ~1.2s for the first chunk). It is /change
+    that feels slow, and that is its external image-edit API call, not this.
+
+    The sustained state prompt is KEPT, not cleared. Measured the hard way: the
+    reference image governs identity, wardrobe and scene, but NOT posture -- she
+    relaxes to a neutral resting pose within ~15s whatever the reference shows,
+    even when it is a frame of her with both arms raised. What actually holds a
+    pose is the state text, which held one for 24s+ in an earlier recording. So
+    clearing it here (the obvious-looking move, since the picture "already shows"
+    the pose) is precisely what un-pins the pose.
+
+    Body: {"pose": str|null}. Omitted -> whatever state is currently held stays
+    held. Pass a pose to overwrite it, or "" to deliberately clear it.
+    """
+    frame = STATE.last_frame
+    if frame is None:
+        return jsonify(
+            {"status": "error", "message": "no frame yet; start the session first"}
+        ), 409
+    body = request.get_json(silent=True) or {}
+    pose = body.get("pose")
+
+    img_path = os.path.join(BASE_DIR, "uploads", f"anchor_{time.time_ns()}.png")
+    os.makedirs(os.path.dirname(img_path), exist_ok=True)
+    Image.fromarray(frame).save(img_path)
+    _prune_uploads(os.path.dirname(img_path), keep=5)
+
+    with STATE.lock:
+        main_prompt = STATE.current_main_prompt
+        # carry the held state across the restart: the loop starts a new session
+        # with state_prompt="" and picks the directive up on its first chunk, so
+        # without this the pose would be dropped by the very act of pinning it
+        rest = STATE.state_prompt if pose is None else pose.strip()
+        STATE.pending_directive = {"transition": None, "rest": rest}
+    _queue_session_start(img_path, main_prompt)
+    STATE.log("system", "pinned her current pose as the new resting pose")
+    return jsonify({"status": "ok", "pose": pose or ""})
 
 
 @app.route("/lora", methods=["POST"])
