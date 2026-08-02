@@ -397,6 +397,52 @@ def decoder_help() -> str:
     return "\n".join(rows)
 
 
+class StreamingDecode:
+    """A causal decode that carries its feature cache from one chunk to the next.
+
+    The Wan VAE is a CAUSAL 3D VAE -- `CausalConv3d` layers with a per-conv
+    feature cache -- and `lightvaew2_1` is the same architecture pruned to 25%
+    of its width (`use_lightvae=True` only sets `pruning_rate=0.75`). But
+    `decode()` calls `clear_decode_cache()` on entry AND exit, so every chunk is
+    decoded cold, and the caller has to re-approximate the lost history by
+    prepending the previous chunk's last latents and discarding the pixel frames
+    it just paid to decode. `cached_decode_withflag` keeps the cache instead,
+    which is both what the architecture is for and strictly less work.
+
+    This deliberately BREAKS the `(C,T,h,w) -> T*4-3` contract the other
+    decoders honour: only the FIRST chunk of a sequence pays the 3-frame
+    warm-up, and every chunk after it returns a full `T*4`. That is why callers
+    must branch on `.streaming` and stop windowing -- feeding a windowed latent
+    to this would decode the overlap twice AND emit too many frames, which A/V
+    sync would notice before anyone saw a seam.
+    """
+
+    streaming = True
+
+    def __init__(self, model):
+        self.model = model
+        self._first = True
+
+    def __call__(self, latent):
+        out = self.model.cached_decode_withflag(latent, self._first, False)
+        self._first = False
+        return out
+
+    def reset(self) -> None:
+        """Begin a new causal sequence. Call between sessions, and after warmup."""
+        self._first = True
+
+
+def stream_decode_enabled() -> bool:
+    """Should a decoder that CAN carry its causal cache across chunks do so?
+
+    `SOULX_STREAM_DECODE=0` restores the cold-cache decode plus the caller's
+    overlap window, so both paths stay measurable against each other on one
+    binary. Applies to every causal decoder -- `wan` and `lightvaew2_1` alike.
+    """
+    return os.environ.get("SOULX_STREAM_DECODE", "1") != "0"
+
+
 def build_decode_fn(key: str, device, p: Paths | None = None) -> Callable | None:
     """Return a drop-in replacement for `WanVAE.decode`, or None to keep it.
 
@@ -449,7 +495,9 @@ def build_decode_fn(key: str, device, p: Paths | None = None) -> Callable | None
             use_lightvae=True,
             parallel=False,
         )
-        return lambda latent, _m=model: _m.decode(latent)
+        if not stream_decode_enabled():
+            return lambda latent, _m=model: _m.decode(latent)
+        return StreamingDecode(model)
 
     if spec.kind == "v3":
         # Optional: the reconstruction lives outside this tree.

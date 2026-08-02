@@ -84,6 +84,11 @@ torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cudnn.allow_tf32 = True
 
 app = Flask(__name__)
+# Jinja caches the compiled template, and reloading this process costs minutes
+# of weight load plus compile warmup. A stat() per page render is nothing next
+# to that -- the page is fetched once per viewer, not once per frame.
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 sock = Sock(app)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HLS_ROOT = os.path.join(BASE_DIR, "hls_output")
@@ -606,21 +611,46 @@ class LiveEngine:
             self.wan.blocks[n].self_attn.init_kvidx(self.frame_len, self.world_size)
 
         self.vae.model.eval()
+        # 'wan' has no registry entry to build: it decodes through the very VAE
+        # object constructed above, which also does encode. So its streaming
+        # wrapper goes around THAT instance. Decide before compiling -- the two
+        # paths have different entry points.
+        # Not under sequence parallelism: `decode` splits 1D there while
+        # `cached_decode_withflag` only has a 2D-grid path, so the streaming
+        # version would not be the same computation.
+        stream_wan = (
+            args.vae == "wan"
+            and soulx_runtime.stream_decode_enabled()
+            and not self.use_dist
+        )
         # Only the full Wan VAE's decode is worth compiling; the tiny decoders
         # are ~32ms and replace this call site outright.
         if args.compile != "off" and args.vae == "wan":
-            self.vae.decode = torch.compile(self.vae.decode)
+            if stream_wan:
+                self.vae.cached_decode_withflag = torch.compile(
+                    self.vae.cached_decode_withflag
+                )
+            else:
+                self.vae.decode = torch.compile(self.vae.decode)
 
         # Swap the decoder AFTER any torch.compile of the real one. self.vae.encode
         # is untouched either way -- the reference image still goes through the
         # full Wan VAE, only the per-chunk decode is replaced.
         decode_fn = soulx_runtime.build_decode_fn(args.vae, self.device)
+        if decode_fn is None and stream_wan:
+            decode_fn = soulx_runtime.StreamingDecode(self.vae)
+        self.fast_dec = None
         if decode_fn is not None:
             self.fast_dec = decode_fn
             self.vae.decode = decode_fn
+        # A streaming decoder keeps the VAE's causal cache across chunks, so it
+        # takes ONLY the new latents and returns a full T*4 frames. Windowing it
+        # would decode the overlap twice and emit 9 frames too many.
+        self.stream_dec = getattr(decode_fn, "streaming", False)
         if self.rank == 0:
             spec = soulx_runtime.DECODERS[args.vae]
-            print(f"[decoder] {spec.label} -- {spec.note}", flush=True)
+            how = "streaming causal cache" if self.stream_dec else "3-latent window"
+            print(f"[decoder] {spec.label} ({how}) -- {spec.note}", flush=True)
 
         # per-chunk geometry
         self.frame_num_init = (sum(self.blksz_lst) - 1) * 4 + 1  # 53
@@ -711,6 +741,8 @@ class LiveEngine:
             )
             audio_embs = self._embed_window(dummy_win)
             pre_latent = None
+            if self.stream_dec:
+                self.fast_dec.reset()
             for it in range(2):
                 f = 0 if it == 0 else 1
                 latent = torch.randn(
@@ -746,7 +778,7 @@ class LiveEngine:
                         )[0]
                         dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
                         latent = latent + (-noise) * dt[0]
-                    if it == 0:
+                    if self.stream_dec or it == 0:
                         _ = self.vae.decode(latent)
                     else:
                         _ = self.vae.decode(
@@ -986,6 +1018,11 @@ class LiveEngine:
             return out
 
         pre_latent = None
+        # The warmup decodes into the same causal cache; a session must not
+        # inherit its state, and a restarted session must not inherit the dead
+        # one's -- both are the same reset.
+        if self.stream_dec:
+            self.fast_dec.reset()
         sr_u8 = None
         sr_job = None
         sr_inflight = []
@@ -1102,7 +1139,7 @@ class LiveEngine:
                             if self.rank == 0
                             else None
                         )
-                    elif iteration == 0:
+                    elif self.stream_dec or iteration == 0:
                         vids = self.vae.decode(latent)
                     else:
                         vids = self.vae.decode(

@@ -765,6 +765,7 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
       let ws,
         audioCtx,
         tsOffset = null,
+        videoT0 = null,
         nextAudioT = 0,
         frames = [],
         lastEventTime = 0;
@@ -821,7 +822,10 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             tsOffset = when - ts;
           }
         };
-        ws.onclose = () => setTimeout(connectWS, 1500);
+        ws.onclose = () => {
+          videoT0 = null;
+          setTimeout(connectWS, 1500);
+        };
       }
       function renderLoop() {
         requestAnimationFrame(renderLoop);
@@ -833,9 +837,27 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           if (drawn)
             ctx2d.drawImage(drawn.bmp, 0, 0, canvas.width, canvas.height);
         } else {
-          const frame = frames[frames.length - 1];
-          ctx2d.drawImage(frame.bmp, 0, 0, canvas.width, canvas.height);
-          frames.length = 0;
+          // No audio clock yet (sound never enabled): pace off a local one.
+          // The server emits a whole 32-frame chunk as a ~50ms burst and then
+          // sends nothing for ~2s, so "draw the newest and drop the rest"
+          // rendered ONE frame per chunk -- a 0.5fps slideshow that reads as
+          // the character twitching. Drain on the frames' own timestamps
+          // instead, exactly like the audio path.
+          const now = performance.now() / 1000;
+          if (videoT0 === null) videoT0 = now - frames[0].ts + JITTER;
+          let mt = now - videoT0;
+          // Re-seed on any desync over a second in EITHER direction: the queue
+          // starved (generation hiccup), ran away (tab backgrounded, so rAF
+          // stopped while frames kept arriving), or a new session restarted the
+          // timestamp timeline at zero.
+          if (Math.abs(frames[0].ts - mt) > 1 || frames.length > 90) {
+            videoT0 = now - frames[0].ts + JITTER;
+            mt = now - videoT0;
+          }
+          let drawn;
+          while (frames.length && frames[0].ts <= mt) drawn = frames.shift();
+          if (drawn)
+            ctx2d.drawImage(drawn.bmp, 0, 0, canvas.width, canvas.height);
         }
       }
       function enableAudio() {

@@ -105,7 +105,10 @@ moves from prompts in realtime.
   clean 720×416 stream at ~14.9fps gen (target 20).
   CRITICAL fixes: (1) SageAttention sm90 kernels produce noise/NaN on this
   pod — run SDPA/flash-attn instead (sage import blocked via PYTHONPATH shim,
-  model_memory_sp.py AttnType.SAGE_FP8_SM90→FA); FP8 GEMM (vllm) also noise —
+  model_memory_sp.py AttnType.SAGE_FP8_SM90→FA). [Both claims superseded
+  2026-08-02: the noise was ONLY the sm90 kernel, not sage as a whole, and the
+  shim is gone — see the SageAttention entry below. The FP8 GEMM claim was
+  already superseded on 2026-07-27.] FP8 GEMM (vllm) also noise —
   `--no_fp8_gemm`; (2) rank0-only kokoro/LLM sampling desyncs CUDA RNG across
   SP ranks → half-frame corruption; latents now use a dedicated torch.Generator.
 - [x] Realtime no-player streaming (2026-07-17): HLS replaced by /ws WebSocket
@@ -123,6 +126,46 @@ moves from prompts in realtime.
   distributed session and A/V clock; expose lifecycle, structured directives,
   status, and media through Scope without coupling `scope.core.persona` to Flask
   or the SoulX runtime.
+- [ ] Replace the SoulX demo's HLS transport with WebRTC + RTP-timestamp pacing.
+  Today `interactive_demo.py` muxes to 1s HLS segments (`:840`) plus a side-channel
+  WS feed of JPEG frames and PCM (`ws_pack`, `:262`), and paces by sleeping against
+  wall clock with a hand-tuned 1.6s lead (`:1179`). Generation is already realtime
+  (1.96s/chunk on 1xH200), so the 3-6s a user waits after "wave at me" is almost
+  entirely transport, not the model. Reuse Scope's stack: `server/tracks.py`
+  `VideoProcessingTrack` + `next_timestamp()` (`:79`), which stamps every frame with
+  a 90kHz `pts` (`:156`) and derives `frame_ptime` from the measured pipeline FPS
+  (`:133`) instead of a constant. Wins: the browser jitter-buffers on the stamps
+  rather than stuttering on late frames; integer `timestamp +=` can't drift the way
+  chained `sleep()` does; and A/V sync becomes expressible at all — sleep-based
+  pacing has no way to say "this frame goes with that audio sample", which is why
+  the demo currently needs ffmpeg to mux. That last point is the real reason to do
+  this before lipsync audio moves off HLS.
+  BLOCKED ON: Scope's WebRTC is video-only (no `AudioStreamTrack`/`AudioFrame`
+  anywhere in `src/scope/server/` or the frontend hooks) — same `AudioProcessingTrack`
+  gap already listed as OmniForcing Phase 4. Build it once, both pipelines use it;
+  SoulX additionally needs the audio timeline (`drain_to`/`slice_abs`, `:963`) to
+  keep feeding wav2vec sample-aligned. Keep the Flask/HLS path as the reference
+  until WebRTC A/V sync is pod-verified.
+- [ ] Bounded-queue + measured-FPS discipline in the SoulX demo. Independent of the
+  WebRTC item above — needs no audio work, can land on the current HLS path.
+  (a) Queue sizes: `vq`/`aq` are `maxsize=8` (`interactive_demo.py:900`), i.e. 8
+  whole chunks ~= 16s of buffer, a constant unrelated to the 32-frame chunk; the
+  `ws_broadcast` clients separately carry 256-slot queues with their own hand-rolled
+  drop-oldest (`:255`). Two buffers, two unrelated sizes, two drop policies. Derive
+  from chunk size the way `pipeline_processor.py:525` does
+  (`num_frames * OUTPUT_QUEUE_MAX_SIZE_FACTOR`, resized when chunk size changes) and
+  use one drop policy in one place.
+  (b) FPS is assumed, not measured: the pacer trusts the `--fps 16` constant
+  (`:1183`), so a chunk that takes 2.4s instead of 1.96s goes unnoticed and the
+  hand-tuned 1.6s lead silently absorbs the error until it can't — then a micro-freeze.
+  (This matches the FP8 finding already recorded in `docs/`: the speedup bought SLACK
+  inside the 2.0s budget rather than fps, and that slack is what stopped the freezes.)
+  Port `pipeline_processor.py:559-586`: timestamp each produced frame, keep the last
+  30 INTER-FRAME DELTAS (deltas, not absolute times — a pause then leaves a gap
+  without dragging the average down), FPS = 1/avg delta, clamped. Feed that measured
+  value to the pacer instead of the constant, as `tracks.py:133` does.
+  Payoff: the consumer adapts when the model slows instead of needing headroom to
+  survive being wrong about the rate — i.e. removes the reason the 1.6s lead exists.
 - [~] Add Vidu-style voice interaction: FIRST PROTOTYPE DEPLOYED 2026-07-20 —
   browser SpeechRecognition mic → the existing chat/action interpreter, live
   captions, plus retained Chat/Say/Do modes and shortcuts. Follow-up: replace
@@ -188,7 +231,28 @@ moves from prompts in realtime.
   `--fp8_scope blocks` wraps only the 480 `blocks.N.{self_attn,cross_attn,ffn}`
   matmuls: 416*720 went 15.0→16.1 fps and 72.3→56.2GB with clean output (no
   noise/NaN, identity preserved). `STREAM_FP8=off|blocks|all` in run_interactive.sh
-  (default off). SageAttention still untested/blocked.
+  (default off).
+- [x] Perf: SageAttention v2.2.0 TESTED AND REJECTED on Hopper (2026-08-02).
+  Two independent blockers, both measured on an idle H200 on the 4xH200 pod:
+  (1) `sageattn_qk_int8_pv_fp8_cuda_sm90` — the kernel `sageattn()` auto-picks on
+  sm90, and the source of the old "sage renders noise" verdict — is numerically
+  broken here: rel err ~45 vs an fp32 SDPA reference at every shape/dtype/layout,
+  NaN with `smooth_k=False,smooth_v=False`. Rebuilt v2.2.0 from source (`eb615cf`,
+  correct `arch=compute_90a,code=sm_90a`, nvcc 12.8) and it reproduced BIT-FOR-BIT
+  (45.31310), so it is a real v2.2.0 bug on this stack, not a bad build.
+  (2) The sage kernels that ARE accurate are the Ampere/Ada ones and are slower
+  than SDPA on Hopper. At the 368x640 self-attn shape (q=2760 kv=5520 H=40 D=128):
+  FA3 1.16ms, SDPA 2.19ms, flash-attn2 2.27ms, sage int8/fp16 2.28ms, sage
+  int8/fp8 2.92ms. FA3 (already `--attn auto` on Hopper) is 2.5x the best correct
+  sage kernel. Even a FIXED sm90 kernel is worth little: 40 blocks x 3 steps x
+  1.16ms = ~139ms of a ~1960ms chunk, i.e. self-attn is ~7% of the budget.
+  SageAttentionFusion (QKV op fusion) inherits the same kernels — not worth trying.
+  Kept as an opt-in backend because the verdict is per-architecture: new
+  `model_liveact/sage_backend.py` makes sage explicit (`--attn sage`) and scoped
+  (`--sage-scope self|self+cross|all`, default self, same reasoning as `--fp8`),
+  and VERIFIES the chosen kernel against SDPA on first use before trusting it.
+  The `nosage` PYTHONPATH shim is deleted — it only existed because the upstream
+  `try: import sageattention` gate had no real off switch.
 - [ ] Perf: the stream is capped at `--fps` by an explicit wall-clock pacer
   (`interactive_demo.py` "pace to wall clock", keeps ~1.6s lead) — faster
   generation does NOT raise stream fps, it buys SLACK in the 2.0s chunk budget.
@@ -288,9 +352,39 @@ moves from prompts in realtime.
     unlike the Conv2D TAEs) at 3.4x, worth testing where chunk-boundary/flicker
     behaviour matters. Ckpts in `/workspace/uflash/ckpt_lx2v/`,
     harness `/workspace/uflash/dec_shootout.py`.
-  - [ ] **USER-REPORTED: output is slightly more jerky ("дерганый") with the tiny
-    VAE and/or FA3** (2026-08-01). Not yet isolated — both changes are on the
-    critical path together. Three candidate causes, in my order of suspicion:
+  - [x] **SOLVED (2026-08-02): the jerkiness was the FRONTEND render loop, and
+    all three hypotheses below were wrong.** User escalated to "really jagged,
+    like she had tics"; measured the emitted websocket stream instead of
+    guessing again (`/workspace/soulx/jitter.py`, 240 frames):
+    - media timestamps are PERFECT: 62.5ms, p50 = p95 = max, zero non-monotonic.
+    - arrivals are BURSTY: p50 1.6ms, max 1961ms, 8 stalls >150ms in 240 frames
+      = exactly one per 32-frame chunk. The server emits a whole 2s chunk in
+      ~50ms and then sends nothing for ~1.95s. It always did.
+    - `chat.html`'s renderLoop has two paths, and the audio-clock one is only
+      armed when `tsOffset` is set — which happens ONLY inside the `type === 1`
+      PCM branch, i.e. only after the user enables sound. Without it the
+      fallback ran `drawImage(frames[last]); frames.length = 0` — drawing the
+      newest frame and DISCARDING the other 31. One frame per chunk: a 0.5fps
+      slideshow of a 2s jump. That is the "tics".
+    So: sound ON was always smooth, sound OFF was always a slideshow, and this
+    is why the frame-driven recorded clips never reproduced it (noted below as a
+    caveat and never followed up). Audio DOES flow when idle (~1 PCM msg/chunk,
+    measured), so enabling sound is the instant workaround.
+    FIXED: the fallback now paces on a local `performance.now()` clock seeded
+    from the first frame's ts, draining on frame timestamps exactly like the
+    audio path, with a symmetric re-seed (>1s desync either way, or >90 queued)
+    for starvation, a backgrounded tab, and session restarts that reset the ts
+    timeline to zero. Also `TEMPLATES_AUTO_RELOAD` — a template edit was costing
+    a full weight-load + compile warmup to see.
+    Residual, now bounded: the chunk-grid test puts phase 31 at 1.67x the mean
+    frame delta (matching the 1.92x offline seam), but the 8 biggest jumps were
+    NOT chunk-locked — they were real motion. The seam is real and small; it was
+    never what "jerky" meant.
+  - [-] SUPERSEDED by the entry above — kept because the reasoning was wrong in
+    an instructive way: all three suspects were in the pipeline, and the bug was
+    in the 40 lines of JS that put the pixels on screen. **USER-REPORTED: output
+    is slightly more jerky ("дерганый") with the tiny VAE and/or FA3**
+    (2026-08-01). Three candidate causes, in my order of suspicion:
     1. **PACING, not either change.** The config being watched when this was
        reported is 416×720 at **1.02x realtime = 0.04s slack per 2.0s chunk**,
        measured IDLE. Chat/TTS/prompt re-encoding add work the benchmark omits,
@@ -313,6 +407,90 @@ moves from prompts in realtime.
         MAE 3.34) which is the only candidate that actually models time.
     NOTE the recorded clips are frame-driven captures, so they will NOT reproduce
     pacing jerkiness — cause 1 can only be judged on the live stream.
+  - [~] **RUNNING (2026-08-02): 368×640 + `lightvaew2_1` on 1×H200** — the config
+    that attacks causes 1 and 2 together. `scope-soulx run --res 368x640 --vae
+    lightvaew2_1 --gpus "3," --port 8090`, log
+    `/workspace/soulx/logs/lightvae_368x640.log`. Measured over chunks 10-50:
+    **1.55s/chunk = 20.6 fps = 1.29x realtime, 0.45s slack**, 67.7GB, flat.
+    Cheaper than expected: the causal Conv3D decoder costs ~0.10s/chunk more than
+    taew2_1 (368×640 + taew2_1 measured 1.45s) — 3x the slack of the 416×720
+    config the jerkiness was reported on, with the only decoder that models time.
+    Frames verified clean (identity, no cross-hatch, no cast). NEEDS the user's
+    eyes on the LIVE stream — it is a pacing question, not a still-frame one.
+    Because it moves both dials at once it cannot attribute the cause; if it is
+    smooth and attribution matters, A/B `--vae taew2_1` at the same 368×640.
+    LAUNCH GOTCHA: `--gpus N` means a COUNT, so an explicit card index needs a
+    trailing comma (`--gpus "3,"` = card 3; `--gpus 3` = cards 0,1,2).
+  - [x] **Decoder cost IN SITU at 368×640, 1×H200** (2026-08-02, fa3 + fp8 blocks
+    + compile blocks, chunks 30-80 idle, 67.7GB flat in all three):
+    | --vae         | s/chunk | realtime | slack | vs taew2_1 |
+    | taew2_1       | 1.45    | 1.38x    | 0.55s | -          |
+    | lightvaew2_1  | 1.55    | 1.29x    | 0.45s | +0.10s     |
+    | **wan**       | 1.79    | **1.12x**| 0.21s | +0.34s     |
+    **The full Wan2.1 VAE now streams above realtime** — the `reference` preset's
+    "NOT realtime" comment is stale at this resolution (it was written when
+    592×336 + wan measured 0.91x on the pre-FA3/pre-compile stack). The 452ms
+    bench decode costs only 340ms of wall time here: decode overlaps other work,
+    so the bench overstates every decoder's in-situ cost. Whole ladder from
+    reference quality to 1.38x fits inside one flag with no re-plumbing.
+    Warmup was 545s for wan vs 204s for lightvae (the VAE decode path compiles
+    too; the block cache on /workspace only covers the DiT).
+    Grabbed frames suggest the wan decode has more contrast and less of a
+    magenta cast than lightvae — but they are different frames from different
+    sessions, so that is an impression, NOT the controlled comparison. The
+    controlled one is `dec_shootout.py` on dumped latents (MAE 3.34/255), and a
+    global cast that visible would score worse; re-run it on the 368×640 latents
+    before believing either reading. RESOLVED below: windowed vs streaming decode
+    differ by 0.5/255, far too little to be that cast — it was session-to-session
+    variation in the generation, not the decoder. Impression was wrong.
+  - [x] **Streaming causal decode for `lightvaew2_1`** (2026-08-02) — we had a
+    CAUSAL decoder and were calling it acausally. The Wan2.1 VAE is a causal 3D
+    VAE (`CausalConv3d` + per-conv `feat_cache`) and `lightvaew2_1` is the same
+    class at `pruning_rate=0.75`, but `decode()` calls `clear_decode_cache()` on
+    entry AND exit, so every chunk decoded cold and `interactive_demo.py`
+    re-approximated the lost history by hand: `decode(cat(pre_latent[:,-3:],
+    latent))[:, :, 9:]` — 11 latent frames in, 41 out, 9 thrown away.
+    lightx2v already ships the right call on the wrapper we hold:
+    `cached_decode_withflag(zs, is_first, is_last)`, which clears only on
+    `is_first`. Now `soulx_runtime.StreamingDecode` + `self.stream_dec` at both
+    decode sites (session loop and warmup), with `reset()` on session start so a
+    session never inherits the warmup's or a dead session's cache.
+    OFFLINE, 14 real consecutive dumped chunks, order-swapped to rule out warmup:
+    | arm      | steady ms | seam /255 | interior /255 | seam/interior |
+    | windowed | 190       | 3.06      | 1.28          | 2.40x         |
+    | stream   | 148       | 2.33      | 1.22          | **1.92x**     |
+    Frame counts IDENTICAL (21 then 32) — a warm cache emits the full `T*4`
+    because only a cold first latent frame costs the 3 warm-up frames, so A/V
+    sync is untouched. Streaming vs windowed MAE 0.5/255 (the decoder's own
+    error vs Wan is 3.34), i.e. no drift over 14 chunks.
+    LIVE at 368×640: **1.55s → 1.52s/chunk (1.29x → 1.32x realtime)**, 68.2GB,
+    flat over 80+ chunks, `32f` per chunk in the log confirming the contract
+    holds in the running system. The live saving is smaller than the offline
+    42ms because this latent is 0.79x the dumped one's area (80×46 vs 52×90) and
+    decode partly overlaps other work — 33ms predicted, 30ms measured.
+    NOTE the seam is REDUCED, not removed: 1.92x the interior delta remains, and
+    the decoder can no longer be the cause of it. The residual belongs to the
+    generator's own chunk boundary (KV cache / latent side). That is where the
+    remaining "jerky" budget is, if any survives the pacing fix.
+    Both arms run on ONE binary: `SOULX_STREAM_DECODE=0` restores the windowed
+    path, so this stays A/B-able without a redeploy.
+  - [x] **Streaming decode extended to `--vae wan`, and that config SHIPS**
+    (2026-08-02). Wan gains more than lightvae did, because the 27% overlap tax
+    was levied on a bigger decode: offline 641→497ms, seam 3.35→2.66/255
+    (2.33x→1.95x), inter-arm MAE 0.95/255, frame counts still 21-then-32.
+    **Live: 1.79 → 1.69s/chunk (1.12x → 1.18x realtime), 69.9GB flat.**
+    USER VERDICT on the live stream: **best quality so far** — 368×640 + `wan`
+    streaming is now the configuration to beat, and the deployed default.
+    Two wiring differences from lightvae, both load-bearing: (1) `wan` has no
+    registry entry to build, it decodes through the SAME VAE object the demo
+    builds for `encode`, so the wrapper goes around that instance and the
+    `torch.compile` target moves from `decode` to `cached_decode_withflag` —
+    compiling the old entry point would have silently compiled nothing;
+    (2) gated OFF under sequence parallelism, because `decode` splits 1D there
+    while `cached_decode_withflag` only has a 2D-grid path, so on SP it would
+    not be the same computation. Moot at world_size=1, would have bitten the
+    next 2×H200 run. The TAEs would each need their own cross-call cache.
+    Full current-state spec: `docs/soulx-current-spec.md`.
   - [~] Pruna optimization spike: block compilation is a confirmed win above.
     FA3 is BLOCKED on the current Torch 2.8 stack: Pruna publishes CUDA 12.8
     kernels for Torch 2.10/2.11 or stable-ABI 2.9+, and a locally built minimal
@@ -390,69 +568,3 @@ See plan: `.claude/plans/longlive2-nvfp4-integration.md`. New `longlive2` pipeli
 - [~] Phase 4: Scope integration — WebRTC/TURN FIXED (Cloudflare direct keys, validated); prompt-switch/I2V/VRAM tuning remain
 - [ ] Phase 5 (optional): VACE/LoRA parity
 - [~] CI/Dockerfile: runtime image was shipping without nvcc/CUDA headers — FIXED in Dockerfile (CUDA_HOME + PATH + build-time `nvcc` assertion) + entrypoint (auto-installs dev headers). Verify on next CI build + pod boot.
-
-## Phase 1: Foundation — Action Schema & Interpreter
-
-- [ ] Design structured action/expression schema (Pydantic models for `{ action, expression, dialogue, intensity }`)
-- [ ] Define action vocabulary — enumerate supported actions (wave, sit, stand, nod, turn, walk, etc.) and expressions (smile, frown, laugh, confused, neutral, etc.)
-- [ ] Build action interpreter module (`scope.core.persona.action_interpreter`) — LLM call that maps free-text user input to structured action directives
-- [ ] Write tests for action interpreter (edge cases: ambiguous commands, multiple actions, unknown actions)
-- [ ] Decide on LLM provider/model for action interpretation (local vs API, latency budget)
-
-## Phase 2: Conversation Layer
-
-- [ ] Build conversation manager (`scope.core.persona.conversation`) — maintains chat history, persona system prompt, personality definition
-- [ ] Design persona personality config schema (name, backstory, voice style, behavioral constraints)
-- [ ] Create chat API endpoint (`server/chat.py`) — WebSocket or SSE for real-time back-and-forth
-- [ ] Wire conversation manager → action interpreter → pipeline manager flow
-- [ ] Add character state tracker (`scope.core.persona.state`) — tracks current pose, expression, activity for coherent transitions
-
-## Phase 3: Persona Video Pipeline
-
-- [ ] Scaffold persona pipeline directory (`core/pipelines/persona/`)
-- [ ] Implement persona pipeline `__call__()` accepting structured action directives (not raw text)
-- [ ] Integrate character consistency module — evaluate approaches: IP-Adapter, reference image conditioning, LoRA identity, latent anchoring
-- [ ] Implement smooth action transitions (don't jump-cut between poses; interpolate or blend)
-- [ ] Benchmark frame latency — must stay real-time (<100ms per frame target)
-- [ ] Test character identity drift over long sessions (>5 min continuous generation)
-
-## Phase 4: Frontend Chat UI
-
-- [ ] Design chat interface component (message history + text input)
-- [ ] Integrate chat UI alongside or replacing the timeline/prompt editor
-- [ ] Show character status indicator (current action/expression)
-- [ ] Display real-time video stream next to chat panel
-- [ ] Add action shortcut buttons (quick-fire common actions like wave, smile, nod)
-
-## Performance: SpargeAttn (Sparse SA3) for Autoregressive DiT
-
-- [ ] Add SpargeAttn support — sparse block-masking on top of SageAttention3 FP4 for inference speedup on Blackwell GPUs
-  - New wrapper module (`wan2_1/modules/sparge.py`) following `sage.py` pattern
-  - Extend `attention()` routing with `use_sparge`/`sparge_topk` params
-  - Hybrid precision: first 2 + last 2 layers use standard SA3, middle layers use SpargeAttn+SA3
-  - Timestep-conditional: only active for t < 800 (configurable)
-  - Config fields on LongLiveConfig (`sparge_attention`, `sparge_topk`, `sparge_timestep_threshold`)
-  - Dependencies: `sparge-attn` (thu-ml/SpargeAttn), compile at runtime like sageattn3
-  - Extend Modal test to validate sparge kernel compilation
-  - See plan: `.claude/plans/recursive-sauteeing-castle.md`
-
-## Phase 5: Polish & Future
-
-- [ ] Audio/TTS integration — persona speaks responses, lip-sync with generated video
-- [ ] Emotion inference from conversation context (auto-set expression without explicit user command)
-- [ ] Multi-character support (stretch goal)
-- [ ] Persona gallery — prebuilt characters users can select
-- [ ] Export/record conversation sessions as video files
-
-## Completed
-
-- [x] Initial project setup (LongLive pipeline working with WebRTC streaming)
-- [x] Update CLAUDE.md with AI persona product direction and architectural plan
-- [x] Create TODO.md for session continuity
-
-## Decisions & Notes
-
-- **Separation of concerns is critical**: Conversational AI layer (LLM, chat, action interpretation) must be fully decoupled from video generation layer (pipeline). They communicate via the structured action schema only.
-- **Character consistency is the hardest unsolved problem** — research this early, prototype multiple approaches before committing.
-- **Latency budget**: Action interpreter LLM call + video generation must fit within ~200ms total for real-time feel. Consider pre-generating idle animations to fill gaps.
-- **Existing LongLive pipeline stays intact** — persona pipeline is a new pipeline registered alongside it, not a replacement.
