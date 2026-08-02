@@ -193,6 +193,15 @@ moves from prompts in realtime.
   and pulls each chunk back to the reference pose (the VACE identity-vs-motion
   tension already noted in memory). Next: decay/re-anchor the reference strength,
   or drive posture through something other than the T5 prompt.
+  UPDATE 2026-08-02 — the "sustained posture does not render" half is too broad.
+  Recorded proof for an ARMS state (`/workspace/soulx/clips/state_persist.mp4`,
+  50s off the websocket, 368x640): 12s baseline arms down matching the reference,
+  action at 12.6s, transition expires at ~25.9s, and she holds arms-above-head
+  for the remaining 24s with identity intact. So sustained state renders AND
+  persists for upper-body/arm poses; what fails is whole-body re-posing
+  (sit/stand/lie), where the reference conditioning wins. Arm wardrobe does drift
+  over the hold (bare arms -> sleeves -> black gloves by 45s) while face, horns,
+  tattoo and outfit stay fixed. Repro: `/workspace/soulx/state_persist.sh`.
 - [x] The Do box can set a sustained state (2026-08-02). The "typed actions don't
   persist" complaint was never the hold duration: the composer sent `{text}` only,
   so the `pose` slot was idle on every chunk and every typed action was a gesture —
