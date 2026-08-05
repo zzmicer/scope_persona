@@ -19,6 +19,15 @@ set -uo pipefail
 
 SOULX_ROOT="${SOULX_ROOT:-/workspace/soulx}"
 export SOULX_ROOT
+
+# FA3 is reached THROUGH xformers, and xformers refuses to import at all when the
+# installed flash-attn is outside its pinned range (<=2.8.2). With flash-attn
+# 2.8.3 that turns into a silent downgrade to SDPA -- `--attn auto` reports sdpa
+# on a Hopper card and the stream just runs ~1.9x slower at the self-attentions,
+# with no error anywhere. The version check guards xformers' own FA2 bindings,
+# which this demo never uses; FA3 is bundled in xformers itself. Exported here,
+# not in the launch env, because the *plan probe* is what resolves the backend.
+export XFORMERS_IGNORE_FLASH_VERSION_CHECK="${XFORMERS_IGNORE_FLASH_VERSION_CHECK:-1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SOULX_SRC:-$HERE/SoulX-LiveAct}"
 PY="${SOULX_PYTHON:-python}"

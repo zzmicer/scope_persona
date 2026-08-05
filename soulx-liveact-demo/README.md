@@ -206,6 +206,14 @@ ssh -N -L 8090:localhost:8090 -p <RUNPOD_TCP_PORT_22> root@<pod-ip>
   modulation/embedding/head linears too — no FLOPs, maximum quantization
   sensitivity — and renders noise. `--fp8 blocks` (480 matmuls) is correct and
   is the default.
+- **FA3 needs `XFORMERS_IGNORE_FLASH_VERSION_CHECK=1`**, which the launcher
+  exports. FA3 is reached through xformers, and xformers refuses to import when
+  the installed flash-attn is outside its pinned range (`<=2.8.2`) — with 2.8.3
+  on the pod that became a *silent* downgrade: `doctor` reported `attention:
+  sdpa` on a Hopper card, the self-attentions ran ~1.9x slower, and nothing
+  raised. The pin guards xformers' own FA2 bindings, which this demo never uses.
+  It is exported at the top of the launcher rather than on the launch line
+  because the plan probe is what resolves the backend.
 - **SageAttention is a dead end on Hopper, for two independent reasons**
   (measured on H200 / torch 2.8 cu128 / CUDA 12.8, SageAttention v2.2.0 built
   from source with `arch=compute_90a,code=sm_90a`):
