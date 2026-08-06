@@ -295,6 +295,33 @@ STATE = SessionState()
 WS_CLIENTS = set()
 WS_LOCK = threading.Lock()
 
+# WebRTC transport, opt-in via --webrtc. Runs ALONGSIDE the WebSocket path off
+# the same emit worker, so one session can serve both and be compared directly.
+# aiortc is an optional dependency: without it, --webrtc reports why and the
+# demo runs exactly as before.
+WEBRTC = None
+soulx_webrtc = None
+
+
+def _enable_webrtc(fps):
+    """Bring up the WebRTC hub, or explain why it stayed off.
+
+    Imported here rather than at module scope so aiortc stays a genuinely
+    optional dependency -- a box without it runs the WebSocket path unchanged
+    instead of failing at startup.
+    """
+    global WEBRTC, soulx_webrtc
+    try:
+        import soulx_webrtc as _mod
+    except ImportError as e:
+        print(f"[webrtc] disabled: {e} -- pip install aiortc", flush=True)
+        return
+    soulx_webrtc = _mod
+    WEBRTC = _mod.WebRTCHub(fps)
+    ice = _mod.ice_servers()
+    where = ice[0]["urls"] if ice else "no TURN (set SOULX_TURN_URL); direct UDP only"
+    print(f"[webrtc] enabled, H.264/Opus; ICE: {where}", flush=True)
+
 
 def ws_broadcast(msg):
     with WS_LOCK:
@@ -1029,6 +1056,14 @@ class LiveEngine:
                     # the reference image. Copied, not viewed: arr belongs to the
                     # generator and is reused.
                     STATE.last_frame = arr[-1].copy()
+                    # WebRTC first: it takes the raw array, so it pays none of
+                    # the JPEG encode below, and start_frame carries the media
+                    # clock its RTP timestamps are derived from.
+                    if WEBRTC is not None:
+                        try:
+                            WEBRTC.publish_video(arr, start_frame)
+                        except Exception as e:
+                            print(f"[webrtc video] {e}", flush=True)
                     try:
                         hls_proc.stdin.write(arr.tobytes())
                     except Exception as e:
@@ -1058,6 +1093,11 @@ class LiveEngine:
                             pass
                         return
                     pcm_bytes, start_sample = item
+                    if WEBRTC is not None:
+                        try:
+                            WEBRTC.publish_audio(pcm_bytes, start_sample)
+                        except Exception as e:
+                            print(f"[webrtc audio] {e}", flush=True)
                     try:
                         afd.write(pcm_bytes)
                         afd.flush()
@@ -1426,12 +1466,46 @@ def control_loop_other():
 # ----------------------------------------------------------------------------
 @app.route("/")
 def index():
+    # ?transport=ws forces the WebSocket path even when WebRTC is up, so a
+    # deployment always has a way back to the transport that is known to work on
+    # a given network -- WebRTC needs a relay it can actually reach, and that is
+    # not something the server can find out for the client.
+    want = (request.args.get("transport") or "").lower()
+    use_rtc = WEBRTC is not None and want != "ws"
     return render_template(
         "chat.html",
         stream_resolution=f"{engine.width}x{engine.height}",
         stream_w=engine.width,
         stream_h=engine.height,
+        webrtc=use_rtc,
+        ice_servers=json.dumps(soulx_webrtc.ice_servers()) if use_rtc else "[]",
     )
+
+
+@app.route("/offer", methods=["POST"])
+def webrtc_offer():
+    """WebRTC signalling. One shot: SDP offer in, answer out, no trickle ICE.
+
+    The browser gathers candidates before posting, which costs a moment on
+    connect and saves needing a signalling channel of our own.
+    """
+    if WEBRTC is None:
+        return jsonify({"error": "webrtc not enabled (start with --webrtc)"}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    if "sdp" not in body or "type" not in body:
+        return jsonify({"error": "expected {sdp, type}"}), 400
+    try:
+        return jsonify(WEBRTC.offer(body["sdp"], body["type"]))
+    except Exception as e:  # noqa: BLE001 -- surface to the page, don't 500
+        print(f"[webrtc offer] {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/webrtc/stats")
+def webrtc_stats():
+    if WEBRTC is None:
+        return jsonify({"enabled": False})
+    return jsonify({"enabled": True, **WEBRTC.stats()})
 
 
 @app.route("/character/default")
@@ -1905,6 +1979,15 @@ if __name__ == "__main__":
         "(452ms, the quality reference), the rest are tiny decoders. "
         "vae.encode always stays the Wan VAE.",
     )
+    parser.add_argument(
+        "--webrtc",
+        action="store_true",
+        help="also serve the stream over WebRTC (H.264/Opus), with RTP "
+        "timestamps taken from the generator's media clock. Measured against "
+        "the MJPEG-over-WebSocket path at 368x640: 0.97 vs 4.47 Mbps, and "
+        "inter-frame p99 137ms vs 1603ms. Both transports run off the same "
+        "emit worker, so a session can serve them side by side.",
+    )
     parser.add_argument("--sr_url", type=str, default=None,
                         help="UltraFlash SR sidecar base URL; omit to stream at native res")
     parser.add_argument("--sr_scale", type=int, default=2)
@@ -1996,6 +2079,8 @@ if __name__ == "__main__":
 
     engine = LiveEngine(args)
     if engine.rank == 0:
+        if args.webrtc:
+            _enable_webrtc(args.fps)
         tts = TTS(args.aux_device, args.aux_url)
         brain = Brain(args.aux_device, args.aux_url)
         STATE.current_image_path = args.image

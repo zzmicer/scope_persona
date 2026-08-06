@@ -72,7 +72,8 @@
           0 30px 90px #000c,
           0 0 0 1px #ffffff14;
       }
-      #canvas {
+      #canvas,
+      #rtc-video {
         /* width/height attributes track the real stream size (set from the ws
            "meta" frame), so this scales down on small screens but never up */
         display: block;
@@ -641,6 +642,15 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
             width="{{ stream_w }}"
             height="{{ stream_h }}"
           ></canvas>
+          <!-- WebRTC mode renders here instead: the browser's own decoder and
+               jitter buffer, paced by RTP timestamps carrying the generator's
+               media clock. Hidden (and never connected) on the WebSocket path. -->
+          <video
+            id="rtc-video"
+            autoplay
+            playsinline
+            style="display: none"
+          ></video>
         </div>
       </div>
       <div class="topbar">
@@ -790,6 +800,61 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         clearTimeout(el.timer);
         el.timer = setTimeout(() => el.classList.remove("on"), 2800);
       }
+      const WEBRTC = {{ 'true' if webrtc else 'false' }};
+      const ICE_SERVERS = {{ ice_servers|safe }};
+      let pc = null;
+
+      async function connectRTC() {
+        const video = document.getElementById("rtc-video");
+        document.getElementById("canvas").style.display = "none";
+        video.style.display = "block";
+        // Autoplay only survives muted; the sound button unmutes on the
+        // click, which is the gesture browsers require anyway.
+        video.muted = true;
+
+        pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        pc.ontrack = (e) => {
+          video.srcObject = e.streams[0];
+        };
+        pc.onconnectionstatechange = () => {
+          if (["failed", "disconnected"].includes(pc.connectionState)) {
+            toast("stream lost — reconnecting");
+            setTimeout(connectRTC, 2000);
+          }
+        };
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        // Wait out ICE gathering instead of trickling: the server does one-shot
+        // signalling, so the offer has to carry every candidate it will get.
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === "complete") return resolve();
+          const check = () =>
+            pc.iceGatheringState === "complete" &&
+            (pc.removeEventListener("icegatheringstatechange", check),
+            resolve());
+          pc.addEventListener("icegatheringstatechange", check);
+          setTimeout(resolve, 4000); // never hang on a stalled gather
+        });
+
+        const res = await fetch("/offer", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type,
+          }),
+        });
+        const answer = await res.json();
+        if (answer.error) {
+          toast(`webrtc: ${answer.error}`);
+          return;
+        }
+        await pc.setRemoteDescription(answer);
+      }
+
       function connectWS() {
         const proto = location.protocol === "https:" ? "wss" : "ws";
         ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -869,9 +934,18 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
         }
       }
       function enableAudio() {
-        if (!audioCtx)
-          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioCtx.resume();
+        if (WEBRTC) {
+          // Nothing to schedule: audio rides the peer connection. The element
+          // starts muted so autoplay works, and this click is the user gesture
+          // that lets it make noise.
+          const video = document.getElementById("rtc-video");
+          video.muted = false;
+          video.play().catch(() => {});
+        } else {
+          if (!audioCtx)
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          audioCtx.resume();
+        }
         document.getElementById("sound-button").classList.add("active");
       }
       function addMsg(kind, text) {
@@ -1139,8 +1213,16 @@ Cheerful, warm, playful, curious, and wholesome.</textarea
           document.getElementById("upload-label").textContent = file.name;
         });
       setupSpeechRecognition();
-      connectWS();
-      renderLoop();
+      if (WEBRTC) {
+        // The peer connection carries both video and audio, so the canvas
+        // renderer, the WebAudio scheduler and the ws media socket all stay
+        // out of it. Everything else on this page -- chat, actions, poses,
+        // captions -- talks over plain HTTP and is unchanged.
+        connectRTC();
+      } else {
+        connectWS();
+        renderLoop();
+      }
       poll();
     </script>
   </body>

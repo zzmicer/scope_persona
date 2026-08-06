@@ -109,6 +109,57 @@ scope-soulx fetch                           # weights + tiny decoders, once
 scope-soulx run --res 416x720 --vae taew2_1 # server on 0.0.0.0:8090
 ```
 
+### Transport: WebRTC or WebSocket
+
+`--webrtc` serves the stream over WebRTC (H.264/Opus) **alongside** the default
+MJPEG-over-WebSocket path, off the same emit worker, so one session serves both
+and `?transport=ws` always gets you back to the older path on a network where
+WebRTC cannot find a relay.
+
+```bash
+scope-soulx run --res 368x640 --vae taew2_1 --webrtc
+# http://host:8090              -> WebRTC
+# http://host:8090/?transport=ws -> WebSocket
+```
+
+Measured on the same 30s window, same stream, 368x640:
+
+| | WebSocket (MJPEG+PCM16) | WebRTC (H.264+Opus) |
+|---|---|---|
+| video bitrate | 4.47 Mbps | **0.97 Mbps** |
+| mean frame | 32.2 KB | 7.4 KB |
+| audio | 0.27 Mbps | ~0.001 Mbps idle (Opus DTX) |
+| inter-frame p50 / p99 | 11.3ms / **1603ms** | 62.6ms / **73.8ms** |
+| stdev | 262ms | **2.7ms** |
+
+The p99 is the point. The generator produces 2s of video at once, so the
+WebSocket path ships 32 frames in a 0.4s burst and then goes quiet for 1.6s,
+against a fixed 0.35s client jitter buffer — 0.35s of margin against 1.6s gaps
+is what a micro-freeze is made of. WebRTC's RTP timestamps carry the
+generator's media clock, so the receiver's jitter buffer paces off the real
+timeline instead of arrival times.
+
+**TURN is not optional off a RunPod pod.** RunPod maps TCP ports only, so no
+browser can reach aiortc directly. Set `SOULX_TURN_CF_ID` / `SOULX_TURN_CF_TOKEN`
+(Cloudflare's Turn Token ID and API token — *not* the friendly key name, which
+returns 404) in `/root/.config/soulx/turn.env` and the server mints short-lived
+ICE credentials per page load, refreshed an hour before expiry. A static
+`SOULX_TURN_URL`/`_USER`/`_PASS` also works.
+
+Use a relay that offers **UDP**. Running coturn on the pod itself only works over
+TCP (nothing else is reachable), which puts every frame through one TCP
+connection where a single loss stalls the stream head-of-line: measured as
+latency spikes and ~12% of frames shed before the peer dropped entirely.
+Cloudflare's relay is reached outbound over UDP by *both* peers, so the pod's
+lack of UDP ingress stops mattering. `aiortc` gets the same relay
+(`_aiortc_ice()`) — without it the server's only candidate is the container's
+private address, which no public relay can route back to.
+
+`webrtc_bridge.py` is the standalone A/B harness those numbers came from: it
+subscribes to `/ws` like any other client, so it can measure a transport against
+a running demo without touching it. Superseded by the in-process path, which
+skips its JPEG decode/re-encode hop.
+
 ### How long an action lasts
 
 A `transition` (a gesture) is held for `--action_hold` chunks and then dropped,

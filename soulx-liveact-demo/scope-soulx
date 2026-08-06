@@ -85,6 +85,11 @@ run options
   --lora-strength F                 default 1.0. The DiT is distilled to 4
                                     steps, so many-step LoRAs want less. Sweep
                                     live: curl -X POST :PORT/lora -d '{"strength":0.6}'
+  --webrtc                          also serve over WebRTC (H.264/Opus) with
+                                    RTP timestamps off the generator's media
+                                    clock: 0.97 vs 4.47 Mbps, inter-frame p99
+                                    137ms vs 1603ms. Reads TURN settings from
+                                    /root/.config/soulx/turn.env if present.
   --port N (8090)  --fps N (16)  --image PATH  --seed N
   --foreground                      run in this shell instead of detaching
   --dry-run                         print the plan and the commands, run nothing
@@ -164,7 +169,7 @@ cmd_logs() {
 cmd_run() {
   local preset=fast res="" vae="" gpus=auto fp8=blocks attn=auto compile=blocks
   local port=8090 fps=16 image="" seed=42 foreground=0 dry=0 sage_scope=self
-  local lora="" lora_strength=1.0
+  local lora="" lora_strength=1.0 webrtc=0
   local logfile="$LOGDIR/demo.log"
 
   while [[ $# -gt 0 ]]; do
@@ -177,6 +182,7 @@ cmd_run() {
       --attn)       attn="$2";   shift 2 ;;
       --sage-scope) sage_scope="$2"; shift 2 ;;
       --compile)    compile="$2";shift 2 ;;
+      --webrtc)     webrtc=1;    shift ;;
       --lora)       lora="$2";   shift 2 ;;
       --lora-strength) lora_strength="$2"; shift 2 ;;
       --port)       port="$2";   shift 2 ;;
@@ -209,6 +215,24 @@ cmd_run() {
     --autostart
   )
   [[ -n "$image" ]] && gen_args+=(--image "$image")
+  if [[ $webrtc == 1 ]]; then
+    gen_args+=(--webrtc)
+    # TURN lives with the other server-only secrets. Without it WebRTC still
+    # works on a LAN or a box with UDP ingress, but not from a browser off a
+    # RunPod pod, which maps TCP ports only.
+    if [[ -f /root/.config/soulx/turn.env ]]; then
+      set -a; . /root/.config/soulx/turn.env; set +a
+    fi
+    # Either form is valid, so report what is actually set rather than assuming
+    # one of them exists -- `set -u` turns that assumption into a failed launch.
+    if [[ -n "${SOULX_TURN_CF_ID:-}" ]]; then
+      echo "scope-soulx: webrtc on, Cloudflare TURN (UDP relay, rotating creds)"
+    elif [[ -n "${SOULX_TURN_URL:-}" ]]; then
+      echo "scope-soulx: webrtc on, TURN ${SOULX_TURN_URL}"
+    else
+      echo "scope-soulx: webrtc on, no TURN configured (direct UDP only)"
+    fi
+  fi
   if [[ -n "$lora" ]]; then
     # accept a bare name in $SOULX_ROOT/lora as well as a path
     [[ -f "$lora" ]] || lora="$SOULX_ROOT/lora/$lora"
