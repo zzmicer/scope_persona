@@ -164,6 +164,34 @@ def gpus() -> list:
     return out
 
 
+def free_mem_gb() -> dict:
+    """{gpu index: free GB}, read from nvidia-smi. `{}` if it cannot be read.
+
+    Deliberately not `torch.cuda.mem_get_info`: that needs a CUDA context on every
+    card it reports, which costs ~300MB each and would touch GPUs this process has
+    no business initialising -- including ones another tenant is using.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except Exception:  # noqa: BLE001 -- no nvidia-smi, no CUDA, or it hung
+        return {}
+
+    free = {}
+    for line in out.strip().splitlines():
+        try:
+            idx, used, total = (int(f.strip()) for f in line.split(","))
+        except ValueError:
+            continue
+        free[idx] = (total - used) / 1024
+    return free
+
+
 @dataclass
 class Plan:
     """What to run, decided from the hardware rather than from a preset."""
@@ -297,8 +325,21 @@ def plan(
     # sequence parallelism it MUST have one -- a second CUDA context inside a
     # torchrun rank destabilises NCCL. With world_size==1 there is no NCCL, so
     # sharing is merely second-best rather than dangerous.
+    #
+    # "Idle" has to mean actually idle: on a shared box the lowest-numbered spare
+    # is often the one someone else is already using, and parking chat/TTS on it
+    # costs latency on every reply. Prefer the emptiest spare, and fall back to
+    # the first one when free memory cannot be read.
     spare = [d.index for d in devices if d.index not in chosen]
-    aux_gpu = spare[0] if spare else chosen[0]
+    free = free_mem_gb()
+    aux_gpu = max(spare, key=lambda i: free.get(i, 0.0)) if spare else chosen[0]
+    if spare and free:
+        busy = [i for i in spare if free.get(i, 0.0) < devices[0].mem_gb - 1.0]
+        if busy:
+            notes.append(
+                f"persona_aux -> GPU{aux_gpu} ({free.get(aux_gpu, 0):.0f}GB free); "
+                f"GPU{','.join(str(i) for i in busy)} already in use"
+            )
     if not spare:
         notes.append(
             "persona_aux shares the generator's card"
