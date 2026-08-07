@@ -100,6 +100,14 @@ run options
                                     clock: 0.97 vs 4.47 Mbps, inter-frame p99
                                     137ms vs 1603ms. Reads TURN settings from
                                     /root/.config/soulx/turn.env if present.
+  --sr-url URL                      hand decode to an UltraFlash SR sidecar and
+                                    stream at --sr-scale x the generator size
+                                    (368x640 x2 -> 736x1280). The sidecar owns
+                                    the upsampler + SR DiT + HR decoder, so
+                                    --vae is unused. Costs one chunk (~2s) of
+                                    added latency, since chunk N is submitted
+                                    while chunk N-1 is emitted.
+  --sr-scale N (2)
   --port N (8090)  --fps N (16)  --image PATH  --seed N
   --foreground                      run in this shell instead of detaching
   --dry-run                         print the plan and the commands, run nothing
@@ -179,7 +187,7 @@ cmd_logs() {
 cmd_run() {
   local preset=fast res="" vae="" gpus=auto fp8=blocks attn=auto compile=blocks
   local port=8090 fps=16 image="" seed=42 foreground=0 dry=0 sage_scope=self
-  local lora="" lora_strength=1.0 webrtc=0
+  local lora="" lora_strength=1.0 webrtc=0 sr_url="" sr_scale=2
   local logfile="$LOGDIR/demo.log"
 
   while [[ $# -gt 0 ]]; do
@@ -193,6 +201,8 @@ cmd_run() {
       --sage-scope) sage_scope="$2"; shift 2 ;;
       --compile)    compile="$2";shift 2 ;;
       --webrtc)     webrtc=1;    shift ;;
+      --sr-url)     sr_url="$2"; shift 2 ;;
+      --sr-scale)   sr_scale="$2"; shift 2 ;;
       --lora)       lora="$2";   shift 2 ;;
       --lora-strength) lora_strength="$2"; shift 2 ;;
       --port)       port="$2";   shift 2 ;;
@@ -225,6 +235,13 @@ cmd_run() {
     --autostart
   )
   [[ -n "$image" ]] && gen_args+=(--image "$image")
+  # With an SR sidecar the generator decodes NOTHING itself -- the sidecar owns
+  # the upsampler, the SR DiT and the HR decoder -- so --vae above is inert and
+  # the stream comes out at sr_scale x the generator resolution.
+  if [[ -n "$sr_url" ]]; then
+    gen_args+=(--sr_url "$sr_url" --sr_scale "$sr_scale")
+    echo "scope-soulx: SR sidecar $sr_url (x$sr_scale) owns the decode; --vae is unused"
+  fi
   if [[ $webrtc == 1 ]]; then
     gen_args+=(--webrtc)
     # TURN lives with the other server-only secrets. Without it WebRTC still
