@@ -6,8 +6,11 @@ identity/scene) + sustained state (held posture) + a transient transition.
 Transitions are held a few chunks then dropped, but posture changes update the
 sustained state so the character STAYS in the new pose (sit -> keeps sitting).
 
-  - /chat    -> LLM decides {say, action, pose}; speech -> kokoro TTS (lip-synced);
-               action = transient motion, pose = new sustained state (or null).
+  - /chat    -> the LLM answers in prose with its own motions written inline,
+               "Sure! [she turns around, 2s] Ta-da!"; `directions.py` splits that
+               into speech -> kokoro TTS (lip-synced) and a motion -> generator,
+               with the stated duration as the transition's TTL. A posture change
+               with no duration becomes the new sustained state.
   - /say     -> speak exactly this text.
   - /action  -> perform a motion now; {pose} or {persist:true} makes it stick,
                empty body clears back to neutral idle.
@@ -43,6 +46,7 @@ import time
 import urllib.request
 from datetime import timedelta
 
+import directions as directions_mod
 import lora as lora_mod
 import numpy as np
 import soulx_runtime
@@ -157,6 +161,8 @@ def _sr_reset(base):
         _rq.post(f"{base}/reset", timeout=30)
     except Exception as e:
         print(f"[sr] reset failed: {e}", flush=True)
+
+
 _DUMP_DIR = os.environ.get("SOULX_DUMP_LATENTS", "")
 _DUMP_N = int(os.environ.get("SOULX_DUMP_N", "12"))
 
@@ -171,8 +177,7 @@ def _parse_size(size):
         return soulx_runtime.parse_resolution(size)
     except ValueError as exc:
         raise SystemExit(
-            f"--size {size!r}: {exc}\n"
-            f"  presets: {', '.join(soulx_runtime.RESOLUTIONS)}"
+            f"--size {size!r}: {exc}\n  presets: {', '.join(soulx_runtime.RESOLUTIONS)}"
         ) from None
 
 
@@ -225,14 +230,6 @@ def _close_media_queue(q):
             q.put_nowait(None)
         except (queue.Empty, queue.Full):
             pass
-
-
-def _clean_field(v):
-    """Normalize an LLM JSON string field -> stripped str or None."""
-    if not isinstance(v, str):
-        return None
-    v = v.strip()
-    return None if v.lower() in ("", "null", "none") else v
 
 
 # ----------------------------------------------------------------------------
@@ -394,21 +391,8 @@ class Brain:
         self.lock = threading.Lock()
 
     def _system_prompt(self):
-        return (
-            f"You are {STATE.persona_name}, an anime character appearing live on video. "
-            f"Your personality is: {STATE.persona_prompt} "
-            "Chat naturally with the user, in English, using 1-2 short sentences. "
-            "You can also perform physical motions on camera. "
-            'Reply ONLY with JSON: {"say": "<what you say>", '
-            '"action": "<short third-person visual description of the MOTION you make now, '
-            "e.g. 'She waves her hand at the camera cheerfully!' or null if no special motion>\", "
-            '"pose": "<if that motion changes your sustained body posture or position '
-            "(sit down, stand up, lie down, turn around, lean back, kneel, cross arms), a SHORT "
-            "third-person description of the RESULTING held pose you stay in afterwards, "
-            "e.g. 'She is sitting on the floor, relaxed.' — otherwise null for momentary "
-            'gestures (wave, nod, wink, laugh) that should not persist>"}. '
-            "Keep everything friendly and wholesome."
-        )
+        # Prompt and parser ship together in `directions.py` — see the note there.
+        return directions_mod.system_prompt(STATE.persona_name, STATE.persona_prompt)
 
     def reset_history(self):
         with self.lock:
@@ -432,12 +416,14 @@ class Brain:
                 self.failed = True
 
     def reply(self, message):
-        """-> (say, action)"""
+        """-> directions.Direction (say, action, pose, hold)"""
         with self.lock:
             self.history.append({"role": "user", "content": message})
-            msgs = [
-                {"role": "system", "content": self._system_prompt()}
-            ] + self.history[-12:]
+            msgs = (
+                [{"role": "system", "content": self._system_prompt()}]
+                + directions_mod.FEWSHOT
+                + self.history[-12:]
+            )
             if self.remote_url:
                 req = urllib.request.Request(
                     f"{self.remote_url}/generate",
@@ -449,7 +435,7 @@ class Brain:
             else:
                 self.ensure()
                 if self.model is None:
-                    return f"You said: {message}", None, None
+                    return directions_mod.Direction(say=f"You said: {message}")
                 text = self.tok.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True
                 )
@@ -466,17 +452,13 @@ class Brain:
                 raw = self.tok.decode(
                     out[0][ids["input_ids"].shape[1] :], skip_special_tokens=True
                 )
-            say, action, pose = raw.strip(), None, None
-            try:
-                s = raw[raw.index("{") : raw.rindex("}") + 1]
-                obj = json.loads(s)
-                say = obj.get("say") or ""
-                action = _clean_field(obj.get("action"))
-                pose = _clean_field(obj.get("pose"))
-            except Exception:
-                pass
-            self.history.append({"role": "assistant", "content": say})
-            return say, action, pose
+            direction = directions_mod.parse(
+                raw, name=STATE.persona_name, default_hold=STATE.action_hold
+            )
+            # The script, not the bare speech: the model's own bracketed line is
+            # the strongest example of the format it sees next turn.
+            self.history.append({"role": "assistant", "content": direction.script})
+            return direction
 
 
 # ----------------------------------------------------------------------------
@@ -669,7 +651,7 @@ class LiveEngine:
         kv_scale_shape = (1, kv_tokens, 40, 1)
         self.kv_cache = {
             i: {
-                l: {
+                layer: {
                     "k": torch.zeros(
                         [1, kv_tokens, 40, 128], dtype=kv_dtype, device=self.device
                     ),
@@ -690,7 +672,7 @@ class LiveEngine:
                     "offload_cache": False,
                     "fp8_kv_cache": args.fp8_kv_cache,
                 }
-                for l in range(40)
+                for layer in range(40)
             }
             for i in range(len(self.timesteps) - 1)
         }
@@ -758,9 +740,9 @@ class LiveEngine:
     # --- helpers -------------------------------------------------------------
     def _reset_kv(self):
         for i in self.kv_cache:
-            for l in self.kv_cache[i]:
-                self.kv_cache[i][l]["k"].zero_()
-                self.kv_cache[i][l]["v"].zero_()
+            for layer in self.kv_cache[i]:
+                self.kv_cache[i][layer]["k"].zero_()
+                self.kv_cache[i][layer]["v"].zero_()
 
     def _encode_text(self, text):
         return [
@@ -1183,8 +1165,7 @@ class LiveEngine:
                         self.lora.set_strength(new_strength)
                         STATE.log(
                             "lora",
-                            f"strength -> {new_strength} "
-                            f"({time.time() - t0:.1f}s)",
+                            f"strength -> {new_strength} ({time.time() - t0:.1f}s)",
                         )
                     # window in frames: [start_f, end_f+2)
                     if iteration == 0:
@@ -1314,7 +1295,9 @@ class LiveEngine:
                     torch.save(
                         {
                             "latent": latent.detach().to(torch.bfloat16).cpu(),
-                            "ctx": [c.detach().to(torch.bfloat16).cpu() for c in cur_ctx],
+                            "ctx": [
+                                c.detach().to(torch.bfloat16).cpu() for c in cur_ctx
+                            ],
                             "iteration": iteration,
                             "size": (self.width, self.height),
                             "fps": self.fps,
@@ -1328,8 +1311,12 @@ class LiveEngine:
                 if self.rank == 0 and self.sr_url:
                     # submit chunk N, emit chunk N-1 -> SR overlaps the next denoise
                     sr_inflight.append(
-                        (_sr_pool.submit(_sr_request, self.sr_url,
-                                         sr_job[0], sr_job[1], 0), heard)
+                        (
+                            _sr_pool.submit(
+                                _sr_request, self.sr_url, sr_job[0], sr_job[1], 0
+                            ),
+                            heard,
+                        )
                     )
                     if len(sr_inflight) >= 2:
                         fut0, heard = sr_inflight.pop(0)
@@ -1723,25 +1710,41 @@ def chat():
             }
         )
     try:
-        say_text, action_text, pose_text = brain.reply(msg)
+        d = brain.reply(msg)
     except Exception as e:
         STATE.log("error", f"LLM failed: {e}")
         return jsonify({"status": "error", "message": f"LLM failed: {e}"}), 500
     # action = transient motion; pose = sustained state to keep afterwards (None -> gesture)
-    if action_text or pose_text:
+    if d.action or d.pose:
+        directive = {"transition": d.action, "rest": d.pose}
+        # A duration the script asked for ("…, 2s") overrides the live default,
+        # so "turn around for a sec" is a beat and not sixteen seconds of back.
+        if d.hold:
+            directive["hold"] = min(int(d.hold), directions_mod.MAX_HOLD_CHUNKS)
         with STATE.lock:
-            STATE.pending_directive = {"transition": action_text, "rest": pose_text}
-        STATE.log("action", action_text or f"(pose: {pose_text})")
-    if say_text:
+            STATE.pending_directive = directive
+        held = directive.get("hold", STATE.action_hold)
+        STATE.log(
+            "action",
+            (d.action or f"(pose: {d.pose})")
+            + (f" · {int(held * directions_mod.CHUNK_SECONDS)}s" if d.action else ""),
+        )
+    if d.say:
         try:
-            wav = tts.synth(say_text, voice=STATE.voice)
+            wav = tts.synth(d.say, voice=STATE.voice)
             if len(wav):
                 STATE.speech_q.put(wav)
         except Exception as e:
             STATE.log("error", f"TTS failed: {e}")
-        STATE.log("chano", say_text)
+        STATE.log("chano", d.say)
     return jsonify(
-        {"status": "ok", "say": say_text, "action": action_text, "pose": pose_text}
+        {
+            "status": "ok",
+            "say": d.say,
+            "action": d.action,
+            "pose": d.pose,
+            "hold": d.hold,
+        }
     )
 
 
@@ -1988,8 +1991,12 @@ if __name__ == "__main__":
         "inter-frame p99 137ms vs 1603ms. Both transports run off the same "
         "emit worker, so a session can serve them side by side.",
     )
-    parser.add_argument("--sr_url", type=str, default=None,
-                        help="UltraFlash SR sidecar base URL; omit to stream at native res")
+    parser.add_argument(
+        "--sr_url",
+        type=str,
+        default=None,
+        help="UltraFlash SR sidecar base URL; omit to stream at native res",
+    )
     parser.add_argument("--sr_scale", type=int, default=2)
     parser.add_argument(
         "--action_hold",
