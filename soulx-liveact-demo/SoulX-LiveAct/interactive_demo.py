@@ -1461,9 +1461,14 @@ def index():
     use_rtc = WEBRTC is not None and want != "ws"
     return render_template(
         "chat.html",
-        stream_resolution=f"{engine.width}x{engine.height}",
-        stream_w=engine.width,
-        stream_h=engine.height,
+        # OUT size, not the generator's: with an SR sidecar the stream leaves at
+        # sr_scale x the generator resolution, and the page shapes its viewer
+        # frame from these. Sending the generator size made the frame the wrong
+        # size for the pixels arriving (same aspect at x2, so it only showed up
+        # as a crop once the stream outgrew the viewport).
+        stream_resolution=f"{engine.out_width}x{engine.out_height}",
+        stream_w=engine.out_width,
+        stream_h=engine.out_height,
         webrtc=use_rtc,
         ice_servers=json.dumps(soulx_webrtc.ice_servers()) if use_rtc else "[]",
     )
