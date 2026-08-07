@@ -28,6 +28,16 @@ export SOULX_ROOT
 # which this demo never uses; FA3 is bundled in xformers itself. Exported here,
 # not in the launch env, because the *plan probe* is what resolves the backend.
 export XFORMERS_IGNORE_FLASH_VERSION_CHECK="${XFORMERS_IGNORE_FLASH_VERSION_CHECK:-1}"
+
+# Compile caches belong on the data volume, not the container's root disk. These
+# default to /tmp and ~/.triton, and a pod whose root fills up (someone else's
+# model cache is enough) then fails the run at `torch.compile` with a bare
+# `OSError: [Errno 28] No space left on device`, minutes into a warmup, with
+# nothing in the message connecting it to disk. Costs a slower first compile on
+# a network volume and saves the whole run.
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$SOULX_ROOT/.cache/inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$SOULX_ROOT/.cache/triton}"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SOULX_SRC:-$HERE/SoulX-LiveAct}"
 PY="${SOULX_PYTHON:-python}"
