@@ -213,6 +213,38 @@ moves from prompts in realtime.
   gained `pose: {state, transition, transition_left}`, mirrored out of the chunk
   loop at the compose site (so an expired transition shows up too) and cleared on
   session stop; the UI status line reads `Live · N chunks · <state>`.
+- [x] The brain acts on its own, in prose (2026-08-06, A/B-measured on the pod
+  against the live 1.5B). **Motion requests that produced an action: 6/20 -> 20/20**,
+  and she moves unprompted on 3/5 replies that asked for nothing. The JSON schema
+  is gone: she answers inline — `Sure! [she turns around slowly, 3s] Ta-da!` —
+  taught by four few-shot turns, and is told to move in almost every reply.
+  New `SoulX-LiveAct/directions.py` (stdlib-only, 20 tests in `test_directions.py`)
+  holds BOTH the prompt and the parser so the two cannot drift; it splits the line
+  into speech (TTS) + motion (generator) and turns a stated duration into the
+  transition TTL (2s = 1 chunk, ceil). Posture rule kept: duration -> transient,
+  no duration + posture verb -> new sustained state, explicit "stays" -> sustained
+  either way. Old failure modes are now recovered rather than spoken aloud —
+  bare/concatenated JSON, `*asterisk*` directions, a bare third-person motion
+  sentence in the speech slot — and first person is rewritten ("I turn around" ->
+  "She turns around"). `/chat` returns `hold` alongside `{say, action, pose}`.
+  Harness: `/workspace/soulx/brain_ab.py [trials] [old|new|both]` — hits
+  persona_aux :8091 directly, so it runs without disturbing a live session.
+  DEPLOYED + LIVE-VERIFIED on the pod (368x640, GPU0, warmup 112.9s): every chat
+  turn with a motion reached the generator as a real transition with the right
+  TTL, read back from `/status.pose` — "can you turn around" -> `She turns around
+  quickly.` transition_left 1 (2s), "sit down for a bit" -> `pose` set AND
+  `state` held. One fix came out of that run: the model writes "takes a seat",
+  not "sits", so POSTURE_PATTERNS grew the phrasings it actually uses (seat /
+  settles / perches / curls up) — without it the one posture this feature exists
+  for stayed a momentary gesture.
+  REMAINING SOFT SPOT: only 13/20 of her acting replies also SPEAK (she sometimes
+  answers with a motion alone) and 11/20 state a duration. Both are 1.5B ceiling,
+  not parser bugs — retry with a bigger `PERSONA_LLM` if it matters.
+- [ ] `scope-soulx stop` is a blanket `pkill -f "[i]nteractive_demo.py"`, and the
+  bracket trick does NOT protect a REMOTE shell: any ssh command line that merely
+  mentions the filename is killed by it (hit this deploying, exit 255, demo left
+  stopped). Fix with the port-scoped stop already listed below, or match on the
+  pidfile.
 - [x] Kohya LoRA support (2026-08-02, verified 1xH200). `SoulX-LiveAct/lora.py`
   merges `lora_unet_*` into the DiT (merge, never adapter — an adapter side-path
   would add un-quantized, un-compiled matmuls); merge point sits between the bf16
@@ -541,6 +573,68 @@ moves from prompts in realtime.
     not be the same computation. Moot at world_size=1, would have bitten the
     next 2×H200 run. The TAEs would each need their own cross-call cache.
     Full current-state spec: `docs/soulx-current-spec.md`.
+  - [x] **GATES 1+2 DONE for Flash-VAED (2026-08-07, on the pod).** It RUNS, and
+    it is not the win we hoped for. Verdict: **do not switch; wire it in for A/B
+    only.** Gate 1 PASSES and better than feared — the Wan student keeps causal
+    3D with our exact cache protocol (`CausalDepthwiseConv3d` + `Resample(mode=
+    '3d')` whose `time_conv` is a real `CausalConv3d`), and `WanVAE_.decode(i, z,
+    scale)` clears the cache only on `i == 0`, i.e. `cached_decode_withflag` in
+    different clothing. The 2D substitution is stage-wise: 3D at low res where
+    the temporal work is, 2D from upsample index 8 where resolution is high.
+    Checkpoint loads STRICT-clean (156 tensors, 0 missing, 0 unexpected) and
+    their `Wan_VAE_Teacher.pth` is BIT-IDENTICAL to LiveAct's `Wan2.1_VAE.pth`
+    (194/194), so MAE against our reference is a fair score with no teacher gap.
+    Gate 2, 10 consecutive real dumped chunks (52x90), reference = full Wan
+    STREAMED through `cached_decode_withflag` (the same call the pipeline makes):
+    | decoder      | streamed ms | interior MAE | seam MAE | seam ratio |
+    | wan (ref)    | 527         | -            | -        | -          |
+    | lightvaew2_1 | 148         | **1.22**     | **2.33** | 1.92x      |
+    | flashvaed    | **119.5**   | 3.78         | 4.18     | **1.11x**  |
+    So it is 4.4x faster than wan and ~19% faster than streamed lightvae, but 3x
+    worse on fidelity than lightvae and worse than taew2_1 (2.77) at 3.7x the
+    cost. The "Wan-grade quality at taew2_1 cost" hypothesis FAILS on our latents.
+    Its ONE real strength: **the best chunk-boundary continuity measured**, seam
+    only 1.11x the interior vs lightvae's 1.92x — which MAE cannot judge and the
+    jerkiness question cares about. That is the only reason to look at it live.
+    ONE FIX REQUIRED before any streaming use: `if i == 20: self.clear_cache()`
+    is hardcoded to a 21-latent-frame clip and would reset the cache mid-stream;
+    the harness reimplements the per-frame loop over the model internals instead.
+    Artifacts on the pod: `/workspace/flashvaed/{model_hybrid_aggressive.py,
+    flashvaed_gate2.py,flashvaed_gate2b.py,teacher_check.py}`, ckpt at
+    `/workspace/soulx/decoders/Flash_VAED_Wan.pth` (23.5MB).
+    NOTE gate2.py (first pass) is WRONG and kept only as a warning: it reset the
+    cache every chunk in BOTH arms and compared against a COLD-decoded reference,
+    manufacturing a 25/255 "seam" that does not exist. Use gate2b.py.
+  - [ ] Gate 3 for Flash-VAED: wire into the `soulx_runtime.DECODERS` registry as
+    `--vae flashvaed` (kind `flashvaed`, needs the vendored model file + a
+    StreamingDecode-alike that owns the per-frame loop), then judge on MOVING
+    VIDEO — the seam advantage is the only thing that could earn it a slot.
+  - [-] SUPERSEDED, original entry kept for the reasoning: **Evaluate Flash-VAED as a 4th decoder** — https://github.com/Aoko955/Flash-VAED
+    (ckpts: HF `Aoko955/Flash-VAED`, student + teacher). Distilled VAE *decoders*
+    via independence-aware channel pruning + stage-wise replacement of the
+    expensive causal 3D convs. Ships a **Wan 2.1 student (~23MB)** — the exact VAE
+    family we decode — claiming **~6x speedup at 96.9% reconstruction** and
+    118.77 FPS on an RTX 5090D, plus an LTX-Video student (944MB).
+    WHY IT MATTERS HERE: at 368×640 the full `wan` VAE already streams at 1.18x
+    realtime and is the shipped quality winner, so we do NOT need more decode
+    speed at this resolution. The prize is **Wan-grade quality at taew2_1 cost**
+    (~0.34s/chunk back), which is what buys 416×720/higher-res, the SR stage, or
+    a second persona per GPU. Treat it as a fidelity/slack trade, not a fps win.
+    GATES, in order:
+    1. **Is it causal with a cross-call cache?** Our shipped path is
+       `StreamingDecode` over `cached_decode_withflag(zs, is_first, is_last)` and
+       depends on per-conv `feat_cache`. If Flash-VAED replaced the causal 3D
+       convs with something acausal it lands in the taew2_1 bucket (Conv2D, needs
+       its own cache design, seams get worse) — that decides everything else.
+    2. Run it through `dec_shootout.py` on the real dumped 52×90 SoulX latents
+       and put it in the ladder table above (taew2_1 31.9ms/MAE 2.77,
+       lightvaew2_1 132.9ms/3.34, wan 452ms). Watch the `need_scaled` gotcha —
+       getting it backwards costs ~20 MAE and looks like a broken checkpoint.
+    3. Only then wire it into `soulx_runtime.py`'s decoder registry as
+       `--vae flashvaed`; every arm must stay A/B-able on one binary.
+    Also check whether the LTX student transfers to **OmniForcing** — that VAE is
+    LTX-**2**, not LTX-Video, so assume it does not until the weights load.
+
   - [~] Pruna optimization spike: block compilation is a confirmed win above.
     FA3 is BLOCKED on the current Torch 2.8 stack: Pruna publishes CUDA 12.8
     kernels for Torch 2.10/2.11 or stable-ABI 2.9+, and a locally built minimal
@@ -601,6 +695,63 @@ moves from prompts in realtime.
   Production build + deployed HTTP assets verified; live H200 E2E verified
   (WebRTC connected, data channel open, seed accepted, event delivered, 13+16
   frames generated without runtime errors).
+
+## Public multi-viewer stage — "let people play with it"
+
+Product shape for putting the persona in front of many strangers on ONE GPU:
+one always-live session, everyone lands in the same stream, and **one visitor at
+a time drives her for ~90s** while the rest watch and chat. The queue is the
+show. Capacity: ~40 drivers/hour + unbounded watchers on 1xH200 (~$2-3/hr), vs
+1 GPU per user for private sessions. Private 1:1 becomes the paid upgrade later.
+Fan-out already exists (`WS_CLIENTS`, per-client 256-slot drop-oldest queues at
+`interactive_demo.py:295-310`); what was missing is turn-taking and auth.
+
+- [x] `SoulX-LiveAct/stage.py` — turn queue: join/heartbeat/leave, one turn
+  token that the control endpoints authorize against, ghost eviction for closed
+  tabs, per-turn + global appearance-edit budget, moderator `force_end`/`close`,
+  `on_turn_start`/`on_turn_end` hooks (used to clear the sustained pose so a
+  driver never inherits a stranger's held state). Stdlib-only and clock-injected
+  → 28 unit tests run on macOS with no model (`test_stage.py`).
+  Found while testing: a stale tab can win the seat *before* it looks stale and
+  burn a whole turn of dead air → added `no_show_grace` (default 10s); a
+  promoted driver must heartbeat or issue a control call or forfeits.
+- [ ] Gate `/action`, `/say`, `/chat`, `/anchor`, `/lora`, `/persona` behind a
+  turn token (they are wide open today — anyone with the URL can drive her and
+  spend the fal balance). Add `/stage/join`, `/stage/heartbeat`, `/stage/leave`,
+  `/stage/skip`, `/stage/state`; wire `on_turn_end` → clear pose + drop pending
+  directive.
+- [ ] Broadcast stage state over the existing `/ws` as `mtype 2` (JSON) so
+  clients never poll: driver name, remaining, queue length, your position/ETA.
+- [ ] Rework `templates/chat.html` into three screens — Join ("tap to join with
+  sound", mandatory: muted is the slideshow path fixed on 2026-08-02), Stage
+  (stream + chat + "N watching" + Take the mic), Your Turn (action palette +
+  free text + Say + one outfit token + countdown). Reuse the fixed render loop
+  verbatim.
+- [ ] Action palette limited to the VERIFIED vocabulary (arms/gestures/
+  expressions/turns). Free text routes through the interpreter, which must
+  re-map or *answer* whole-body re-posing instead of silently doing nothing —
+  sit/stand/lie lose to the reference conditioning, and a user who types "sit
+  down" and sees nothing concludes the product is broken.
+- [ ] Acknowledge every directive in <100ms client-side ("sent → she's doing
+  it") against the chunk boundary. One chunk (~1.7s) of latency is fine;
+  unacknowledged latency reads as a dead button.
+- [ ] Cap sustained holds at ~25s (wardrobe drifts: bare arms → sleeves →
+  gloves by 45s) and auto-clear state at turn end.
+- [ ] Outfit change as a ritual: "give me a second" + a `changing…` card over
+  the 3-4s session restart. One token per turn, globally rate-limited (paid fal
+  call). This is the shareable moment.
+- [ ] Moderation on all free text before it reaches Qwen or T5; the driver's
+  text is visible to every viewer (accountability).
+- [ ] NO reference-image upload in v1 — fixed roster (chano39 anime + one
+  SYNTHETIC realistic face, never a real person). Deletes the consent/likeness/
+  CSAM review surface, which is otherwise the launch blocker.
+- [ ] Measure the synthetic realistic reference before it fronts anything:
+  identity + wardrobe behavior on a photoreal reference is unmeasured on this
+  stack, and photoreal is where drift is noticed instantly.
+- [ ] OBS Browser Source pointed at the stage page = Twitch/Kick output. Do NOT
+  wait on NDI: Scope's NDI is receiver-only (`docs/ndi.md`, sender "coming
+  soon").
+- [ ] Scale by ROOMS, not a pool: room = 1 GPU = 1 character = 1 queue.
 
 ## LongLive 2.0 (NVFP4) Integration
 
