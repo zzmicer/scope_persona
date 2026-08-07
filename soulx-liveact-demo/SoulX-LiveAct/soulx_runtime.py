@@ -175,9 +175,15 @@ def free_mem_gb() -> dict:
 
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, check=True,
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
         ).stdout
     except Exception:  # noqa: BLE001 -- no nvidia-smi, no CUDA, or it hung
         return {}
@@ -421,6 +427,16 @@ DECODERS = {
         mae=3.34,
         note="75% pruned but CAUSAL Conv3D -- the only fast option that models time",
     ),
+    "flashvaed": DecoderSpec(
+        key="flashvaed",
+        kind="flashvaed",
+        label="Flash-VAED Wan student",
+        file="Flash_VAED_Wan.pth",
+        ms=120,
+        mae=3.78,
+        note="23MB, causal 3D at low res -- the SMOOTHEST chunk seam (1.11x vs "
+        "lightvae's 1.92x) but 3x its per-frame error",
+    ),
     "v3": DecoderSpec(
         key="v3",
         kind="v3",
@@ -482,6 +498,100 @@ class StreamingDecode:
     def reset(self) -> None:
         """Begin a new causal sequence. Call between sessions, and after warmup."""
         self._first = True
+
+
+class FlashVAEDDecode:
+    """Streaming decode for the Flash-VAED student.
+
+    Same contract as `StreamingDecode` (first chunk `T*4-3` frames, every chunk
+    after it `T*4`), but the per-latent-frame loop is reimplemented here rather
+    than delegated, because the upstream `WanVAE_.decode(i, z, scale)` decides
+    cache lifetime from the frame index: it clears on `i == 0` AND again on a
+    hardcoded `i == 20`, the last frame of a 21-latent-frame (81-frame) clip.
+    In a continuous session the first would clear on every chunk and the second
+    would drop the causal history mid-stream, planting a seam. Cache lifetime
+    belongs to the SEQUENCE, so it is owned here.
+
+    The scale constants are Wan2.1's own -- the student was distilled from a
+    teacher that is bit-identical to LiveAct's `Wan2.1_VAE.pth` (194/194
+    tensors), so it shares the latent distribution and needs no `need_scaled`
+    style flag.
+    """
+
+    streaming = True
+
+    LATENTS_MEAN = (
+        -0.7571,
+        -0.7089,
+        -0.9113,
+        0.1075,
+        -0.1745,
+        0.9653,
+        -0.1517,
+        1.5508,
+        0.4134,
+        -0.0715,
+        0.5517,
+        -0.3632,
+        -0.1922,
+        -0.9497,
+        0.2503,
+        -0.2921,
+    )
+    LATENTS_STD = (
+        2.8184,
+        1.4541,
+        2.3275,
+        2.6558,
+        1.2196,
+        1.7708,
+        2.6052,
+        2.0743,
+        3.2687,
+        2.1526,
+        2.8652,
+        1.5579,
+        1.6382,
+        1.1253,
+        2.8251,
+        1.9160,
+    )
+
+    def __init__(self, model, device, dtype, streaming: bool = True):
+        import torch
+
+        self.model = model
+        self.streaming = streaming
+        self._first = True
+        kw = {"dtype": dtype, "device": device}
+        self._mean = torch.tensor(self.LATENTS_MEAN, **kw).view(1, -1, 1, 1, 1)
+        self._std = torch.tensor(self.LATENTS_STD, **kw).view(1, -1, 1, 1, 1)
+
+    def reset(self) -> None:
+        self._first = True
+
+    def __call__(self, latent):
+        import torch
+
+        z = latent.unsqueeze(0) if latent.dim() == 4 else latent
+        if self._first or not self.streaming:
+            self.model.clear_cache()
+        self._first = False
+        z = z.to(self._mean.dtype) * self._std + self._mean
+        x = self.model.conv2(z)
+        frames = []
+        for i in range(x.shape[2]):
+            # feat_idx is a cursor the decoder advances per cached conv; it must
+            # restart at 0 for every latent frame while _feat_map persists.
+            self.model._conv_idx = [0]
+            frames.append(
+                self.model.decoder(
+                    x[:, :, i : i + 1],
+                    feat_cache=self.model._feat_map,
+                    feat_idx=self.model._conv_idx,
+                )
+            )
+        return torch.cat(frames, dim=2).float().clamp_(-1, 1)
 
 
 def stream_decode_enabled() -> bool:
@@ -549,6 +659,38 @@ def build_decode_fn(key: str, device, p: Paths | None = None) -> Callable | None
         if not stream_decode_enabled():
             return lambda latent, _m=model: _m.decode(latent)
         return StreamingDecode(model)
+
+    if spec.kind == "flashvaed":
+        # The model definition lives outside this tree, like v3: it is upstream's
+        # file, not ours. Clone it next to the checkpoint (or point
+        # SOULX_FLASHVAED at it):
+        #   models/wan/model_hybrid_aggressive.py from Aoko955/Flash-VAED
+        import sys
+
+        home = os.environ.get("SOULX_FLASHVAED", "/workspace/flashvaed")
+        if home not in sys.path:
+            sys.path.insert(0, home)
+        try:
+            from model_hybrid_aggressive import WanVAE_ as FlashWanVAE
+        except ImportError as exc:
+            raise FileNotFoundError(
+                f"decoder 'flashvaed' needs model_hybrid_aggressive.py in {home}\n"
+                "  get it from https://github.com/Aoko955/Flash-VAED "
+                "(models/wan/model_hybrid_aggressive.py)\n"
+                "  or point SOULX_FLASHVAED at the directory holding it"
+            ) from exc
+
+        model = FlashWanVAE(z_dim=16)
+        # strict=False on purpose: the released student ships DECODER weights and
+        # its Encoder3d is an nn.Identity stub. Verified 0 decoder-side keys
+        # missing, so a real mismatch would still show up as a shape error here.
+        model.load_state_dict(
+            torch.load(ckpt, map_location="cpu", weights_only=True), strict=False
+        )
+        model = model.to(dev, torch.bfloat16).eval().requires_grad_(False)
+        return FlashVAEDDecode(
+            model, dev, torch.bfloat16, streaming=stream_decode_enabled()
+        )
 
     if spec.kind == "v3":
         # Optional: the reconstruction lives outside this tree.

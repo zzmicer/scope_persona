@@ -72,7 +72,7 @@ runs on H200, RTX PRO 6000 and RTX 6000 Ada without edits.
 run options
   --preset fast|quality|reference   shorthand for --res/--vae (default: fast)
   --res    416x720|368x640|WxH      generator resolution, multiples of 16
-  --vae    wan|taew2_1|lighttaew2_1|lightvaew2_1|v3
+  --vae    wan|taew2_1|lighttaew2_1|lightvaew2_1|flashvaed|v3
                                     wan = full Wan2.1 VAE (452ms, reference)
                                     taew2_1 = tiny decoder (32ms, default)
   --gpus   auto|1|2|0,1             default auto
