@@ -96,6 +96,50 @@ github.com/Soul-AILab/SoulX-LiveAct: reference image + audio → lip-synced vide
 Goal: chat with the chano39 anime character; she speaks (kokoro TTS) and performs
 moves from prompts in realtime.
 
+- [x] **Single-card stress test: everything on GPU 3 — 0.72x realtime** (2026-08-11).
+  368x640 x2 = 736x1280, flashvaed HR decode, WebRTC, all three processes on one
+  H200. **2.79s/chunk (chunks 10/20/30 = 2.80/2.79/2.78, mem 67.6GB flat) against
+  a 2.0s budget = 0.72x**, vs the same config split across two cards at 1.47s =
+  1.36x. Single-card costs **1.90x the wall time**.
+  WHERE IT GOES, and this is the result worth keeping: identical work, so every
+  increase is pure SM contention, and **SR becomes the critical path**.
+  | stage        | 2 cards | GPU3 only | change |
+  | up           | 19ms    | 19ms      | -      |
+  | **SR DiT**   | 508ms   | **1752ms**| 3.4x   |
+  | dec flashvaed| ~466ms  | 752-840ms | 1.7x   |
+  | SR total     | 0.99s   | 2.53s     | 2.6x   |
+  | **wall**     | 1.47s   | **2.79s** | 1.90x  |
+  On two cards SR's 0.99s hid entirely behind the generator's 1.47s (wall =
+  max()); co-located it is sum() plus ~0.33s of contention on top, and the
+  sidecar alone now costs more per chunk than the whole denoise.
+  **Memory is NOT the constraint — compute is**: 91.7/143.8GB used, 52GB FREE,
+  no OOM, no CUDA errors, stable 30+ chunks. The card holds the entire persona
+  stack and still cannot feed it.
+  At 0.72x the wall-clock pacer cannot hold its lead: `SOULX_PACER_LEAD=0.7` is
+  absorbing a 0.79s/chunk deficit that COMPOUNDS, so the stream starves
+  progressively rather than settling at a fixed lag.
+  NEXT if single-card realtime is wanted: the lever is the **SR DiT**, not the
+  decoder — `--sr-scale`/generator resolution attack the 1752ms, while a decoder
+  swap can only touch the ~800ms line. Untested.
+- [~] **Single-card deploy mechanics: everything on GPU 3** (2026-08-11). Generator +
+  SR sidecar + persona_aux all under `CUDA_VISIBLE_DEVICES=3` on the 4×H200 pod
+  (`0oa7yefi1wg0v1`, ssh alias `soulx-pod` = 213.181.104.236:11000, key
+  `id_runpod_new`). Cards 0-2 belong to other tenants (48-75GB resident), so 3 is
+  not a preference, it is the only free card. New launcher flags: `--only-gpu N`,
+  `--sr` (starts the sidecar itself), `--sr-gpu`, `--sr-dec`, `--aux-gpu`.
+  THREE things this cost, none of them obvious from outside:
+  1. `--gpus 3` means THREE CARDS (0,1,2) to the planner, not card 3 — a bare
+     number is a count. Pinning one card is `--gpus 3,`. Getting this wrong lands
+     the run on other tenants' GPUs. `--only-gpu 3` now spells it out.
+  2. Co-locating the sidecar REMOVES the pipelining that made SR nearly free. On
+     separate cards SR's ~1.0s overlapped the generator's ~1.47s so wall time was
+     max(); on one card they contend and it is closer to sum(), i.e. ~2.4s against
+     a 2.0s/chunk budget. Expect sub-realtime — that is the point of the test, not
+     a regression.
+  3. A 180s health-gate on the sidecar is TOO SHORT and actively harmful: models
+     take 155s to load off this pod's network volume, torch + UltraFlash imports
+     run before that timer starts, and the launcher's `die` then kills a sidecar
+     that was seconds from serving. Budget is now 600s.
 - [x] Pod bring-up (4×H200, 2026-07-16): weights (51GB LiveAct + wav2vec2) on
   /workspace/soulx/weights; conda env on /workspace/soulx/env (root disk full);
   torch 2.8 cu128 + vllm 0.11 + SageAttention v2.2 + LightVAE + flash-attn 2.8.3
@@ -605,10 +649,20 @@ moves from prompts in realtime.
     NOTE gate2.py (first pass) is WRONG and kept only as a warning: it reset the
     cache every chunk in BOTH arms and compared against a COLD-decoded reference,
     manufacturing a 25/255 "seam" that does not exist. Use gate2b.py.
-  - [ ] Gate 3 for Flash-VAED: wire into the `soulx_runtime.DECODERS` registry as
-    `--vae flashvaed` (kind `flashvaed`, needs the vendored model file + a
-    StreamingDecode-alike that owns the per-frame loop), then judge on MOVING
-    VIDEO — the seam advantage is the only thing that could earn it a slot.
+  - [x] Gate 3 for Flash-VAED DONE, and it found a better home than expected.
+    Registry entry + `FlashVAEDDecode` (owns the per-frame loop, so upstream's
+    hardcoded `i == 20` cache clear cannot plant a mid-stream seam) landed in
+    a4c18b8. The real slot is NOT `--vae flashvaed` on the generator: it is the
+    **SR sidecar's HR decoder** (`sr_service.py --dec flashvaed`), where it
+    replaces the reconstructed v3 (MAE 6.41, smears on motion) at the same cost
+    — 466ms vs v3's 459ms at 736x1280 — and, being causal with a cross-call
+    cache, drops v3's hand-rolled 3-frame lead-in window entirely.
+    NOTE `--vae` is INERT whenever `--sr_url` is set (interactive_demo.py sets
+    `vids=None` and the sidecar decodes), so the generator-side flag and the SR
+    path are mutually exclusive by construction. The launcher now says so rather
+    than silently ignoring `--vae`.
+    STILL OPEN: the "judge on MOVING VIDEO" half — the seam advantage (1.11x vs
+    lightvae's 1.92x) is still unjudged live against `wan` at 368x640.
   - [-] SUPERSEDED, original entry kept for the reasoning: **Evaluate Flash-VAED as a 4th decoder** — https://github.com/Aoko955/Flash-VAED
     (ckpts: HF `Aoko955/Flash-VAED`, student + teacher). Distilled VAE *decoders*
     via independence-aware channel pruning + stage-wise replacement of the
