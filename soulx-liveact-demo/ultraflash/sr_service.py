@@ -8,7 +8,11 @@ POSTs a chunk latent, this returns the upscaled frames.
 Pipeline per chunk (all in Wan2.1 latent space, no pixel round-trip):
     LR latent -> causal latent upsampler (streaming caches)
               -> sparse causal SR DiT   (streaming KV cache)
-              -> v3 tiny decoder        -> HR uint8 frames
+              -> HR decoder (--dec)     -> HR uint8 frames
+
+The HR decoder comes from the demo's own registry (`--dec`), because the SR DiT
+emits ordinary Wan2.1 latents and every decoder scored on the generator's
+latents is therefore a candidate for this stage too.
 
 Both caches persist across chunks for the life of a session; /reset clears them
 when the demo starts a new session, which is what keeps the stream temporally
@@ -38,10 +42,58 @@ sys.path.insert(0, "/workspace/uflash")
 sys.path.insert(0, "/workspace/uflash/UltraFlash/inference")
 
 from sr_probe import DIT_PARAMS, UPSAMPLER_PARAMS, load_sr_dit, load_upsampler  # noqa: E402
-from ultra_dec_v3 import UltraDecoderV3  # noqa: E402
 
 app = Flask(__name__)
 ENG = None
+
+
+def _build_hr_decoder(args, device):
+    """The HR decoder, from the demo's own registry. Returns (fn, streaming).
+
+    The SR DiT emits ordinary Wan2.1 latents at `scale` x the generator's
+    resolution, so every decoder the generator can use is a candidate here --
+    there is nothing SR-specific about this stage beyond the size of its input.
+    Building it through `soulx_runtime.build_decode_fn` keeps one registry, so a
+    decoder scored on the generator's latents can be A/B'd here without a second
+    implementation drifting out of sync with the first.
+
+    `streaming` is the load-bearing part of the return value. A streaming
+    decoder carries its causal feature cache across chunks and must be fed the
+    chunk and nothing but the chunk; a cold one has to be handed the previous
+    3 HR latent frames as a lead-in. Getting that branch wrong does not error --
+    it emits the wrong number of frames, and A/V sync drifts by a third of a
+    second per chunk.
+    """
+    if args.dec == "v3":
+        # Kept as its own path: v3's checkpoint lives in the UltraFlash tree,
+        # not in $SOULX_DECODERS, and this is the arm every SR number to date
+        # was measured on.
+        from ultra_dec_v3 import UltraDecoderV3
+
+        model = (UltraDecoderV3(args.dec_ckpt)
+                 .to(device, torch.float16).eval().requires_grad_(False))
+        return (lambda lat: model.decode_latents(lat.unsqueeze(0))), False
+
+    # The demo source sits next to this file in a checkout and somewhere else
+    # entirely on a deployed pod, where the sidecar lives with the UltraFlash
+    # tree rather than with the launcher.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.environ.get("SOULX_SRC"),
+                 os.path.join(here, "..", "SoulX-LiveAct"),
+                 "/workspace/soulx/SoulX-LiveAct"):
+        if cand and os.path.isfile(os.path.join(cand, "soulx_runtime.py")):
+            sys.path.insert(0, os.path.abspath(cand))
+            break
+    import soulx_runtime
+
+    fn = soulx_runtime.build_decode_fn(args.dec, device)
+    if fn is None:  # "wan": the registry defers to the caller's own VAE object
+        raise SystemExit(
+            "--dec wan is not available in the sidecar: the registry returns the "
+            "generator's own VAE instance for it, and this process has none. "
+            "Use flashvaed (causal, streaming) or v3."
+        )
+    return fn, bool(getattr(fn, "streaming", False))
 
 
 class SREngine:
@@ -63,9 +115,11 @@ class SREngine:
         t0 = time.time()
         self.upsampler = load_upsampler(up_ck, args.scale, self.device, self.dtype)
         self.sr_dit = load_sr_dit(sr_ck, self.device, self.dtype)
-        self.dec = (UltraDecoderV3(args.dec_ckpt)
-                    .to(self.device, torch.float16).eval().requires_grad_(False))
-        print(f"[sr] models loaded in {time.time() - t0:.1f}s", flush=True)
+        self.dec, self.dec_streaming = _build_hr_decoder(args, self.device)
+        print(f"[sr] models loaded in {time.time() - t0:.1f}s "
+              f"(hr decoder: {args.dec}"
+              f"{', streaming' if self.dec_streaming else ', cold + 3-frame lead-in'})",
+              flush=True)
 
         self.gen = torch.Generator(device=self.device).manual_seed(args.seed)
         self.reset()
@@ -77,6 +131,11 @@ class SREngine:
         self.offset = 0
         self.n = 0
         self.first = True
+        # A streaming decoder's cache belongs to the SESSION, so it resets with
+        # the upsampler and DiT caches and at no other time. Missing this would
+        # carry one session's last frames into the next session's first chunk.
+        if getattr(self.dec, "reset", None):
+            self.dec.reset()
         print("[sr] caches reset", flush=True)
 
     @torch.no_grad()
@@ -121,18 +180,23 @@ class SREngine:
         clean = lat - torch.stack(out, dim=0)
         self.offset += lr.shape[2]
 
-        # The tiny decoder's mem-blocks only carry state WITHIN one call, so decode
-        # each chunk with the previous 3 HR latent frames prepended and drop the
-        # lead-in. This mirrors what SoulX does with the Wan VAE and, critically,
-        # reproduces its exact frame counts (21 for chunk 0, then 32) -- the demo
-        # drives A/V sync off frames_emitted, so a different count desyncs audio.
+        # Frame counts are a hard contract, not an implementation detail: the demo
+        # drives A/V sync off frames_emitted, so this stage must reproduce SoulX's
+        # own 21-for-chunk-0-then-32 exactly. Both branches below do; they just
+        # buy it differently.
         t0 = time.time()
         n_lat = clean.shape[2]
-        if self.pre_hr is None:
-            vids = self.dec.decode_latents(clean)            # n_lat*4 - 3 frames
+        if self.dec_streaming:
+            # A causal decoder with a cross-call cache already HAS the history the
+            # lead-in exists to fake, and it yields T*4-3 on the first chunk and
+            # T*4 after -- the contract, for free. Prepending here would decode
+            # the overlap a second time AND overrun the frame count.
+            vids = self.dec(clean[0])
+        elif self.pre_hr is None:
+            vids = self.dec(clean[0])                        # n_lat*4 - 3 frames
         else:
             ctx_in = torch.cat([self.pre_hr[:, :, -3:], clean], dim=2)
-            vids = self.dec.decode_latents(ctx_in)[:, :, -(n_lat * 4):]
+            vids = self.dec(ctx_in[0])[:, :, -(n_lat * 4):]
         self.pre_hr = clean
         u8 = (((vids.squeeze(0).permute(1, 2, 3, 0).float() + 1.0) * 127.5)
               .clamp(0, 255).to(torch.uint8).contiguous().cpu().numpy())
@@ -177,7 +241,17 @@ def main():
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--ckpt_dir", default="/workspace/uflash/ckpt")
     ap.add_argument("--dec_ckpt",
-                    default="/workspace/uflash/ckpt/v1.1-ultra-decoder-v3-ema_decoder.pth")
+                    default="/workspace/uflash/ckpt/v1.1-ultra-decoder-v3-ema_decoder.pth",
+                    help="checkpoint for --dec v3 only; the registry decoders "
+                         "resolve their own out of $SOULX_DECODERS")
+    ap.add_argument("--dec", default="flashvaed",
+                    choices=["flashvaed", "v3", "taew2_1", "lighttaew2_1",
+                             "lightvaew2_1"],
+                    help="HR decoder. flashvaed (default) is an official causal "
+                         "student that carries its cache across chunks, so it "
+                         "needs no lead-in window and scores MAE 3.78; v3 is our "
+                         "reconstruction (MAE 6.41, smears on motion) and is the "
+                         "arm the earlier SR numbers were measured on")
     ap.add_argument("--scale", type=int, default=2, choices=[2, 3])
     ap.add_argument("--sr_kv_len", type=int, default=3)
     ap.add_argument("--sr_timestep", type=float, default=1000.0)
