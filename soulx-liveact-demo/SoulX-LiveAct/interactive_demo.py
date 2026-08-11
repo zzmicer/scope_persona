@@ -106,6 +106,9 @@ os.makedirs(HLS_ROOT, exist_ok=True)
 appearance_editor = FalAppearanceEditor(os.path.join(BASE_DIR, "uploads"))
 
 SR = 16000  # everything audio inside the session is 16k mono float32
+# How far ahead of playback the emitter runs. Tunable because it is the
+# largest single term in perceived speak-latency; see the pacer below.
+_PACER_LEAD = float(os.environ.get("SOULX_PACER_LEAD", "1.6"))
 
 # Wan-Streamer v0.3 "world + event stream": the world prompt is the PERSISTENT,
 # pose-neutral identity/scene. It must NOT lock a posture (e.g. "looks at the
@@ -642,7 +645,11 @@ class LiveEngine:
         )
 
         torch.cuda.empty_cache()
-        self.blksz_lst = [6, 8]
+        # Upstream's schedule is [6, 8]: 6 latent frames of context, 8 new.
+        # Overridable only to measure the chunk-length/real-time trade.
+        self.blksz_lst = [
+            int(x) for x in os.environ.get("SOULX_BLKSZ", "6,8").split(",")
+        ]
         self.frame_len = (self.height // (self.patch_size[1] * self.vae_stride[1])) * (
             self.width // (self.patch_size[2] * self.vae_stride[2])
         )
@@ -1362,7 +1369,12 @@ class LiveEngine:
                     if wall_start is None:
                         wall_start = time.perf_counter()
                     frames_emitted += n_emit
-                    target = wall_start + frames_emitted / self.fps - 1.6
+                    # Playback lead. This is the single largest term in perceived
+                    # speak-latency: audio queued at time t is not heard until the
+                    # chunk carrying it is played, one lead later. It buys tolerance
+                    # for slow chunks, so it can only shrink as far as the per-chunk
+                    # slack (2.0s media - ~1.44s generate) reliably covers.
+                    target = wall_start + frames_emitted / self.fps - _PACER_LEAD
                     lag = target - time.perf_counter()
                     if lag > 0:
                         time.sleep(lag)
