@@ -85,7 +85,14 @@ run options
   --vae    wan|taew2_1|lighttaew2_1|lightvaew2_1|flashvaed|v3
                                     wan = full Wan2.1 VAE (452ms, reference)
                                     taew2_1 = tiny decoder (32ms, default)
-  --gpus   auto|1|2|0,1             default auto
+  --gpus   auto|1|2|0,1             default auto. NOTE a bare number is a COUNT
+                                    (--gpus 2 = cards 0,1); to name one card
+                                    write it as a list: --gpus 3,
+  --aux-gpu N|same                  where chat/TTS runs. Default: the emptiest
+                                    card the generator is not using
+  --only-gpu N                      put EVERYTHING on card N -- generator, aux,
+                                    and the SR sidecar if --sr. Shorthand for
+                                    --gpus N, --aux-gpu same --sr-gpu same
   --fp8    blocks|off|all           default blocks; auto-off below sm_89
   --attn   auto|sdpa|fa3|sage       default auto; fa3 is Hopper-only
   --sage-scope self|all|self+cross  which attentions sage covers (default self)
@@ -100,13 +107,17 @@ run options
                                     clock: 0.97 vs 4.47 Mbps, inter-frame p99
                                     137ms vs 1603ms. Reads TURN settings from
                                     /root/.config/soulx/turn.env if present.
-  --sr-url URL                      hand decode to an UltraFlash SR sidecar and
-                                    stream at --sr-scale x the generator size
-                                    (368x640 x2 -> 736x1280). The sidecar owns
-                                    the upsampler + SR DiT + HR decoder, so
-                                    --vae is unused. Costs one chunk (~2s) of
-                                    added latency, since chunk N is submitted
+  --sr                              start an UltraFlash SR sidecar and hand it
+                                    the decode, streaming at --sr-scale x the
+                                    generator size (368x640 x2 -> 736x1280).
+                                    The sidecar owns the upsampler + SR DiT +
+                                    HR decoder, so --vae is unused; pick the HR
+                                    decoder with --sr-dec. Costs one chunk (~2s)
+                                    of added latency, since chunk N is submitted
                                     while chunk N-1 is emitted.
+  --sr-url URL                      use an ALREADY-RUNNING sidecar instead
+  --sr-dec v3|flashvaed|taew2_1|... HR decoder in the sidecar (default v3)
+  --sr-gpu N                        default: the generator's card
   --sr-scale N (2)
   --port N (8090)  --fps N (16)  --image PATH  --seed N
   --foreground                      run in this shell instead of detaching
@@ -175,6 +186,7 @@ cmd_fetch() {
 cmd_stop() {
   pkill -f "[i]nteractive_demo.py" 2>/dev/null
   pkill -f "[p]ersona_aux.py"      2>/dev/null
+  pkill -f "[s]r_service.py"       2>/dev/null
   pkill -f "[t]orchrun"            2>/dev/null
   echo "scope-soulx: stopped (CUDA takes ~15s to free)"
 }
@@ -188,21 +200,27 @@ cmd_run() {
   local preset=fast res="" vae="" gpus=auto fp8=blocks attn=auto compile=blocks
   local port=8090 fps=16 image="" seed=42 foreground=0 dry=0 sage_scope=self
   local lora="" lora_strength=1.0 webrtc=0 sr_url="" sr_scale=2
+  local sr=0 sr_dec=v3 sr_gpu="" aux_gpu="" only_gpu="" vae_explicit=""
   local logfile="$LOGDIR/demo.log"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --preset)     preset="$2"; shift 2 ;;
       --res|--size) res="$2";    shift 2 ;;
-      --vae)        vae="$2";    shift 2 ;;
+      --vae)        vae="$2"; vae_explicit="$2"; shift 2 ;;
       --gpus)       gpus="$2";   shift 2 ;;
       --fp8)        fp8="$2";    shift 2 ;;
       --attn)       attn="$2";   shift 2 ;;
       --sage-scope) sage_scope="$2"; shift 2 ;;
       --compile)    compile="$2";shift 2 ;;
       --webrtc)     webrtc=1;    shift ;;
+      --sr)         sr=1;        shift ;;
       --sr-url)     sr_url="$2"; shift 2 ;;
+      --sr-dec)     sr_dec="$2"; shift 2 ;;
+      --sr-gpu)     sr_gpu="$2"; shift 2 ;;
       --sr-scale)   sr_scale="$2"; shift 2 ;;
+      --aux-gpu)    aux_gpu="$2"; shift 2 ;;
+      --only-gpu)   only_gpu="$2"; shift 2 ;;
       --lora)       lora="$2";   shift 2 ;;
       --lora-strength) lora_strength="$2"; shift 2 ;;
       --port)       port="$2";   shift 2 ;;
@@ -224,7 +242,24 @@ cmd_run() {
     *) die "unknown preset '$preset' (fast|quality|reference)" ;;
   esac
 
+  # --only-gpu N. The trailing comma is not a typo: a bare `--gpus 3` means
+  # "three cards" (0,1,2) to the planner, and pinning to card 3 is `--gpus 3,`.
+  # Easy to get wrong from the outside and it fails as an OOM on someone else's
+  # GPU, so the ergonomic flag exists to make it unmistakable.
+  if [[ -n "$only_gpu" ]]; then
+    gpus="${only_gpu},"; aux_gpu=same; sr_gpu=same
+  fi
+
   probe_plan "$gpus" "$fp8" "$attn" "$res"
+
+  # The planner puts chat/TTS on the emptiest card the generator is not using,
+  # which is right by default and wrong when the point is to occupy exactly one.
+  case "$aux_gpu" in
+    "")   ;;
+    same) SOULX_AUX_GPU="${SOULX_GEN_GPUS%%,*}" ;;
+    *)    SOULX_AUX_GPU="$aux_gpu" ;;
+  esac
+  [[ "$sr_gpu" == same ]] && sr_gpu="${SOULX_GEN_GPUS%%,*}"
   mkdir -p "$LOGDIR" "$(dirname "$logfile")"
 
   local gen_args=(
@@ -238,9 +273,17 @@ cmd_run() {
   # With an SR sidecar the generator decodes NOTHING itself -- the sidecar owns
   # the upsampler, the SR DiT and the HR decoder -- so --vae above is inert and
   # the stream comes out at sr_scale x the generator resolution.
+  [[ $sr == 1 && -z "$sr_url" ]] && sr_url="http://127.0.0.1:$((port + 2))"
   if [[ -n "$sr_url" ]]; then
     gen_args+=(--sr_url "$sr_url" --sr_scale "$sr_scale")
     echo "scope-soulx: SR sidecar $sr_url (x$sr_scale) owns the decode; --vae is unused"
+    # The decoder choice moves to the sidecar under SR, and --vae silently
+    # becomes inert. Someone asking for a decoder here means it, so say where
+    # the flag went rather than ignoring it.
+    if [[ -n "$vae_explicit" ]]; then
+      echo "scope-soulx: --vae $vae_explicit is INERT under SR -- the sidecar decodes." >&2
+      echo "scope-soulx: did you mean --sr-dec $vae_explicit ?" >&2
+    fi
   fi
   if [[ $webrtc == 1 ]]; then
     gen_args+=(--webrtc)
@@ -298,8 +341,34 @@ cmd_run() {
     launch=("${env_prefix[@]}" "$PY" interactive_demo.py "${gen_args[@]}")
   fi
 
+  # The sidecar is a separate process for the same reason persona_aux is, and
+  # gets its own card by default for a second reason: on one card it does not
+  # overlap the generator, it CONTENDS with it, so the pipelining that made SR
+  # nearly free (wall time max(), not sum()) stops applying.
+  local sr_cmd=()
+  if [[ $sr == 1 ]]; then
+    : "${sr_gpu:=$SOULX_AUX_GPU}"
+    # The sidecar lives with the UltraFlash tree on a deployed pod and next to
+    # the launcher in a checkout; it imports sr_probe and the SR checkpoints
+    # from beside itself either way, so prefer the deployed copy.
+    local sr_py="${SOULX_UFLASH:-/workspace/uflash}/sr_service.py"
+    [[ -f "$sr_py" ]] || sr_py="$HERE/ultraflash/sr_service.py"
+    [[ -f "$sr_py" ]] || die "--sr: no sr_service.py (looked in \
+${SOULX_UFLASH:-/workspace/uflash} and $HERE/ultraflash)"
+    sr_cmd=(env "CUDA_VISIBLE_DEVICES=$sr_gpu"
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+            "$PY" "$sr_py"
+            --port "$((port + 2))" --scale "$sr_scale" --dec "$sr_dec")
+    echo "scope-soulx: SR sidecar on GPU $sr_gpu, hr decoder=$sr_dec"
+    if [[ "$sr_gpu" == "${SOULX_GEN_GPUS%%,*}" ]]; then
+      echo "scope-soulx: sidecar SHARES the generator's card -- SR no longer" \
+           "overlaps the denoise, so budget gen+sr serially against 2.0s/chunk" >&2
+    fi
+  fi
+
   if [[ $dry == 1 ]]; then
     echo "scope-soulx: would run, in $SRC:"
+    [[ ${#sr_cmd[@]} -gt 0 ]] && printf '  %s\n' "${sr_cmd[*]}"
     echo "  CUDA_VISIBLE_DEVICES=$SOULX_AUX_GPU $PY persona_aux.py --port $((port + 1)) --preload"
     printf '  %s\n' "${launch[*]}"
     echo "scope-soulx: log -> $logfile"
@@ -310,10 +379,34 @@ cmd_run() {
   # torchrun rank a second CUDA context destabilises NCCL. The planner gives it
   # its own card whenever one is idle.
   cd "$SRC" || die "no source dir at $SRC"
+
+  if [[ ${#sr_cmd[@]} -gt 0 ]]; then
+    "${sr_cmd[@]}" >> "$LOGDIR/sr_service.log" 2>&1 &
+    local sr_pid=$!
+    trap 'kill "$sr_pid" 2>/dev/null || true' EXIT INT TERM
+    # Wait for it here rather than letting the generator discover it missing:
+    # the SR request path has no fallback to a local decode, so a sidecar that
+    # failed to load turns into a stalled stream several minutes into a warmup,
+    # with the real error sitting in a log nobody is tailing.
+    # Budget generously: the upsampler + SR DiT + decoder took 155s to load off
+    # this pod's network volume, and torch and the UltraFlash imports run before
+    # the timer even starts. A ceiling that merely covers the happy path turns a
+    # slow disk into "sidecar did not come up" -- and the die below kills the
+    # sidecar that was seconds from serving.
+    local ok=0
+    for _ in $(seq 1 300); do
+      curl -sf "http://127.0.0.1:$((port + 2))/health" >/dev/null 2>&1 && { ok=1; break; }
+      kill -0 "$sr_pid" 2>/dev/null || break
+      sleep 2
+    done
+    [[ $ok == 1 ]] || die "SR sidecar did not come up within 600s; see $LOGDIR/sr_service.log"
+    echo "scope-soulx: SR sidecar ready on :$((port + 2))"
+  fi
   CUDA_VISIBLE_DEVICES="$SOULX_AUX_GPU" "$PY" persona_aux.py \
     --port "$((port + 1))" --preload >> "$LOGDIR/persona_aux.log" 2>&1 &
   local aux_pid=$!
-  trap 'kill "$aux_pid" 2>/dev/null || true' EXIT INT TERM
+  # Replaces the sidecar's own trap, so it has to kill both.
+  trap 'kill "$aux_pid" ${sr_pid:-} 2>/dev/null || true' EXIT INT TERM
 
   if [[ $foreground == 1 ]]; then
     "${launch[@]}" 2>&1 | tee "$logfile"
