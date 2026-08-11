@@ -96,6 +96,65 @@ github.com/Soul-AILab/SoulX-LiveAct: reference image + audio → lip-synced vide
 Goal: chat with the chano39 anime character; she speaks (kokoro TTS) and performs
 moves from prompts in realtime.
 
+- [x] **The room: one stage, one seat, many chairs** (2026-08-11). `--room` turns the
+  demo into a public link. Everyone lands in the SAME already-running stream;
+  one visitor at a time holds the seat for 90s and drives her; everyone else
+  watches and talks. The queue is the show, and the GPU never idles between
+  users the way private per-visitor rooms would (which also pay a session
+  restart each). ~40 drivers/hour + unlimited watchers on one H200.
+  - `stage.py` owns the seat (turn queue, tokens, no-show grace, outfit
+    credits); `room.py` owns the crowd (presence, open chat, flood control).
+    Both stdlib-only and clock-injected, so the whole social layer is testable
+    with no model loaded: **53 unit tests**, plus **36 end-to-end** against the
+    live pod.
+  - **Talking is open, driving is gated** — opposite rules on purpose. Room chat
+    never reaches the model at all (it is people talking to each other), while
+    `/action /say /chat /anchor /action_hold /lora /persona /session/*` now
+    require the turn token; they were wide open. Turn end clears the sustained
+    pose so the next driver starts neutral rather than inheriting a stranger's
+    held state (which also decays: arm wardrobe drifts past ~30s of hold).
+  - **A watcher's message IS the suggestion** — no separate suggestion box. The
+    driver's client renders every room line with a one-tap replay, so watchers
+    type where they already type.
+  - New `templates/room.html`, deliberately NOT chat.html (which stays as the
+    operator console at `/?console=1`). Six actions that are VERIFIED to render;
+    sit/stand/lie are absent because the I2V reference path re-imposes the
+    reference every chunk and no prompt reaches it, so they silently do nothing.
+    Acknowledge in <100ms, render in ~1.7s. **WebRTC now falls back to the
+    WebSocket path** instead of showing a black screen when a relay is
+    unreachable — the failure mode this demo actually hit.
+  - Uploads are refused in room mode (deletes the likeness/consent surface);
+    `/room/admin` is a kill switch (close/open/end/reset) behind
+    `SOULX_ADMIN_TOKEN`, absent entirely when unset.
+  - NOT DONE, and the remaining launch blocker: **moderation on free text**.
+    Mitigated structurally — room chat never reaches Qwen/T5, and only one
+    driver per 90s can — but the driver's text does reach the model, and room
+    chat is displayed to everyone.
+- [x] **Drop SR, take the bigger native frame: 400x640 at 1.15x realtime** (2026-08-11).
+  `--only-gpu 3 --res 400x640 --vae flashvaed --attn fa3 --fp8 blocks --compile
+  blocks --webrtc`, no SR sidecar. **1.74s/chunk against a 2.0s budget = 1.15x,
+  18.4 fps, 70.9GB**, flat across 240 chunks.
+  The comparison that matters: the 288x512 x2 SR config measured 1.72s/chunk —
+  the SAME wall time for a SMALLER generated frame (147k px vs 256k px). Removing
+  the sidecar returned exactly the contention the stress test above attributed to
+  it, and buys a natively larger frame instead of an upscaled one. It also drops
+  the mosaic/cross-hatch artifact for free, since that is a property of the SR
+  DiT (trained with AIGC degradation on photoreal Wan output, so it invents
+  pore/hair-grade detail against flat cel-shaded anime), not of the generator.
+- [x] **WebRTC actually works off this pod: local coturn over TCP** (2026-08-11).
+  Cloudflare TURN is a dead end here — its UDP relay hostname resolves IPv6-only
+  with no IPv6 path out of the container, and the TLS/443 fallback allocates a
+  relay but then answers CHANNEL_BIND with 401. The fix needs no code: RunPod
+  maps **TCP** ports, so run the pod's own coturn on a mapped one and dial it
+  over TCP. `/etc/turnserver.conf` listens on pod 3000 (public 11001) with
+  `relay-ip=172.19.0.2` (the CONTAINER ip): the browser never contacts the relay
+  address directly, it reaches its allocation over the TCP control connection,
+  and the peer that DOES send to it (aiortc) is on the same host. Static creds go
+  in `/root/.config/soulx/turn.env` as `SOULX_TURN_URL/USER/PASS` — the
+  Cloudflare `CF_ID/CF_TOKEN` must be ABSENT, since `_cloudflare_ice()` is tried
+  first and would shadow them. Verified with an out-of-pod ALLOCATE (the pod CAN
+  hairpin its public IP, so the server-side probe passes too) and by
+  `[webrtc] TURN relay via turn:213.181.104.236:11001?transport=tcp` in the log.
 - [x] **Single-card stress test: everything on GPU 3 — 0.72x realtime** (2026-08-11).
   368x640 x2 = 736x1280, flashvaed HR decode, WebRTC, all three processes on one
   H200. **2.79s/chunk (chunks 10/20/30 = 2.80/2.79/2.78, mem 67.6GB flat) against

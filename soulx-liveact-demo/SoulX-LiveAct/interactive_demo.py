@@ -38,6 +38,7 @@ import io
 import json
 import os
 import queue
+import secrets
 import shutil
 import struct
 import subprocess
@@ -72,6 +73,8 @@ from flask_sock import Sock
 from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
 from lightx2v.models.video_encoders.hf.wan.vae import WanVAE as LightVAE
 from PIL import Image
+from room import Room, RoomError
+from stage import Stage, StageConfig, StageError
 from torchvision import transforms
 from transformers import Wav2Vec2FeatureExtractor
 from util_liveact import (
@@ -288,6 +291,95 @@ class SessionState:
 
 
 STATE = SessionState()
+
+# ----------------------------------------------------------------------------
+# One stage, one seat, many chairs.
+#
+# There is exactly one live session on one GPU, so exactly one visitor at a time
+# can drive her. That is not hidden -- it is the mechanic: everyone lands in the
+# same already-running stream, one person holds the seat, and the queue is the
+# show. `stage.py` owns the seat, `room.py` owns the crowd.
+#
+# Talking and driving have opposite access rules on purpose. Chat is open to
+# everyone always (a room where only one person may speak is not a room), while
+# the endpoints that move the character are gated on the turn token. Watchers
+# still steer the show: the driver's client renders every room message with a
+# one-tap replay, so a suggestion IS a chat message.
+#
+# Gating is opt-in via --room. Off, every control endpoint behaves exactly as it
+# always has -- the single-operator workflow and the probe scripts predate this
+# and must not need a token.
+# ----------------------------------------------------------------------------
+ROOM = Room()
+ROOM_MODE = False
+MAX_SAY_LEN = 240
+# Set from SOULX_ADMIN_TOKEN. Without one the kill switch is simply absent
+# rather than open: a public link with an unauthenticated "stop everything"
+# endpoint is worse than no kill switch at all.
+ADMIN_TOKEN = os.environ.get("SOULX_ADMIN_TOKEN") or ""
+
+
+def _on_turn_start(turn):
+    ROOM.system(f"{turn.name} took the mic")
+
+
+def _on_turn_end(turn, reason):
+    """Hand back a neutral character.
+
+    A sustained pose outlives the turn that set it -- that is what "sustained"
+    means -- so without this the next driver inherits a stranger's held state
+    and starts by undoing it. Also the arm wardrobe drifts past ~30s of hold
+    (bare -> sleeves -> gloves), so a pose nobody owns any more is pure decay.
+    """
+    with STATE.lock:
+        STATE.pending_directive = {"transition": None, "rest": ""}
+    if reason in ("expired", "skipped", "left"):
+        ROOM.system(f"{turn.name}'s turn ended")
+    else:
+        ROOM.system(f"{turn.name}'s turn ended ({reason})")
+
+
+STAGE = Stage(on_turn_start=_on_turn_start, on_turn_end=_on_turn_end)
+
+
+def _turn_token():
+    """The bearer of control authority for this request.
+
+    Header first so one scheme covers both the JSON endpoints and the multipart
+    /session/start; body/form is accepted as a convenience for curl.
+    """
+    token = request.headers.get("X-Turn-Token")
+    if token:
+        return token
+    if request.form:
+        return request.form.get("token")
+    body = request.get_json(force=True, silent=True) or {}
+    return body.get("token") if isinstance(body, dict) else None
+
+
+def require_turn():
+    """Gate for every endpoint that moves the character. No-op unless --room."""
+    if not ROOM_MODE:
+        return None
+    return STAGE.authorize(_turn_token())
+
+
+def spend_outfit():
+    """Consume one appearance-change credit, or refuse.
+
+    Metered even harder than the rest: each edit is a paid API call AND a
+    session restart, so it is one per turn and capped globally.
+    """
+    if not ROOM_MODE:
+        return None
+    return STAGE.spend_outfit(_turn_token())
+
+
+@app.errorhandler(StageError)
+@app.errorhandler(RoomError)
+def _stage_error(exc):
+    return jsonify({"status": "error", "message": exc.message}), exc.status
+
 
 # ----------------------------------------------------------------------------
 # WebSocket frame feed: binary msgs = 1B type (0=jpeg,1=pcm16@16k) + f64le ts + payload
@@ -1486,8 +1578,16 @@ def index():
     # not something the server can find out for the client.
     want = (request.args.get("transport") or "").lower()
     use_rtc = WEBRTC is not None and want != "ws"
+    # Two audiences, two pages. The console is the operator's: uploads, persona
+    # editing, LoRA sweeps, every control at once. The room is a stranger's: one
+    # stream, six buttons that are known to render, and no way to break it.
+    # Trying to serve both from one template would be a page-long pile of
+    # conditionals over exactly the controls that must not leak into public.
+    template = "room.html" if ROOM_MODE else "chat.html"
+    if request.args.get("console"):
+        template = "chat.html"
     return render_template(
-        "chat.html",
+        template,
         # OUT size, not the generator's: with an SR sidecar the stream leaves at
         # sr_scale x the generator resolution, and the page shapes its viewer
         # frame from these. Sending the generator size made the frame the wrong
@@ -1498,6 +1598,7 @@ def index():
         stream_h=engine.out_height,
         webrtc=use_rtc,
         ice_servers=json.dumps(soulx_webrtc.ice_servers()) if use_rtc else "[]",
+        persona_name=STATE.persona_name,
     )
 
 
@@ -1561,9 +1662,24 @@ def _queue_session_start(img_path, main_prompt):
 
 @app.route("/session/start", methods=["POST"])
 def session_start():
+    require_turn()
     with STATE.lock:
         img_path = STATE.current_image_path or engine.args.image
     f = request.files.get("img_file")
+    if f and ROOM_MODE:
+        # A public link plus "upload any picture, she becomes it" is a
+        # likeness/consent review surface, and it is the single biggest thing
+        # standing between this demo and a link you can hand to strangers. A
+        # fixed roster costs a 3-minute toy almost nothing, so v1 has no uploads.
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "image uploads are disabled in room mode",
+                }
+            ),
+            403,
+        )
     if f:
         # unique name per upload: the previous reference may still be mmap'd by
         # the session we are about to replace, and overwriting it in place also
@@ -1602,6 +1718,7 @@ def session_start():
 
 @app.route("/session/stop", methods=["POST"])
 def session_stop():
+    require_turn()
     STATE.stop_flag = True
     return jsonify({"status": "ok"})
 
@@ -1630,6 +1747,7 @@ def persona_payload():
 
 @app.route("/persona", methods=["POST"])
 def persona():
+    require_turn()
     configure_persona(request.get_json(force=True))
     brain.reset_history()
     STATE.log("system", f"persona updated: {STATE.persona_name}")
@@ -1638,9 +1756,24 @@ def persona():
 
 @app.route("/say", methods=["POST"])
 def say():
+    require_turn()
     text = (request.get_json(force=True).get("text") or "").strip()
     if not text:
         return jsonify({"status": "error", "message": "empty"}), 400
+    if ROOM_MODE and len(text) > MAX_SAY_LEN:
+        # Uncapped, this is a megaphone: TTS turns any length of text into that
+        # much speech, and the audio queue is played to every viewer with no way
+        # for them to skip it. One paragraph is one turn's worth of everyone
+        # else's time.
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": f"keep it under {MAX_SAY_LEN} characters",
+                }
+            ),
+            400,
+        )
     try:
         wav = tts.synth(text, voice=STATE.voice)
     except Exception as e:
@@ -1654,6 +1787,7 @@ def say():
 
 @app.route("/action", methods=["POST"])
 def action():
+    require_turn()
     body = request.get_json(force=True)
     text = (body.get("text") or "").strip()
     pose = body.get("pose")  # explicit resting state; None -> gesture, "" -> clear
@@ -1682,10 +1816,13 @@ def action():
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    turn = require_turn()
     msg = (request.get_json(force=True).get("text") or "").strip()
     if not msg:
         return jsonify({"status": "error", "message": "empty"}), 400
     STATE.log("user", msg)
+    if turn is not None:
+        ROOM.said(turn.name, msg, client_id=turn.client_id)
     change_instruction = parse_change_command(msg)
     if change_instruction is not None:
         if not change_instruction:
@@ -1698,20 +1835,34 @@ def chat():
                 ),
                 400,
             )
+        # Claim the slot first, then charge for it. The credit is real money and
+        # a whole turn's allowance, so it must not be burned by the 409 below.
+        #
+        # The charge stays OUTSIDE STATE.lock deliberately: _on_turn_end takes
+        # STATE.lock while the stage lock is already held, so taking them in the
+        # other order here would be a lock-order inversion.
         with STATE.lock:
-            if STATE.appearance_busy:
-                return (
-                    jsonify(
-                        {
-                            "status": "error",
-                            "message": "another appearance change is still running",
-                        }
-                    ),
-                    409,
-                )
-            STATE.appearance_busy = True
-            source_path = STATE.current_image_path or engine.args.image
-            main_prompt = STATE.current_main_prompt
+            busy = STATE.appearance_busy
+            if not busy:
+                STATE.appearance_busy = True
+                source_path = STATE.current_image_path or engine.args.image
+                main_prompt = STATE.current_main_prompt
+        if busy:
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "another appearance change is still running",
+                    }
+                ),
+                409,
+            )
+        try:
+            spend_outfit()
+        except StageError:
+            with STATE.lock:
+                STATE.appearance_busy = False
+            raise
         STATE.log("system", "Creating the new appearance…")
         try:
             img_path = appearance_editor.edit(source_path, change_instruction)
@@ -1769,6 +1920,7 @@ def chat():
         except Exception as e:
             STATE.log("error", f"TTS failed: {e}")
         STATE.log("chano", d.say)
+        ROOM.persona(d.say, who=STATE.persona_name)
     return jsonify(
         {
             "status": "ok",
@@ -1788,6 +1940,7 @@ def action_hold():
     given. Runtime-settable on purpose: how long a gesture should linger is a
     feel judgement that wants a few tries, and a restart costs a ~3min warmup.
     """
+    require_turn()
     try:
         chunks = int(request.get_json(force=True).get("chunks"))
     except (TypeError, ValueError):
@@ -1836,6 +1989,7 @@ def anchor():
     Body: {"pose": str|null}. Omitted -> whatever state is currently held stays
     held. Pass a pose to overwrite it, or "" to deliberately clear it.
     """
+    require_turn()
     frame = STATE.last_frame
     if frame is None:
         return jsonify(
@@ -1871,6 +2025,7 @@ def lora_strength():
     A full warmup is ~10 minutes, so this is what makes a strength sweep
     cost one launch instead of one per point.
     """
+    require_turn()
     if engine.lora is None:
         return jsonify({"status": "error", "message": "no LoRA loaded"}), 400
     if engine.use_dist:
@@ -1892,6 +2047,135 @@ def lora_strength():
             STATE.pending_lora_strength = None
         return jsonify({"status": "ok", "strength": value, "applied": "now"})
     return jsonify({"status": "ok", "strength": value, "applied": "next chunk"})
+
+
+def _client_id():
+    body = request.get_json(force=True, silent=True) or {}
+    cid = (
+        body.get("client_id") if isinstance(body, dict) else None
+    ) or request.args.get("client_id")
+    if not cid:
+        raise RoomError("client_id required")
+    return str(cid)[:64]
+
+
+def _room_payload(client_id, after_id, name=None):
+    """Everything a viewer's timer needs, in ONE request.
+
+    Presence, the queue and the chat tail move together and are all driven by
+    the same poll -- so a poll IS the heartbeat, for both the room roster and
+    the stage queue. A second heartbeat endpoint would only add a way for the
+    two to disagree about who is still here.
+    """
+    snap = ROOM.snapshot(client_id=client_id, after_id=after_id, name=name)
+    snap["stage"] = STAGE.heartbeat(client_id)
+    snap["room_mode"] = ROOM_MODE
+    # Whether the outfit ritual is even possible. Without a server-side FAL_KEY
+    # the edit endpoint can only fail, and a prominent button that always
+    # errors is worse than no button -- the same rule as the action palette.
+    snap["outfit_enabled"] = appearance_editor.configured
+    return snap
+
+
+@app.route("/room/join", methods=["POST"])
+def room_join():
+    """Enter the room as a watcher. Does NOT get you in line.
+
+    Landing on the link must not queue you: the whole shape of this is that you
+    arrive mid-stream, watch a stranger discover it, and THEN decide to take the
+    mic. Auto-queueing every page load would also fill the line with tabs whose
+    owners never wanted a turn, and the advertised ETA is only honest if the
+    people in it asked to be there.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    cid = _client_id()
+    ROOM.see(cid, body.get("name"))
+    return jsonify(_room_payload(cid, int(body.get("since") or 0), body.get("name")))
+
+
+@app.route("/room/queue", methods=["POST"])
+def room_queue():
+    """Get in line to drive. Idempotent -- pressing twice keeps your place."""
+    body = request.get_json(force=True, silent=True) or {}
+    cid = _client_id()
+    name = body.get("name") or ROOM.name_of(cid)
+    ROOM.see(cid, name)
+    STAGE.join(cid, name)
+    # The payload's own heartbeat re-reads the queue after the join, so a
+    # visitor promoted by their own join already sees the token here.
+    return jsonify(_room_payload(cid, int(body.get("since") or 0), name))
+
+
+@app.route("/room/poll", methods=["GET", "POST"])
+def room_poll():
+    cid = _client_id()
+    since = request.args.get("since")
+    if since is None:
+        body = request.get_json(force=True, silent=True) or {}
+        since = body.get("since") if isinstance(body, dict) else 0
+    return jsonify(_room_payload(cid, int(since or 0)))
+
+
+@app.route("/room/say", methods=["POST"])
+def room_say():
+    """Talk to the room. Open to everyone -- watchers included.
+
+    This is NOT /chat: nothing here reaches the model, costs GPU time or moves
+    the character. It is people talking to each other around the stream, and
+    the driver's client turns any line into a one-tap action.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    cid = _client_id()
+    msg = ROOM.post(cid, body.get("text"), name=body.get("name"))
+    return jsonify({"status": "ok", "message": msg})
+
+
+@app.route("/room/skip", methods=["POST"])
+def room_skip():
+    """The driver hands the seat on early."""
+    STAGE.skip(_turn_token())
+    return jsonify({"status": "ok"})
+
+
+@app.route("/room/admin", methods=["POST"])
+def room_admin():
+    """Kill switch and reset-to-idle, for whoever is holding the link.
+
+    Body: {"do": "close"|"open"|"end"|"reset", "admin": "<token>"}.
+      close  stop granting turns; watchers keep watching
+      open   resume
+      end    boot the current driver, keep the queue moving
+      reset  end the turn AND clear the sustained pose back to neutral
+
+    Not reachable at all without SOULX_ADMIN_TOKEN in the server environment.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    supplied = request.headers.get("X-Admin-Token") or body.get("admin") or ""
+    if not ADMIN_TOKEN or not secrets.compare_digest(str(supplied), ADMIN_TOKEN):
+        return jsonify({"status": "error", "message": "not authorized"}), 403
+    do = (body.get("do") or "").lower()
+    if do == "close":
+        STAGE.close(body.get("reason") or "closed")
+        ROOM.system("the stage is closed")
+    elif do == "open":
+        STAGE.open()
+        ROOM.system("the stage is open")
+    elif do in ("end", "reset"):
+        STAGE.force_end("moderated")
+        if do == "reset":
+            with STATE.lock:
+                STATE.pending_directive = {"transition": None, "rest": ""}
+    else:
+        return jsonify({"status": "error", "message": "do: close|open|end|reset"}), 400
+    return jsonify({"status": "ok", "stage": STAGE.state()})
+
+
+@app.route("/room/leave", methods=["POST"])
+def room_leave():
+    cid = _client_id()
+    ROOM.leave(cid)
+    STAGE.leave(cid)
+    return jsonify({"status": "ok"})
 
 
 @app.route("/status")
@@ -2098,8 +2382,36 @@ if __name__ == "__main__":
     parser.add_argument(
         "--autostart", action="store_true", help="start session immediately"
     )
+    parser.add_argument(
+        "--room",
+        action="store_true",
+        help="public room mode: many viewers share one stream, one at a time "
+        "holds the seat and drives her. Gates /action, /say, /chat, /anchor, "
+        "/action_hold, /lora, /persona and /session/* on the turn token, and "
+        "disables reference-image uploads. Off, every endpoint is wide open, "
+        "which is what the single-operator workflow and the probes expect.",
+    )
+    parser.add_argument(
+        "--turn-seconds",
+        type=float,
+        default=90.0,
+        help="how long one visitor holds the seat (default 90). Long enough to "
+        "discover what works, short enough that the advertised ETA stays honest.",
+    )
+    parser.add_argument(
+        "--outfit-budget",
+        type=int,
+        default=40,
+        help="global ceiling on appearance changes (default 40). Each one is a "
+        "paid API call plus a session restart, so it is capped for the whole run.",
+    )
     args = parser.parse_args()
     STATE.action_hold = args.action_hold
+    ROOM_MODE = args.room
+    STAGE.config = StageConfig(
+        turn_seconds=args.turn_seconds,
+        outfit_budget=args.outfit_budget,
+    )
 
     # Separate FIFOs/segments for simultaneous debug or A/B processes. Sharing
     # hls_output/live made one port open another port's FIFO and deadlocked a

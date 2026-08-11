@@ -107,6 +107,14 @@ run options
                                     clock: 0.97 vs 4.47 Mbps, inter-frame p99
                                     137ms vs 1603ms. Reads TURN settings from
                                     /root/.config/soulx/turn.env if present.
+  --room                            public room: many viewers share one stream
+                                    and one at a time holds the seat and drives
+                                    her. Gates every control endpoint on the
+                                    turn token and disables reference-image
+                                    uploads. Serves the stripped-down room page;
+                                    the operator console stays at /?console=1
+  --turn-seconds N (90)             how long one visitor holds the seat
+  --outfit-budget N (40)            global ceiling on paid appearance changes
   --sr                              start an UltraFlash SR sidecar and hand it
                                     the decode, streaming at --sr-scale x the
                                     generator size (368x640 x2 -> 736x1280).
@@ -201,6 +209,7 @@ cmd_run() {
   local port=8090 fps=16 image="" seed=42 foreground=0 dry=0 sage_scope=self
   local lora="" lora_strength=1.0 webrtc=0 sr_url="" sr_scale=2
   local sr=0 sr_dec=v3 sr_gpu="" aux_gpu="" only_gpu="" vae_explicit=""
+  local room=0 turn_seconds=90 outfit_budget=40
   local logfile="$LOGDIR/demo.log"
 
   while [[ $# -gt 0 ]]; do
@@ -214,6 +223,9 @@ cmd_run() {
       --sage-scope) sage_scope="$2"; shift 2 ;;
       --compile)    compile="$2";shift 2 ;;
       --webrtc)     webrtc=1;    shift ;;
+      --room)       room=1;      shift ;;
+      --turn-seconds)  turn_seconds="$2"; shift 2 ;;
+      --outfit-budget) outfit_budget="$2"; shift 2 ;;
       --sr)         sr=1;        shift ;;
       --sr-url)     sr_url="$2"; shift 2 ;;
       --sr-dec)     sr_dec="$2"; shift 2 ;;
@@ -284,6 +296,12 @@ cmd_run() {
       echo "scope-soulx: --vae $vae_explicit is INERT under SR -- the sidecar decodes." >&2
       echo "scope-soulx: did you mean --sr-dec $vae_explicit ?" >&2
     fi
+  fi
+  if [[ $room == 1 ]]; then
+    gen_args+=(--room --turn-seconds "$turn_seconds" --outfit-budget "$outfit_budget")
+    echo "scope-soulx: ROOM mode -- ${turn_seconds}s turns, one driver at a time;"
+    echo "scope-soulx:   /action /say /chat /anchor /lora need the turn token,"
+    echo "scope-soulx:   reference-image uploads are off. Console: /?console=1"
   fi
   if [[ $webrtc == 1 ]]; then
     gen_args+=(--webrtc)

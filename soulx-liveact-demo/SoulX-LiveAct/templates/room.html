@@ -1,0 +1,678 @@
+{# The public room: one stage, one seat, many chairs.
+
+   Deliberately NOT chat.html. That page is the operator's console -- uploads,
+   persona editing, LoRA sweeps, every knob at once. This one is handed to
+   strangers, so it contains only what is known to render and offers no way to
+   break the session for the other forty people watching.
+
+   Three screens, in one document: join (a gesture, for sound), stage (watch and
+   talk), and your turn (the controls appear in place). #}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>{{ persona_name }} — live</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<style>
+  :root { color-scheme: dark; }
+  :root {
+    --bg: #08070c;
+    --panel: rgba(18, 16, 28, 0.82);
+    --line: rgba(255, 255, 255, 0.1);
+    --text: #f2eef8;
+    --dim: #9d95b4;
+    --accent: #c07cff;
+    --accent-ink: #1a0b2b;
+    --live: #ff4d6d;
+    --stream-w: {{ stream_w }};
+    --stream-h: {{ stream_h }};
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+
+  /* ---- stage layout ---------------------------------------------------- */
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+  }
+  /* The media is centred and letterboxed rather than stretched: the generator
+     resolution and the viewport almost never share an aspect ratio. */
+  #media {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: #000;
+    z-index: 0;
+  }
+  #media > * {
+    max-width: 100%;
+    max-height: 100%;
+    aspect-ratio: var(--stream-w) / var(--stream-h);
+    object-fit: contain;
+  }
+  #rtc-video, #canvas { display: none; }
+
+  .bar {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    padding-top: max(10px, env(safe-area-inset-top));
+    background: linear-gradient(180deg, rgba(8, 7, 12, 0.85), transparent);
+  }
+  .who { font-weight: 650; letter-spacing: 0.01em; }
+  .live-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--live);
+    box-shadow: 0 0 0 0 rgba(255, 77, 109, 0.7);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    70% { box-shadow: 0 0 0 9px rgba(255, 77, 109, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 77, 109, 0); }
+  }
+  .spacer { flex: 1; }
+  .count {
+    font-variant-numeric: tabular-nums;
+    color: var(--dim);
+    font-size: 13px;
+  }
+
+  /* ---- the crowd ------------------------------------------------------- */
+  #lower {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    background: linear-gradient(0deg, rgba(8, 7, 12, 0.92) 55%, transparent);
+  }
+  #log {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    max-height: 34vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    overscroll-behavior: contain;
+  }
+  .msg {
+    font-size: 14px;
+    line-height: 1.35;
+    padding: 3px 6px;
+    border-radius: 8px;
+    word-break: break-word;
+  }
+  .msg .nm { font-weight: 650; color: var(--accent); }
+  .msg.persona .nm { color: #7ce0ff; }
+  .msg.system { color: var(--dim); font-size: 13px; font-style: italic; }
+  /* Only the driver can act on a suggestion, so only the driver gets the
+     affordance. Showing a tap target to watchers would promise something the
+     server will refuse. */
+  body.driving .msg.chat { cursor: pointer; }
+  body.driving .msg.chat:hover { background: rgba(192, 124, 255, 0.14); }
+  body.driving .msg.chat:hover .nm::after {
+    content: " ▸ act this";
+    font-weight: 400;
+    color: var(--dim);
+    font-size: 12px;
+  }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    padding: 11px 13px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--accent); }
+  .send {
+    border: 0;
+    border-radius: 999px;
+    padding: 11px 16px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 650;
+  }
+  .send:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* ---- the seat -------------------------------------------------------- */
+  #seat { display: flex; gap: 8px; align-items: center; }
+  .cta {
+    flex: 1;
+    border: 0;
+    border-radius: 12px;
+    padding: 13px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 700;
+  }
+  .cta.ghost {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text);
+    font-weight: 600;
+  }
+  .cta:disabled { opacity: 0.6; cursor: default; }
+
+  #palette { display: none; flex-wrap: wrap; gap: 6px; }
+  body.driving #palette { display: flex; }
+  #palette button {
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.07);
+    border-radius: 999px;
+    padding: 8px 13px;
+    font-size: 14px;
+  }
+  #palette button:active { background: var(--accent); color: var(--accent-ink); }
+  #palette button:disabled { opacity: 0.4; }
+
+  .ring {
+    display: none;
+    align-items: center;
+    gap: 7px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 650;
+    font-size: 13px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: rgba(192, 124, 255, 0.16);
+    border: 1px solid rgba(192, 124, 255, 0.35);
+  }
+  body.driving .ring { display: flex; }
+
+  /* ---- join gate ------------------------------------------------------- */
+  #join {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 24px;
+    background: rgba(6, 5, 10, 0.82);
+    backdrop-filter: blur(7px);
+  }
+  #join h1 { font-size: 25px; margin: 0 0 6px; font-weight: 700; }
+  #join p { color: var(--dim); margin: 0 0 20px; max-width: 30ch; }
+  #join .card { display: grid; gap: 12px; justify-items: center; width: min(340px, 90vw); }
+  #join input { width: 100%; text-align: center; }
+  #join button {
+    width: 100%;
+    border: 0;
+    border-radius: 14px;
+    padding: 15px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 750;
+    font-size: 16px;
+  }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 96px;
+    transform: translateX(-50%);
+    z-index: 20;
+    background: rgba(20, 18, 30, 0.95);
+    border: 1px solid var(--line);
+    padding: 9px 15px;
+    border-radius: 999px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 0.25s;
+    pointer-events: none;
+    max-width: 88vw;
+  }
+  #toast.on { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div class="bar">
+    <span class="live-dot"></span>
+    <span class="who">{{ persona_name }}</span>
+    <span class="spacer"></span>
+    <span class="ring">⏱ <span id="left">0:00</span></span>
+    <span class="count"><span id="watching">1</span> watching</span>
+  </div>
+
+  <div id="media">
+    <video id="rtc-video" autoplay playsinline></video>
+    <canvas id="canvas" width="{{ stream_w }}" height="{{ stream_h }}"></canvas>
+  </div>
+
+  <div id="lower">
+    <div id="log"></div>
+    <div id="palette"></div>
+    <div class="row">
+      <input id="text" type="text" maxlength="240" placeholder="Say something to the room…"
+             autocomplete="off" />
+      <button class="send" id="send">Send</button>
+    </div>
+    <div id="seat">
+      <button class="cta" id="mic">Take the mic</button>
+      <button class="cta ghost" id="outfit" style="display: none; flex: 0 0 auto">
+        🎁 New outfit
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="join">
+  <div class="card">
+    <h1>{{ persona_name }} is live</h1>
+    <p>One person at a time gets to direct her. Everyone else watches and chips in.</p>
+    <input id="name" type="text" maxlength="24" placeholder="your name" autocomplete="off" />
+    <button id="enter">Tap to join with sound</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+  const WEBRTC = {{ 'true' if webrtc else 'false' }};
+  const ICE_SERVERS = {{ ice_servers|safe }};
+  const POLL_MS = 2000;
+  const JITTER = 0.35;
+
+  // Only what is verified to render. Whole-body re-posing (sit / stand / lie /
+  // kneel) is deliberately absent: the reference image is re-imposed every
+  // chunk through the I2V path, which no prompt wording reaches, so she slides
+  // back within seconds. A button that silently does nothing is worse than no
+  // button -- the visitor concludes the whole thing is broken and leaves.
+  const PALETTE = [
+    ["👋 Wave", "She waves her hand at the camera cheerfully!"],
+    ["🫶 Heart", "She makes a heart shape with both hands and smiles!"],
+    ["😉 Wink", "She tilts her head and winks playfully!"],
+    ["😄 Laugh", "She laughs joyfully, eyes sparkling!"],
+    ["🙂 Nod", "She nods thoughtfully and smiles!"],
+    ["🔄 Turn", "She turns around slowly."],
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const cid = (() => {
+    let v = localStorage.getItem("soulx_cid");
+    if (!v) {
+      v = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem("soulx_cid", v);
+    }
+    return v;
+  })();
+
+  let name = localStorage.getItem("soulx_name") || "";
+  let cursor = 0;
+  let lastShown = 0;
+  let token = null;
+  let role = "watching";
+  let expiresAt = 0;
+  let outfitEnabled = false;
+  let pc = null, ws = null, audioCtx = null, rtcOk = false;
+  let frames = [], tsOffset = null, nextAudioT = 0, videoT0 = null;
+  const canvas = $("canvas"), ctx2d = canvas.getContext("2d");
+
+  function toast(text) {
+    const el = $("toast");
+    el.textContent = text;
+    el.classList.add("on");
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove("on"), 2600);
+  }
+
+  async function api(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { "X-Turn-Token": token } : {}),
+      },
+      body: JSON.stringify({ client_id: cid, name, ...body }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `http ${res.status}`);
+    return data;
+  }
+
+  // ---- stream ------------------------------------------------------------
+  // WebRTC is the good path (0.97 vs 4.47 Mbps, 137ms vs 1603ms inter-frame
+  // p99). But it needs a relay it can actually reach, and when it cannot the
+  // failure is a BLACK SCREEN -- there is no partial version of a peer
+  // connection. So it is raced against a deadline and falls back to the
+  // WebSocket path, which only needs the HTTP port that already served this
+  // page. A worse stream beats no stream.
+  async function connectRTC() {
+    const video = $("rtc-video");
+    video.style.display = "block";
+    video.muted = true;
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.ontrack = (e) => { video.srcObject = e.streams[0]; };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") rtcOk = true;
+      if (["failed", "disconnected"].includes(pc.connectionState)) {
+        if (rtcOk) { toast("stream lost — reconnecting"); rtcOk = false; setTimeout(connectRTC, 2000); }
+        else fallbackToWS("relay unreachable");
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const check = () =>
+        pc.iceGatheringState === "complete" &&
+        (pc.removeEventListener("icegatheringstatechange", check), resolve());
+      pc.addEventListener("icegatheringstatechange", check);
+      setTimeout(resolve, 4000);
+    });
+    const res = await fetch("/offer", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    });
+    const answer = await res.json();
+    if (answer.error) return fallbackToWS(answer.error);
+    await pc.setRemoteDescription(answer);
+    setTimeout(() => { if (!rtcOk) fallbackToWS("relay timed out"); }, 9000);
+  }
+
+  function fallbackToWS(why) {
+    if (ws) return;
+    console.warn("webrtc fallback:", why);
+    toast("using backup stream");
+    try { pc && pc.close(); } catch (_) {}
+    pc = null;
+    $("rtc-video").style.display = "none";
+    canvas.style.display = "block";
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+    connectWS();
+  }
+
+  function connectWS() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = async (event) => {
+      if (typeof event.data === "string") {
+        const m = JSON.parse(event.data);
+        if (m.kind === "meta") { canvas.width = m.w; canvas.height = m.h; }
+        return;
+      }
+      const dv = new DataView(event.data),
+        type = dv.getUint8(0),
+        ts = dv.getFloat64(1, true),
+        payload = event.data.slice(9);
+      if (type === 0) {
+        try {
+          const bmp = await createImageBitmap(new Blob([payload], { type: "image/jpeg" }));
+          frames.push({ ts, bmp });
+          if (frames.length > 180) frames.splice(0, frames.length - 180);
+        } catch (_) {}
+      } else if (type === 1 && audioCtx) {
+        const pcm = new Int16Array(payload);
+        if (!pcm.length) return;
+        const buf = audioCtx.createBuffer(1, pcm.length, 16000), ch = buf.getChannelData(0);
+        for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+        const when = Math.max(audioCtx.currentTime + JITTER, nextAudioT),
+          src = audioCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(audioCtx.destination);
+        src.start(when);
+        nextAudioT = when + buf.duration;
+        tsOffset = when - ts;
+      }
+    };
+    ws.onclose = () => { videoT0 = null; ws = null; setTimeout(connectWS, 1500); };
+  }
+
+  // Drain on the frames' OWN timestamps. The server emits a whole 32-frame
+  // chunk as a ~50ms burst then goes quiet for ~2s, so "draw the newest, drop
+  // the rest" renders one frame per chunk -- a 0.5fps slideshow that reads as
+  // the character twitching. That bug was the frontend's, not the pipeline's.
+  function renderLoop() {
+    requestAnimationFrame(renderLoop);
+    if (!frames.length) return;
+    let mt;
+    if (audioCtx && tsOffset !== null) {
+      mt = audioCtx.currentTime - tsOffset;
+    } else {
+      const now = performance.now() / 1000;
+      if (videoT0 === null) videoT0 = now - frames[0].ts + JITTER;
+      mt = now - videoT0;
+      if (Math.abs(frames[0].ts - mt) > 1 || frames.length > 90) {
+        videoT0 = now - frames[0].ts + JITTER;
+        mt = now - videoT0;
+      }
+    }
+    let drawn;
+    while (frames.length && frames[0].ts <= mt) drawn = frames.shift();
+    if (drawn) ctx2d.drawImage(drawn.bmp, 0, 0, canvas.width, canvas.height);
+  }
+
+  // ---- the room ----------------------------------------------------------
+  function addMsg(m) {
+    // The 2s timer and an explicit call (taking the mic) can be in flight at
+    // once, both having read the same cursor, and would then render the same
+    // lines twice. Ids are monotonic, so the id itself is the guard.
+    if (m.id <= lastShown) return;
+    lastShown = m.id;
+    const log = $("log");
+    const el = document.createElement("div");
+    el.className = `msg ${m.kind}`;
+    if (m.kind === "system") {
+      el.textContent = m.text;
+    } else {
+      const nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = m.who + ": ";
+      el.append(nm, document.createTextNode(m.text));
+    }
+    // Any line in the room is a suggestion the driver can enact with one tap.
+    // There is no separate suggestion box precisely because there does not
+    // need to be: watchers type where they already type.
+    if (m.kind === "chat") el.onclick = () => role === "driving" && act(m.text);
+    log.append(el);
+    while (log.children.length > 120) log.firstChild.remove();
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function fmt(s) {
+    s = Math.max(0, Math.round(s));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }
+
+  function applyStage(st) {
+    const me = st.me || {};
+    const was = role;
+    role = me.role || "watching";
+    token = me.token || null;
+    document.body.classList.toggle("driving", role === "driving");
+    if (role === "driving") expiresAt = Date.now() + (me.remaining || 0) * 1000;
+    if (was !== "driving" && role === "driving") {
+      toast("You're up — direct her!");
+      $("text").placeholder = "Tell her what to do…";
+    }
+    if (was === "driving" && role !== "driving") {
+      $("text").placeholder = "Say something to the room…";
+    }
+
+    // One token per turn, and it is a ritual rather than a setting: it costs a
+    // real API call AND a session restart, so it is spent deliberately or not
+    // at all. Hidden entirely when the server has no key to spend.
+    const outfit = $("outfit");
+    const left = me.outfit_left || 0;
+    outfit.style.display =
+      role === "driving" && outfitEnabled && (st.outfit_left_global || 0) > 0
+        ? "block"
+        : "none";
+    outfit.disabled = left <= 0;
+    outfit.textContent = left > 0 ? "🎁 New outfit" : "🎁 Used";
+
+    const mic = $("mic");
+    if (role === "driving") {
+      mic.textContent = "Pass the mic";
+      mic.className = "cta ghost";
+      mic.disabled = false;
+      mic.onclick = passMic;
+    } else if (role === "queued") {
+      mic.textContent = `You're #${me.position} in line · ~${fmt(me.eta || 0)}`;
+      mic.className = "cta ghost";
+      mic.disabled = true;
+      mic.onclick = null;
+    } else {
+      const d = st.driver;
+      // A disabled button with an unchanged label reads as a broken button.
+      // If the stage is closed, say so -- the stream is still worth watching.
+      mic.textContent = st.closed
+        ? "Taking a break — still live"
+        : d
+          ? `Take the mic — after ${d.name} (${fmt(d.remaining)})`
+          : "Take the mic";
+      mic.className = st.closed ? "cta ghost" : "cta";
+      mic.disabled = !!st.closed;
+      mic.onclick = st.closed ? null : takeMic;
+    }
+  }
+
+  function tickRing() {
+    if (role === "driving") $("left").textContent = fmt((expiresAt - Date.now()) / 1000);
+    requestAnimationFrame(tickRing);
+  }
+
+  async function poll() {
+    try {
+      const data = await api("/room/poll", { since: cursor });
+      (data.messages || []).forEach(addMsg);
+      if (data.cursor !== undefined) cursor = data.cursor;
+      $("watching").textContent = data.watching;
+      outfitEnabled = !!data.outfit_enabled;
+      if (data.stage) applyStage(data.stage);
+    } catch (e) {
+      /* a dropped poll is not worth a toast; the next one is 2s away */
+    }
+  }
+
+  // ---- driving -----------------------------------------------------------
+  // Acknowledge in <100ms, render in ~1.7s. One chunk of latency is fine;
+  // UNACKNOWLEDGED latency is what reads as a broken button, and the visitor
+  // taps it four more times.
+  async function act(text) {
+    if (role !== "driving") return toast("take the mic first");
+    toast(`sent → ${text.slice(0, 40)}`);
+    try {
+      await api("/action", { text });
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function takeMic() {
+    try {
+      const data = await api("/room/queue", { since: cursor });
+      (data.messages || []).forEach(addMsg);
+      if (data.cursor !== undefined) cursor = data.cursor;
+      if (data.stage) applyStage(data.stage);
+    } catch (e) { toast(e.message); }
+  }
+
+  async function passMic() {
+    try { await api("/room/skip", {}); } catch (e) { toast(e.message); }
+    poll();
+  }
+
+  async function send() {
+    const input = $("text");
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    // The driver's line goes to HER (it drives speech and action, and the
+    // server mirrors it into the room). A watcher's line goes to the room.
+    try {
+      if (role === "driving") await api("/chat", { text });
+      else await api("/room/say", { text });
+    } catch (e) {
+      toast(e.message);
+      input.value = text;
+    }
+    poll();
+  }
+
+  // ---- boot --------------------------------------------------------------
+  PALETTE.forEach(([label, text]) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.onclick = () => act(text);
+    $("palette").append(b);
+  });
+
+  $("outfit").onclick = async () => {
+    const what = prompt("What should she change into?");
+    if (!what || !what.trim()) return;
+    toast("she's getting changed…");
+    try {
+      await api("/chat", { text: `/change ${what.trim()}` });
+    } catch (e) {
+      toast(e.message);
+    }
+    poll();
+  };
+
+  $("send").onclick = send;
+  $("text").addEventListener("keydown", (e) => e.key === "Enter" && send());
+  $("name").value = name;
+
+  $("enter").onclick = async () => {
+    name = ($("name").value || "").trim() || "guest";
+    localStorage.setItem("soulx_name", name);
+    $("join").style.display = "none";
+
+    // The gesture browsers demand for audio is also what makes the render loop
+    // smooth: with an AudioContext the frames pace off the media clock instead
+    // of a guess. Nobody is admitted muted -- muted is the slideshow path.
+    if (WEBRTC) {
+      const v = $("rtc-video");
+      v.muted = false;
+      v.play().catch(() => {});
+    } else {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx.resume();
+    }
+    try { await api("/room/join", { since: 0 }); } catch (_) {}
+    poll();
+  };
+
+  window.addEventListener("pagehide", () => {
+    // Best effort: a closed tab must not hold the seat or inflate the count.
+    navigator.sendBeacon?.(
+      "/room/leave",
+      new Blob([JSON.stringify({ client_id: cid })], { type: "application/json" }),
+    );
+  });
+
+  if (WEBRTC) connectRTC().catch((e) => fallbackToWS(e.message));
+  else fallbackToWS("webrtc disabled");
+  requestAnimationFrame(renderLoop);
+  requestAnimationFrame(tickRing);
+  setInterval(poll, POLL_MS);
+  poll();
+</script>
+</body>
+</html>
