@@ -319,7 +319,22 @@ def _enable_webrtc(fps):
     soulx_webrtc = _mod
     WEBRTC = _mod.WebRTCHub(fps)
     ice = _mod.ice_servers()
-    where = ice[0]["urls"] if ice else "no TURN (set SOULX_TURN_URL); direct UDP only"
+    # Decide the relay transport HERE, in sync startup code: aiortc takes one
+    # TURN server per peer, so the choice cannot be made per candidate once
+    # offers are arriving on the hub's loop.
+    _mod.select_turn_transport()
+    # Report the RELAY, not ice[0]. Cloudflare returns STUN as the first entry
+    # and TURN as the second, so printing ice[0] shows a STUN-only line whenever
+    # TURN is working -- which reads as "TURN is broken" and sends you hunting a
+    # failure that is not there. What matters is whether a relay resolved at all:
+    # without one, a browser off this pod cannot get media, because RunPod maps
+    # TCP and there is no UDP ingress.
+    relays = [str(r.urls) for r in _mod._aiortc_ice()]
+    where = (
+        f"relay {relays[0]} ({len(ice)} ice servers)"
+        if relays
+        else "NO RELAY (set SOULX_TURN_CF_ID/TOKEN or SOULX_TURN_URL); direct UDP only"
+    )
     print(f"[webrtc] enabled, H.264/Opus; ICE: {where}", flush=True)
 
 

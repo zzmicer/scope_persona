@@ -62,6 +62,11 @@ QUEUE_S = 3.0
 _ice_cache = {"servers": None, "expires": 0.0}
 _ice_lock = threading.Lock()
 
+# Hard ceiling on how long TURN credentials are reused, whatever ttl was asked
+# for. Cloudflare grants far less than it is asked for and says so nowhere in
+# the response, so the only safe assumption is that they are short-lived.
+_ICE_MAX_CACHE_S = int(os.environ.get("SOULX_TURN_CACHE_S", "300"))
+
 
 def _cloudflare_ice():
     """Short-lived ICE servers from Cloudflare's TURN API, cached until near expiry.
@@ -76,7 +81,7 @@ def _cloudflare_ice():
     token = os.environ.get("SOULX_TURN_CF_TOKEN")
     if not (key and token):
         return None
-    ttl = int(os.environ.get("SOULX_TURN_TTL", "86400"))
+    ttl = int(os.environ.get("SOULX_TURN_TTL", "3600"))
     req = urllib.request.Request(
         f"https://rtc.live.cloudflare.com/v1/turn/keys/{key}"
         f"/credentials/generate-ice-servers",
@@ -95,9 +100,15 @@ def _cloudflare_ice():
     servers = body.get("iceServers") or []
     if not isinstance(servers, list):
         return None
-    # refresh an hour early rather than handing a client a credential that dies
-    # mid-session
-    _ice_cache["expires"] = time.time() + max(ttl - 3600, 60)
+    # Cache for MINUTES, not for the ttl we asked for. Cloudflare's response
+    # carries no expiry field, and the credentials it returns stop working long
+    # before the requested ttl: with the old `ttl - 3600` (23h at the old 86400
+    # default) this served dead credentials for the rest of the session. TURN
+    # allocation then failed and aiortc quietly offered ONLY its 172.19.x.x
+    # docker-bridge candidate, which no browser can route to -- so every peer
+    # went connecting -> failed, with nothing logged anywhere. Re-fetching is one
+    # ~100ms request per session start, which is nothing next to being wrong.
+    _ice_cache["expires"] = time.time() + min(max(ttl // 2, 60), _ICE_MAX_CACHE_S)
     return servers
 
 
@@ -131,8 +142,95 @@ def ice_servers():
         return servers
 
 
+def _relay_urls(urls):
+    """TURN urls worth trying, best first.
+
+    UDP first because it is the better stream: a relay reached over TCP puts
+    every frame through one connection, where a single loss stalls everything
+    behind it -- measured here as latency spikes, a backed-up queue and ~12% of
+    frames shed. But "better" only counts among relays that WORK. On this pod
+    UDP to turn.cloudflare.com never answers an ALLOCATE (the name resolves
+    IPv6-only and the container has no working IPv6 path), so a UDP-only
+    preference yields NO relay at all and every peer fails. Degraded beats
+    absent, so TCP and TLS follow rather than being discarded.
+    """
+    turn = [u for u in urls if str(u).startswith(("turn:", "turns:"))]
+
+    def rank(u):
+        if "transport=udp" in u:
+            return 0
+        if u.startswith("turns:") and ":443" in u:
+            return 1  # TLS on 443 traverses the most hostile middleboxes
+        if u.startswith("turns:"):
+            return 2
+        return 3
+
+    return sorted(turn, key=rank)
+
+
+# Which relay transport this box can actually reach. Probed once (see
+# `select_turn_transport`) because aiortc takes a single TURN server per peer,
+# so the choice has to be made before any offer arrives -- not per candidate.
+_turn_url = {"value": None}
+
+
+def _turn_probe(url, username, credential):
+    """Does an ALLOCATE against `url` actually yield a relay candidate?"""
+
+    async def go():
+        pc = RTCPeerConnection(
+            RTCConfiguration(
+                iceServers=[
+                    RTCIceServer(urls=url, username=username, credential=credential)
+                ]
+            )
+        )
+        pc.addTransceiver("video", direction="sendonly")
+        try:
+            await pc.setLocalDescription(await pc.createOffer())
+            return "typ relay" in pc.localDescription.sdp
+        finally:
+            await pc.close()
+
+    try:
+        return asyncio.run(go())
+    except Exception:  # noqa: BLE001 -- an unreachable transport is a No, not a crash
+        return False
+
+
+def select_turn_transport():
+    """Pick the first TURN transport that really allocates, and remember it.
+
+    Call once at startup, from sync code, before the hub's loop exists. Costs a
+    few seconds and saves the failure this exists for: a silently relay-less
+    server whose every peer goes connecting -> failed.
+    """
+    forced = os.environ.get("SOULX_TURN_TRANSPORT")  # udp|tcp|tls to skip probing
+    for s in ice_servers():
+        if not s.get("username"):
+            continue
+        urls = s.get("urls") or []
+        if isinstance(urls, str):
+            urls = [urls]
+        candidates = _relay_urls(urls)
+        if forced:
+            want = {"udp": "transport=udp", "tcp": "transport=tcp", "tls": "turns:"}
+            candidates = [u for u in candidates if want.get(forced, forced) in u]
+        for url in candidates:
+            if _turn_probe(url, s.get("username"), s.get("credential")):
+                _turn_url["value"] = url
+                print(f"[webrtc] TURN relay via {url}", flush=True)
+                return url
+        print(
+            "[webrtc] WARNING no TURN transport allocated a relay "
+            f"(tried {len(candidates)}). Browsers off this pod will not connect.",
+            flush=True,
+        )
+    return None
+
+
 def _aiortc_ice():
-    """The same relays, as aiortc objects, preferring UDP.
+    """The same relays, as aiortc objects, on the transport that works here.
 
     aiortc MUST relay too. Its only other candidate here is the container's
     private address, which a public relay cannot route back to -- so without
@@ -144,14 +242,15 @@ def _aiortc_ice():
         urls = s.get("urls") or []
         if isinstance(urls, str):
             urls = [urls]
-        udp = [u for u in urls if "transport=udp" in u] or [
-            u for u in urls if u.startswith("turn")
-        ]
-        if not udp:
+        candidates = _relay_urls(urls)
+        if not candidates:
             continue
+        chosen = _turn_url["value"]
+        if chosen not in candidates:
+            chosen = candidates[0]
         out.append(
             RTCIceServer(
-                urls=udp[0],
+                urls=chosen,
                 username=s.get("username"),
                 credential=s.get("credential"),
             )
@@ -315,7 +414,22 @@ class WebRTCHub:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+
+        # Say so when the answer carries no relay. On this pod the only other
+        # candidate is the 172.19.x.x docker bridge, which no browser can route
+        # to, so a relay-less answer is a guaranteed `connecting -> failed` --
+        # and it used to produce no log line at all, which cost an afternoon.
+        # The peer is still returned: on a LAN or a host with UDP ingress the
+        # host candidate is legitimately enough.
+        sdp_out = pc.localDescription.sdp
+        if "typ relay" not in sdp_out:
+            print(
+                "[webrtc] WARNING no relay candidate gathered -- offering only "
+                "host candidates. A browser off this pod CANNOT connect. Check "
+                "SOULX_TURN_CF_ID/TOKEN and that the TURN credentials are live.",
+                flush=True,
+            )
+        return {"sdp": sdp_out, "type": pc.localDescription.type}
 
     async def _drop(self, pc):
         with self.lock:
