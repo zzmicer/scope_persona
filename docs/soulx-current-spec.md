@@ -5,6 +5,11 @@ Companion to `soulx-deployment.md` (how to deploy) — this is *what is deployed
 and what it measures*. Numbers marked **[v]** were verified on this pod today;
 anything else is inherited from earlier sessions and is labelled.
 
+> **The running configuration below is out of date.** Since this was written the
+> SR sidecar was dropped, the stream moved to 400×640 over WebRTC, and the demo
+> gained a public room. For current state and what is planned, read
+> **`soulx-status.md`**; the component-level detail here is still accurate.
+
 ---
 
 ## 1. What it is
